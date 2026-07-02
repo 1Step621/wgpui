@@ -2749,6 +2749,18 @@ impl Pixels {
     pub fn to_f64(self) -> f64 {
         self.0 as f64
     }
+
+    /// Returns the underlying `f32` value of the `Pixels`.
+    pub fn to_f32(self) -> f32 {
+        self.0
+    }
+}
+
+impl Pixels {
+    /// Returns the underlying `f32` value (non-consuming).
+    pub fn value(&self) -> f32 {
+        self.0
+    }
 }
 
 impl Eq for Pixels {}
