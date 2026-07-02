@@ -1303,6 +1303,8 @@ impl InteractiveElement for Div {
     }
 }
 
+impl StatefulInteractiveElement for Div {}
+
 impl ParentElement for Div {
     fn extend(&mut self, elements: impl IntoIterator<Item = AnyElement>) {
         self.children
