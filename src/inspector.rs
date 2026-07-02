@@ -544,7 +544,7 @@ mod conditional {
                 cx.inspector_renderer = Some(inspector_renderer);
                 result
             } else {
-                Empty
+                Empty.into_any_element()
             }
         }
     }
