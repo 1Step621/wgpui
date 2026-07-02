@@ -264,6 +264,8 @@ mod conditional {
             }
         }
 
+        /// Set the active element by its ID and refresh the window if it changed.
+        /// Returns true if the element changed.
         pub fn set_active_element_id(
             &mut self,
             id: InspectorElementId,
