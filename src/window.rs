@@ -4313,22 +4313,6 @@ impl Window {
             return;
         };
 
-        #[cfg(any(feature = "inspector", debug_assertions))]
-        {
-            if keystroke.key == "i"
-                && keystroke.modifiers.control
-                && keystroke.modifiers.shift
-                && !keystroke.modifiers.alt
-                && !keystroke.modifiers.platform
-                && !keystroke.modifiers.function
-            {
-                self.toggle_inspector(cx);
-                cx.propagate_event = false;
-                self.finish_dispatch_key_event(event, dispatch_path, self.context_stack(), cx);
-                return;
-            }
-        }
-
         cx.propagate_event = true;
         self.dispatch_keystroke_interceptors(event, self.context_stack(), cx);
         if !cx.propagate_event {
