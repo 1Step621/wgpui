@@ -264,7 +264,7 @@ mod conditional {
             }
         }
 
-        pub(crate) fn set_active_element_id(
+        pub fn set_active_element_id(
             &mut self,
             id: InspectorElementId,
             window: &mut Window,
