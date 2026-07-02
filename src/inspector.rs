@@ -626,46 +626,46 @@ mod conditional {
     // ── Default colors ───────────────────────────────────────────────────────
 
     fn default_bg() -> crate::Hsla {
-        crate::rgba(0x1e1e2ecc).into()
+        crate::rgba(0x1e2127ff).into()
     }
     fn default_text() -> crate::Hsla {
-        crate::rgba(0xcdd6f4ff).into()
+        crate::rgba(0xabb2bfff).into()
     }
     fn accent() -> crate::Hsla {
-        crate::rgba(0x89b4faff).into()
+        crate::rgba(0x61afefff).into()
     }
     fn accent_dim() -> crate::Hsla {
-        crate::rgba(0x89b4fa33).into()
+        crate::rgba(0x61afef33).into()
     }
     fn border() -> crate::Hsla {
-        crate::rgba(0x313244ff).into()
+        crate::rgba(0x2c313aff).into()
     }
     fn tab_active_bg() -> crate::Hsla {
-        crate::rgba(0x313244ff).into()
+        crate::rgba(0x2c313aff).into()
     }
     fn tab_inactive_bg() -> crate::Hsla {
-        crate::rgba(0x1e1e2ecc).into()
+        crate::rgba(0x1e2127ff).into()
     }
     fn dim_text() -> crate::Hsla {
-        crate::rgba(0x6c7086ff).into()
+        crate::rgba(0x5c6370ff).into()
     }
     fn hover_bg() -> crate::Hsla {
-        crate::rgba(0x45475a66).into()
+        crate::rgba(0x3e445266).into()
     }
     fn selected_bg() -> crate::Hsla {
-        crate::rgba(0x89b4fa33).into()
+        crate::rgba(0x61afef33).into()
     }
     fn margin_color() -> crate::Hsla {
-        crate::rgba(0xf9e2afcc).into()
+        crate::rgba(0xe5c07bcc).into()
     }
     fn border_color_box() -> crate::Hsla {
-        crate::rgba(0xfab387cc).into()
+        crate::rgba(0xd19a66cc).into()
     }
     fn padding_color_box() -> crate::Hsla {
-        crate::rgba(0xa6e3a1cc).into()
+        crate::rgba(0x98c379cc).into()
     }
     fn content_color_box() -> crate::Hsla {
-        crate::rgba(0x89b4facc).into()
+        crate::rgba(0x61afefcc).into()
     }
 
     // ── Tab bar ──────────────────────────────────────────────────────────────
@@ -702,8 +702,9 @@ mod conditional {
                             move |inspector: &mut Inspector,
                                   _event: &crate::ClickEvent,
                                   _window,
-                                  _cx| {
+                                  cx| {
                                 inspector.set_tab(tab);
+                                cx.notify();
                             },
                         )
                     })
@@ -736,7 +737,7 @@ mod conditional {
                     .text_sm()
                     .text_color(dim_text())
                     .mr(px(4.))
-                    .child(SharedString::from("🔍")),
+                    .child(SharedString::from("Filter")),
             )
             .child(
                 crate::div()
@@ -791,8 +792,9 @@ mod conditional {
                     .border_color(if is_picking { accent() } else { border() })
                     .rounded_sm()
                     .on_click(cx.listener(
-                        |inspector: &mut Inspector, _: &crate::ClickEvent, _window, _cx| {
+                        |inspector: &mut Inspector, _: &crate::ClickEvent, _window, cx| {
                             inspector.start_picking();
+                            cx.notify();
                         },
                     ))
                     .child(SharedString::from("Pick")),
@@ -811,8 +813,9 @@ mod conditional {
                     .rounded_sm()
                     .when(!has_selection, |this| this.opacity(0.5))
                     .on_click(cx.listener(
-                        |inspector: &mut Inspector, _: &crate::ClickEvent, _window, _cx| {
+                        |inspector: &mut Inspector, _: &crate::ClickEvent, _window, cx| {
                             inspector.collapse_all();
+                            cx.notify();
                         },
                     ))
                     .child(SharedString::from("Collapse")),
@@ -831,8 +834,9 @@ mod conditional {
                     .rounded_sm()
                     .when(!has_selection, |this| this.opacity(0.5))
                     .on_click(cx.listener(
-                        |inspector: &mut Inspector, _: &crate::ClickEvent, _window, _cx| {
+                        |inspector: &mut Inspector, _: &crate::ClickEvent, _window, cx| {
                             inspector.expand_all();
+                            cx.notify();
                         },
                     ))
                     .child(SharedString::from("Expand")),
@@ -954,9 +958,10 @@ mod conditional {
                         move |inspector: &mut Inspector,
                               _event: &crate::ClickEvent,
                               _window,
-                              _cx| {
+                              cx| {
                             inspector.set_active_element_id(id.clone(), _window);
                             inspector.stop_resizing();
+                            cx.notify();
                         },
                     )
                 })
