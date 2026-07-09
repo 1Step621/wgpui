@@ -32,6 +32,7 @@ use stacksafe::{StackSafe, stacksafe};
 use std::{
     any::{Any, TypeId},
     cell::RefCell,
+    hash::{Hash, Hasher},
     cmp::Ordering,
     fmt::Debug,
     marker::PhantomData,
@@ -329,9 +330,12 @@ impl Interactivity {
         &mut self,
         listener: impl Fn(&A, &mut Window, &mut App) + 'static,
     ) {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        A::name_for_type().hash(&mut hasher);
+        let action_disc = hasher.finish();
         self.action_listeners.push((
             TypeId::of::<A>(),
-            crate::type_name_hash::<A>(),
+            action_disc,
             Box::new(move |action, phase, window, cx| {
                 let action = unsafe { &*(action as *const dyn Any as *const A) };
                 if phase == DispatchPhase::Capture {
@@ -348,9 +352,12 @@ impl Interactivity {
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     pub fn on_action<A: Action>(&mut self, listener: impl Fn(&A, &mut Window, &mut App) + 'static) {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        A::name_for_type().hash(&mut hasher);
+        let action_disc = hasher.finish();
         self.action_listeners.push((
             TypeId::of::<A>(),
-            crate::type_name_hash::<A>(),
+            action_disc,
             Box::new(move |action, phase, window, cx| {
                 let action = unsafe { &*(action as *const dyn Any as *const A) };
                 if phase == DispatchPhase::Bubble {
