@@ -4675,6 +4675,7 @@ impl Window {
         action: &dyn Action,
         cx: &mut App,
     ) {
+        let action_registry = cx.actions.clone();
         let dispatch_path = self.rendered_frame.dispatch_tree.dispatch_path(node_id);
 
         // Capture phase for global actions.
@@ -4708,14 +4709,15 @@ impl Window {
         for node_id in &dispatch_path {
             let node = self.rendered_frame.dispatch_tree.node(*node_id);
             let action_type_id = action.as_any().type_id();
+            let action_disc = action_registry.discriminator_for_type(&action_type_id);
             for DispatchActionListener {
                 action_type,
+                action_discriminator,
                 listener,
-                ..
             } in node.action_listeners.clone()
             {
                 let any_action = action.as_any();
-                if action_type == action_type_id {
+                if action_type == action_type_id || action_discriminator == action_disc {
                     listener(any_action, DispatchPhase::Capture, self, cx);
 
                     if !cx.propagate_event {
@@ -4729,14 +4731,15 @@ impl Window {
         for node_id in dispatch_path.iter().rev() {
             let node = self.rendered_frame.dispatch_tree.node(*node_id);
             let action_type_id = action.as_any().type_id();
+            let action_disc = action_registry.discriminator_for_type(&action_type_id);
             for DispatchActionListener {
                 action_type,
+                action_discriminator,
                 listener,
-                ..
             } in node.action_listeners.clone()
             {
                 let any_action = action.as_any();
-                if action_type == action_type_id {
+                if action_type == action_type_id || action_discriminator == action_disc {
                     cx.propagate_event = false; // Actions stop propagation by default during the bubble phase
                     listener(any_action, DispatchPhase::Bubble, self, cx);
 

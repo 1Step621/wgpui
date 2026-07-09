@@ -6,6 +6,7 @@ use serde_json::json;
 use std::{
     any::{Any, TypeId},
     fmt::Display,
+    hash::{Hash, Hasher},
 };
 
 /// Defines and registers unit structs that can be used as actions. For more complex data types, derive `Action`.
@@ -343,6 +344,18 @@ impl ActionRegistry {
         if let Some(documentation) = action.documentation {
             self.documentation.insert(name, documentation);
         }
+    }
+
+    /// Get the cross-DLL discriminator for an action type by looking up its name
+    /// and computing a hash. The action name is consistent across compilation units.
+    pub fn discriminator_for_type(&self, type_id: &TypeId) -> u64 {
+        let name = self
+            .names_by_type_id
+            .get(type_id)
+            .expect("action type not registered");
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (*name).hash(&mut hasher);
+        hasher.finish()
     }
 
     /// Construct an action based on its name and optional JSON parameters sourced from the keymap.
