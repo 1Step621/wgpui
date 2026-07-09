@@ -6,7 +6,7 @@ use crate::{
     Capslock, Context, Corners, CursorStyle, Decorations, DevicePixels, DispatchActionListener,
     DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter,
     FileDropEvent, Filter, FilterBoundary, FontId, Global, GlobalElementId,
-    GlyphId, GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
+    GlyphId, GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding, KeyContext,     KeyDownEvent, KeyEvent, KeyUpEvent, Keystroke,
     KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
     MouseButton, MouseDownEvent, MouseEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, ScrollWheelEvent,
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
@@ -3977,14 +3977,18 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
 
-        self.next_frame.dispatch_tree.on_key_event(Rc::new(
-            move |event: &dyn Any, phase, window: &mut Window, cx: &mut App| {
-                // SAFETY: on_key_event callers always pass the correct event type.
-                // TypeId downcast skipped for cross-DLL compatibility.
-                let event = unsafe { &*(event as *const dyn Any as *const Event) };
-                listener(event, phase, window, cx)
-            },
-        ));
+        let discriminator = type_name_hash::<Event>();
+        self.next_frame.dispatch_tree.on_key_event(
+            discriminator,
+            Rc::new(
+                move |event: &dyn Any, phase, window: &mut Window, cx: &mut App| {
+                    // SAFETY: dispatch_key_down_up_event only calls this when
+                    // discriminator matches the dispatched event's type_name_hash.
+                    let event = unsafe { &*(event as *const dyn Any as *const Event) };
+                    listener(event, phase, window, cx)
+                },
+            ),
+        );
     }
 
     /// Register a modifiers changed event listener on the window for the next frame.
@@ -4538,26 +4542,41 @@ impl Window {
         dispatch_path: &SmallVec<[DispatchNodeId; 32]>,
         cx: &mut App,
     ) {
+        // Determine discriminator from the event type.
+        let discriminator = if event.is::<KeyDownEvent>() {
+            type_name_hash::<KeyDownEvent>()
+        } else if event.is::<KeyUpEvent>() {
+            type_name_hash::<KeyUpEvent>()
+        } else {
+            0
+        };
+
         // Capture phase
         for node_id in dispatch_path {
-            let node = self.rendered_frame.dispatch_tree.node(*node_id);
+            let listeners = self.rendered_frame.dispatch_tree.node(*node_id)
+                .key_listeners.clone();
 
-            for key_listener in node.key_listeners.clone() {
-                key_listener(event, DispatchPhase::Capture, self, cx);
-                if !cx.propagate_event {
-                    return;
+            for (listener_disc, key_listener) in &listeners {
+                if *listener_disc == discriminator {
+                    key_listener(event, DispatchPhase::Capture, self, cx);
+                    if !cx.propagate_event {
+                        return;
+                    }
                 }
             }
         }
 
         // Bubble phase
         for node_id in dispatch_path.iter().rev() {
-            // Handle low level key events
-            let node = self.rendered_frame.dispatch_tree.node(*node_id);
-            for key_listener in node.key_listeners.clone() {
-                key_listener(event, DispatchPhase::Bubble, self, cx);
-                if !cx.propagate_event {
-                    return;
+            let listeners = self.rendered_frame.dispatch_tree.node(*node_id)
+                .key_listeners.clone();
+
+            for (listener_disc, key_listener) in &listeners {
+                if *listener_disc == discriminator {
+                    key_listener(event, DispatchPhase::Bubble, self, cx);
+                    if !cx.propagate_event {
+                        return;
+                    }
                 }
             }
         }
