@@ -8,7 +8,7 @@ use crate::{
     FileDropEvent, Filter, FilterBoundary, FontId, Global, GlobalElementId,
     GlyphId, GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
     KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
+    MouseButton, MouseDownEvent, MouseEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, ScrollWheelEvent,
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
     Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
     RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
@@ -534,6 +534,21 @@ type FrameCallback = Box<dyn FnOnce(&mut Window, &mut App)>;
 pub(crate) type AnyMouseListener =
     Box<dyn FnMut(&dyn Any, DispatchPhase, &mut Window, &mut App) + 'static>;
 
+/// A cross-DLL-safe event type discriminator computed from `std::any::type_name::<T>()`.
+/// The type name string is the same across compilation units, so the hash is consistent
+/// between the main binary and plugin DLLs.
+pub(crate) fn type_name_hash<T: 'static>() -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::any::type_name::<T>().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// A mouse listener entry with a type discriminator for cross-DLL event dispatch.
+pub(crate) struct MouseListenerEntry {
+    pub(crate) discriminator: u64,
+    pub(crate) listener: AnyMouseListener,
+}
+
 #[derive(Clone)]
 pub(crate) struct CursorStyleRequest {
     pub(crate) hitbox_id: Option<HitboxId>,
@@ -741,7 +756,7 @@ pub(crate) struct Frame {
     pub(crate) window_active: bool,
     pub(crate) element_states: FxHashMap<(GlobalElementId, TypeId), ElementStateBox>,
     accessed_element_states: Vec<(GlobalElementId, TypeId)>,
-    pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
+    pub(crate) mouse_listeners: Vec<Option<MouseListenerEntry>>,
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
     pub(crate) hitboxes: Vec<Hitbox>,
@@ -3934,13 +3949,18 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
 
-        self.next_frame.mouse_listeners.push(Some(Box::new(
-            move |event: &dyn Any, phase: DispatchPhase, window: &mut Window, cx: &mut App| {
-                if let Some(event) = event.downcast_ref() {
+        let discriminator = type_name_hash::<Event>();
+        self.next_frame.mouse_listeners.push(Some(MouseListenerEntry {
+            discriminator,
+            listener: Box::new(
+                move |event: &dyn Any, phase: DispatchPhase, window: &mut Window, cx: &mut App| {
+                    // SAFETY: dispatch_mouse_event only calls this listener when the
+                    // discriminator matches the dispatched event's type_name_hash.
+                    let event = unsafe { &*(event as *const dyn Any as *const Event) };
                     listener(event, phase, window, cx)
-                }
-            },
-        )));
+                },
+            ),
+        }));
     }
 
     /// Register a key event listener on this node for the next frame. The type of event
@@ -3959,9 +3979,10 @@ impl Window {
 
         self.next_frame.dispatch_tree.on_key_event(Rc::new(
             move |event: &dyn Any, phase, window: &mut Window, cx: &mut App| {
-                if let Some(event) = event.downcast_ref::<Event>() {
-                    listener(event, phase, window, cx)
-                }
+                // SAFETY: on_key_event callers always pass the correct event type.
+                // TypeId downcast skipped for cross-DLL compatibility.
+                let event = unsafe { &*(event as *const dyn Any as *const Event) };
+                listener(event, phase, window, cx)
             },
         ));
     }
@@ -4205,7 +4226,24 @@ impl Window {
         };
 
         if let Some(any_mouse_event) = event.mouse_event() {
-            self.dispatch_mouse_event(any_mouse_event, cx);
+            // Determine the event discriminator by checking against known event types.
+            // TypeId checks here work because both the event and the check are from the
+            // main binary. The resulting type_name_hash is consistent with DLL-computed
+            // hashes, so DLL-registered listeners match correctly.
+            let discriminator: u64 = if any_mouse_event.is::<MouseDownEvent>() {
+                type_name_hash::<MouseDownEvent>()
+            } else if any_mouse_event.is::<MouseUpEvent>() {
+                type_name_hash::<MouseUpEvent>()
+            } else if any_mouse_event.is::<MouseMoveEvent>() {
+                type_name_hash::<MouseMoveEvent>()
+            } else if any_mouse_event.is::<ScrollWheelEvent>() {
+                type_name_hash::<ScrollWheelEvent>()
+            } else if any_mouse_event.is::<MouseExitEvent>() {
+                type_name_hash::<MouseExitEvent>()
+            } else {
+                0
+            };
+            self.dispatch_mouse_event(any_mouse_event, discriminator, cx);
         } else if let Some(any_key_event) = event.keyboard_event() {
             self.dispatch_key_event(any_key_event, cx);
         }
@@ -4216,7 +4254,7 @@ impl Window {
         }
     }
 
-    fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
+    fn dispatch_mouse_event(&mut self, event: &dyn Any, discriminator: u64, cx: &mut App) {
         let hit_test = self.rendered_frame.hit_test(self.mouse_position());
         if std::env::var_os("GPUI_DEBUG_MOUSE").is_some() {
             eprintln!(
@@ -4263,23 +4301,31 @@ impl Window {
 
         let mut mouse_listeners = mem::take(&mut self.rendered_frame.mouse_listeners);
 
-        // Capture phase, events bubble from back to front. Handlers for this phase are used for
-        // special purposes, such as detecting events outside of a given Bounds.
-        for listener in &mut mouse_listeners {
-            let listener = listener.as_mut().unwrap();
-            listener(event, DispatchPhase::Capture, self, cx);
-            if !cx.propagate_event {
-                break;
+        // Capture phase, events bubble from back to front.
+        // Only listeners whose discriminator matches the dispatched event type are called.
+        // The discriminator (type_name_hash) is consistent across compilation units,
+        // so DLL-registered listeners match correctly.
+        for entry in &mut mouse_listeners {
+            if let Some(entry) = entry {
+                if entry.discriminator == discriminator {
+                    (entry.listener)(event, DispatchPhase::Capture, self, cx);
+                    if !cx.propagate_event {
+                        break;
+                    }
+                }
             }
         }
 
         // Bubble phase, where most normal handlers do their work.
         if cx.propagate_event {
-            for listener in mouse_listeners.iter_mut().rev() {
-                let listener = listener.as_mut().unwrap();
-                listener(event, DispatchPhase::Bubble, self, cx);
-                if !cx.propagate_event {
-                    break;
+            for entry in mouse_listeners.iter_mut().rev() {
+                if let Some(entry) = entry {
+                    if entry.discriminator == discriminator {
+                        (entry.listener)(event, DispatchPhase::Bubble, self, cx);
+                        if !cx.propagate_event {
+                            break;
+                        }
+                    }
                 }
             }
         }
