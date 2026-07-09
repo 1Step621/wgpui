@@ -1509,6 +1509,41 @@ impl Window {
             .map(|view| view.clone().downcast::<E>().ok())
     }
 
+    /// Returns the root view without TypeId-based downcasting.
+    /// Useful for cross-DLL access where type identities differ.
+    pub fn root_view(&self) -> Option<&AnyView> {
+        self.root.as_ref()
+    }
+
+    /// Read the root entity data without TypeId checking.
+    /// # Safety
+    /// The caller must ensure the root is of type T.
+    pub unsafe fn read_root<'a, T: 'static>(&self, cx: &'a App) -> &'a T {
+        let view = self.root_view().expect("window has no root");
+        cx.entities.read_unchecked(view.entity_id())
+    }
+
+    /// Update the root entity data without TypeId checking.
+    /// # Safety
+    /// The caller must ensure the root is of type T.
+    pub unsafe fn update_root<T: 'static, R>(
+        &mut self,
+        cx: &mut App,
+        f: impl FnOnce(&mut T, &mut Window, &mut Context<T>) -> R,
+    ) -> R {
+        let view = self.root_view().expect("window has no root");
+        let entity_id = view.entity_id();
+        let weak = view.downgrade_unchecked::<T>();
+        let mut entity = cx.entities.lease_unchecked::<T>(entity_id);
+        let result = f(
+            &mut entity,
+            self,
+            &mut Context::new_context(cx, weak),
+        );
+        cx.entities.end_lease_unchecked(entity);
+        result
+    }
+
     /// Obtain a handle to the window that belongs to this context.
     pub fn window_handle(&self) -> AnyWindowHandle {
         self.handle

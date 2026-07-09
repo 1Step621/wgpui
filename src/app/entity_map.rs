@@ -153,6 +153,41 @@ impl EntityMap {
         self.entities.insert(lease.id, lease.entity.take().unwrap());
     }
 
+    /// # Safety
+    /// The caller must ensure an entity exists at entity_id and is of type T.
+    pub unsafe fn lease_unchecked<T: 'static>(&mut self, entity_id: EntityId) -> LeaseUnchecked<T> {
+        let mut accessed_entities = self.accessed_entities.get_mut();
+        accessed_entities.insert(entity_id);
+
+        let entity = Some(
+            self.entities
+                .remove(entity_id)
+                .expect("entity not found or already leased"),
+        );
+        LeaseUnchecked {
+            entity,
+            id: entity_id,
+            _phantom: PhantomData,
+        }
+    }
+
+    pub fn end_lease_unchecked<T>(&mut self, mut lease: LeaseUnchecked<T>) {
+        self.entities.insert(lease.id, lease.entity.take().unwrap());
+    }
+
+    /// # Safety
+    /// The caller must ensure an entity exists at entity_id and is of type T.
+    pub unsafe fn read_unchecked<T: 'static>(&self, entity_id: EntityId) -> &T {
+        let mut accessed_entities = self.accessed_entities.borrow_mut();
+        accessed_entities.insert(entity_id);
+
+        let entity = self
+            .entities
+            .get(entity_id)
+            .expect("entity not found or already leased");
+        &*(entity.as_ref() as *const dyn Any as *const T)
+    }
+
     pub fn read<T: 'static>(&self, entity: &Entity<T>) -> &T {
         self.assert_valid_context(entity);
         let mut accessed_entities = self.accessed_entities.borrow_mut();
@@ -235,6 +270,35 @@ impl<T> Drop for Lease<T> {
     fn drop(&mut self) {
         if self.entity.is_some() && !panicking() {
             panic!("Leases must be ended with EntityMap::end_lease")
+        }
+    }
+}
+
+/// Like Lease but avoids TypeId checks for cross-DLL access.
+/// SAFETY: The caller must ensure the entity is of type T.
+pub(crate) struct LeaseUnchecked<T> {
+    entity: Option<Box<dyn Any>>,
+    pub id: EntityId,
+    _phantom: PhantomData<T>,
+}
+
+impl<T: 'static> core::ops::Deref for LeaseUnchecked<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*(self.entity.as_ref().unwrap().as_ref() as *const dyn Any as *const T) }
+    }
+}
+
+impl<T: 'static> core::ops::DerefMut for LeaseUnchecked<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *(self.entity.as_mut().unwrap().as_mut() as *mut dyn Any as *mut T) }
+    }
+}
+
+impl<T> Drop for LeaseUnchecked<T> {
+    fn drop(&mut self) {
+        if self.entity.is_some() && !panicking() {
+            panic!("LeaseUnchecked must be ended with EntityMap::end_lease_unchecked")
         }
     }
 }
@@ -763,6 +827,16 @@ impl<T> Clone for WeakEntity<T> {
 }
 
 impl<T: 'static> WeakEntity<T> {
+    /// Create a WeakEntity from raw parts.
+    /// # Safety
+    /// Caller must ensure the entity exists and is of type T.
+    pub(crate) unsafe fn from_raw(any_entity: AnyWeakEntity) -> Self {
+        Self {
+            any_entity,
+            entity_type: PhantomData,
+        }
+    }
+
     /// Upgrade this weak entity reference into a strong entity reference
     pub fn upgrade(&self) -> Option<Entity<T>> {
         Some(Entity {

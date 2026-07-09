@@ -135,6 +135,12 @@ impl AnyView {
     pub fn entity_id(&self) -> EntityId {
         self.entity.entity_id()
     }
+
+    /// # Safety
+    /// The caller must ensure the underlying entity is of type T.
+    pub unsafe fn downgrade_unchecked<T: 'static>(&self) -> WeakEntity<T> {
+        WeakEntity::from_raw(self.entity.downgrade())
+    }
 }
 
 impl PartialEq for AnyView {
