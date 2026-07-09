@@ -133,6 +133,7 @@ type ModifiersChangedListener = Rc<dyn Fn(&ModifiersChangedEvent, &mut Window, &
 #[derive(Clone)]
 pub(crate) struct DispatchActionListener {
     pub(crate) action_type: TypeId,
+    pub(crate) action_discriminator: u64,
     pub(crate) listener: Rc<dyn Fn(&dyn Any, DispatchPhase, &mut Window, &mut App)>,
 }
 
@@ -333,12 +334,14 @@ impl DispatchTree {
     pub fn on_action(
         &mut self,
         action_type: TypeId,
+        action_discriminator: u64,
         listener: Rc<dyn Fn(&dyn Any, DispatchPhase, &mut Window, &mut App)>,
     ) {
         self.active_node()
             .action_listeners
             .push(DispatchActionListener {
                 action_type,
+                action_discriminator,
                 listener,
             });
     }
@@ -367,8 +370,6 @@ impl DispatchTree {
             for DispatchActionListener { action_type, .. } in &node.action_listeners {
                 if let Err(ix) = actions.binary_search_by_key(action_type, |a| a.as_any().type_id())
                 {
-                    // Intentionally silence these errors without logging.
-                    // If an action cannot be built by default, it's not available.
                     let action = self.action_registry.build_action_type(action_type).ok();
                     if let Some(action) = action {
                         actions.insert(ix, action);

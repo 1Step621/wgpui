@@ -331,8 +331,9 @@ impl Interactivity {
     ) {
         self.action_listeners.push((
             TypeId::of::<A>(),
+            crate::type_name_hash::<A>(),
             Box::new(move |action, phase, window, cx| {
-                let action = action.downcast_ref().unwrap();
+                let action = unsafe { &*(action as *const dyn Any as *const A) };
                 if phase == DispatchPhase::Capture {
                     (listener)(action, window, cx)
                 } else {
@@ -349,8 +350,9 @@ impl Interactivity {
     pub fn on_action<A: Action>(&mut self, listener: impl Fn(&A, &mut Window, &mut App) + 'static) {
         self.action_listeners.push((
             TypeId::of::<A>(),
+            crate::type_name_hash::<A>(),
             Box::new(move |action, phase, window, cx| {
-                let action = action.downcast_ref().unwrap();
+                let action = unsafe { &*(action as *const dyn Any as *const A) };
                 if phase == DispatchPhase::Bubble {
                     (listener)(action, window, cx)
                 }
@@ -372,6 +374,7 @@ impl Interactivity {
         let action = action.boxed_clone();
         self.action_listeners.push((
             (*action).type_id(),
+            0,
             Box::new(move |_, phase, window, cx| {
                 if phase == DispatchPhase::Bubble {
                     (listener)(&*action, window, cx)
@@ -1528,7 +1531,7 @@ pub struct Interactivity {
     pub(crate) key_down_listeners: Vec<KeyDownListener>,
     pub(crate) key_up_listeners: Vec<KeyUpListener>,
     pub(crate) modifiers_changed_listeners: Vec<ModifiersChangedListener>,
-    pub(crate) action_listeners: Vec<(TypeId, ActionListener)>,
+    pub(crate) action_listeners: Vec<(TypeId, u64, ActionListener)>,
     pub(crate) drop_listeners: Vec<(TypeId, DropListener)>,
     pub(crate) can_drop_predicate: Option<CanDropPredicate>,
     pub(crate) click_listeners: Vec<ClickListener>,
@@ -2392,8 +2395,8 @@ impl Interactivity {
             })
         }
 
-        for (action_type, listener) in action_listeners {
-            window.on_action(action_type, listener)
+        for (action_type, action_disc, listener) in action_listeners {
+            window.on_action(action_type, action_disc, listener)
         }
     }
 

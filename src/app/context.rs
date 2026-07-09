@@ -721,7 +721,7 @@ impl<'a, T: 'static> Context<'a, T> {
         listener: impl Fn(&mut T, &dyn Any, DispatchPhase, &mut Window, &mut Context<T>) + 'static,
     ) {
         let handle = self.weak_entity();
-        window.on_action(action_type, move |action, phase, window, cx| {
+        window.on_action(action_type, 0, move |action, phase, window, cx| {
             handle
                 .update(cx, |view, cx| {
                     listener(view, action, phase, window, cx);

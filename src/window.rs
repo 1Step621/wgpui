@@ -4707,13 +4707,15 @@ impl Window {
         // Capture phase for window actions.
         for node_id in &dispatch_path {
             let node = self.rendered_frame.dispatch_tree.node(*node_id);
+            let action_type_id = action.as_any().type_id();
             for DispatchActionListener {
                 action_type,
                 listener,
+                ..
             } in node.action_listeners.clone()
             {
                 let any_action = action.as_any();
-                if action_type == any_action.type_id() {
+                if action_type == action_type_id {
                     listener(any_action, DispatchPhase::Capture, self, cx);
 
                     if !cx.propagate_event {
@@ -4726,13 +4728,15 @@ impl Window {
         // Bubble phase for window actions.
         for node_id in dispatch_path.iter().rev() {
             let node = self.rendered_frame.dispatch_tree.node(*node_id);
+            let action_type_id = action.as_any().type_id();
             for DispatchActionListener {
                 action_type,
                 listener,
+                ..
             } in node.action_listeners.clone()
             {
                 let any_action = action.as_any();
-                if action_type == any_action.type_id() {
+                if action_type == action_type_id {
                     cx.propagate_event = false; // Actions stop propagation by default during the bubble phase
                     listener(any_action, DispatchPhase::Bubble, self, cx);
 
@@ -5028,13 +5032,14 @@ impl Window {
     pub fn on_action(
         &mut self,
         action_type: TypeId,
+        action_discriminator: u64,
         listener: impl Fn(&dyn Any, DispatchPhase, &mut Window, &mut App) + 'static,
     ) {
         self.invalidator.debug_assert_paint();
 
         self.next_frame
             .dispatch_tree
-            .on_action(action_type, Rc::new(listener));
+            .on_action(action_type, action_discriminator, Rc::new(listener));
     }
 
     /// Register a capturing action listener on this node for the next frame if the condition is true.
@@ -5049,6 +5054,7 @@ impl Window {
         &mut self,
         condition: bool,
         action_type: TypeId,
+        action_discriminator: u64,
         listener: impl Fn(&dyn Any, DispatchPhase, &mut Window, &mut App) + 'static,
     ) {
         self.invalidator.debug_assert_paint();
@@ -5056,7 +5062,7 @@ impl Window {
         if condition {
             self.next_frame
                 .dispatch_tree
-                .on_action(action_type, Rc::new(listener));
+                .on_action(action_type, action_discriminator, Rc::new(listener));
         }
     }
 
