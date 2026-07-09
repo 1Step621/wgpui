@@ -3982,8 +3982,8 @@ impl Window {
             discriminator,
             Rc::new(
                 move |event: &dyn Any, phase, window: &mut Window, cx: &mut App| {
-                    // SAFETY: dispatch_key_down_up_event only calls this when
-                    // discriminator matches the dispatched event's type_name_hash.
+                    // SAFETY: dispatch_key_down_up_event only calls this listener
+                    // when its discriminator matches the event's type_name_hash.
                     let event = unsafe { &*(event as *const dyn Any as *const Event) };
                     listener(event, phase, window, cx)
                 },
@@ -4542,11 +4542,14 @@ impl Window {
         dispatch_path: &SmallVec<[DispatchNodeId; 32]>,
         cx: &mut App,
     ) {
-        // Determine discriminator from the event type.
-        let discriminator = if event.is::<KeyDownEvent>() {
+        // Compute cross-DLL discriminator from event type. TypeId checks work here
+        // because both the event and checks are from the main binary.
+        let discriminator: u64 = if event.is::<KeyDownEvent>() {
             type_name_hash::<KeyDownEvent>()
         } else if event.is::<KeyUpEvent>() {
             type_name_hash::<KeyUpEvent>()
+        } else if event.is::<ModifiersChangedEvent>() {
+            type_name_hash::<ModifiersChangedEvent>()
         } else {
             0
         };
