@@ -234,6 +234,7 @@ type ActionBuilder = fn(json: serde_json::Value) -> anyhow::Result<Box<dyn Actio
 pub(crate) struct ActionRegistry {
     by_name: HashMap<&'static str, ActionData>,
     names_by_type_id: HashMap<TypeId, &'static str>,
+    discriminators_by_type_id: HashMap<TypeId, u64>,
     all_names: Vec<&'static str>, // So we can return a static slice.
     deprecated_aliases: HashMap<&'static str, &'static str>, // deprecated name -> preferred name
     deprecation_messages: HashMap<&'static str, &'static str>, // action name -> deprecation message
@@ -245,6 +246,7 @@ impl Default for ActionRegistry {
         let mut this = ActionRegistry {
             by_name: Default::default(),
             names_by_type_id: Default::default(),
+            discriminators_by_type_id: Default::default(),
             documentation: Default::default(),
             all_names: Default::default(),
             deprecated_aliases: Default::default(),

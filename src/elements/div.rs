@@ -330,9 +330,7 @@ impl Interactivity {
         &mut self,
         listener: impl Fn(&A, &mut Window, &mut App) + 'static,
     ) {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        A::name_for_type().hash(&mut hasher);
-        let action_disc = hasher.finish();
+        let action_disc = crate::action_name_hash::<A>();
         self.action_listeners.push((
             TypeId::of::<A>(),
             action_disc,
@@ -352,9 +350,7 @@ impl Interactivity {
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     pub fn on_action<A: Action>(&mut self, listener: impl Fn(&A, &mut Window, &mut App) + 'static) {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        A::name_for_type().hash(&mut hasher);
-        let action_disc = hasher.finish();
+        let action_disc = crate::action_name_hash::<A>();
         self.action_listeners.push((
             TypeId::of::<A>(),
             action_disc,

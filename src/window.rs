@@ -543,6 +543,14 @@ pub(crate) fn type_name_hash<T: 'static>() -> u64 {
     hasher.finish()
 }
 
+/// Cross-DLL discriminator for actions, computed from the action name (e.g. "editor::SaveCurrentFile").
+/// Action names are defined in source and are consistent across compilation units.
+pub(crate) fn action_name_hash<T: crate::Action>() -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    T::name_for_type().hash(&mut hasher);
+    hasher.finish()
+}
+
 /// A mouse listener entry with a type discriminator for cross-DLL event dispatch.
 pub(crate) struct MouseListenerEntry {
     pub(crate) discriminator: u64,
