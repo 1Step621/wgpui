@@ -81,7 +81,7 @@ pub(crate) struct DispatchTree {
 
 #[derive(Default)]
 pub(crate) struct DispatchNode {
-    pub key_listeners: Vec<KeyListener>,
+        pub key_listeners: Vec<(u64, KeyListener)>,
     pub action_listeners: Vec<DispatchActionListener>,
     pub modifiers_changed_listeners: Vec<ModifiersChangedListener>,
     pub context: Option<KeyContext>,
@@ -320,8 +320,8 @@ impl DispatchTree {
         self.nodes.truncate(index);
     }
 
-    pub fn on_key_event(&mut self, listener: KeyListener) {
-        self.active_node().key_listeners.push(listener);
+    pub fn on_key_event(&mut self, discriminator: u64, listener: KeyListener) {
+        self.active_node().key_listeners.push((discriminator, listener));
     }
 
     pub fn on_modifiers_changed(&mut self, listener: ModifiersChangedListener) {
