@@ -2148,6 +2148,19 @@ impl App {
         self.active_drag.is_some()
     }
 
+    /// Returns the TypeId of the currently active drag payload, if any.
+    pub fn active_drag_type_id(&self) -> Option<TypeId> {
+        self.active_drag.as_ref().map(|drag| drag.value.as_ref().type_id())
+    }
+
+    /// Downcasts the active drag payload to type `T`. Returns `None` if no
+    /// drag is active or the payload is not of type `T`.
+    pub fn active_drag_value<T: 'static>(&self) -> Option<&T> {
+        self.active_drag
+            .as_ref()
+            .and_then(|drag| drag.value.as_ref().downcast_ref::<T>())
+    }
+
     /// Gets the cursor style of the currently active drag operation.
     pub fn active_drag_cursor_style(&self) -> Option<CursorStyle> {
         self.active_drag.as_ref().and_then(|drag| drag.cursor_style)
