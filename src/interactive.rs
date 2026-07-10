@@ -697,16 +697,23 @@ mod test {
 
         impl Render for TestEnterLeaveView {
             fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let entered = self.entered;
+                let left = self.left;
                 div()
                     .debug_selector(|| "target".to_string())
-                    .size(px(100.), px(100.))
+                    .w(px(100.))
+                    .h(px(100.))
                     .bg(gpui::red())
-                    .on_mouse_enter(cx.listener(|this, _, _| {
-                        this.entered = true;
-                    }))
-                    .on_mouse_leave(cx.listener(|this, _, _| {
-                        this.left = true;
-                    }))
+                    .on_mouse_enter(
+                        cx.listener(|this, _window, _cx| {
+                            this.entered = true;
+                        }),
+                    )
+                    .on_mouse_leave(
+                        cx.listener(|this, _window, _cx| {
+                            this.left = true;
+                        }),
+                    )
             }
         }
 
@@ -727,7 +734,6 @@ mod test {
             None::<gpui::MouseButton>,
             gpui::Modifiers::none(),
         );
-        cx.run_until_parked();
 
         view.update(cx, |test_view, _| {
             assert!(test_view.entered, "on_mouse_enter should have fired");
@@ -741,7 +747,6 @@ mod test {
             None::<gpui::MouseButton>,
             gpui::Modifiers::none(),
         );
-        cx.run_until_parked();
 
         view.update(cx, |test_view, _| {
             assert!(test_view.entered, "on_mouse_enter should have stayed fired");
@@ -761,11 +766,13 @@ mod test {
         impl Render for TestDragHoverView {
             fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
                 div()
-                    .size(px(400.), px(200.))
+                    .w(px(400.))
+                    .h(px(200.))
                     .child(
                         div()
                             .debug_selector(|| "source".to_string())
-                            .size(px(50.), px(50.))
+                            .w(px(50.))
+                            .h(px(50.))
                             .bg(gpui::blue())
                             .on_drag(TestDragData, |_, _, _, cx| {
                                 cx.new(|_| gpui::Empty)
@@ -774,19 +781,26 @@ mod test {
                     .child(
                         div()
                             .debug_selector(|| "target".to_string())
-                            .size(px(100.), px(100.))
+                            .w(px(100.))
+                            .h(px(100.))
                             .absolute()
                             .left(px(200.))
                             .bg(gpui::red())
-                            .on_mouse_enter(cx.listener(|this, _, _| {
-                                this.mouse_entered = true;
-                            }))
-                            .on_mouse_leave(cx.listener(|this, _, _| {
-                                this.mouse_left = true;
-                            }))
-                            .on_drag_hover::<TestDragData>(cx.listener(|this, &hovered, _, _| {
-                                this.drag_hovered = Some(hovered);
-                            })),
+                            .on_mouse_enter(
+                                cx.listener(|this, _window, _cx| {
+                                    this.mouse_entered = true;
+                                }),
+                            )
+                            .on_mouse_leave(
+                                cx.listener(|this, _window, _cx| {
+                                    this.mouse_left = true;
+                                }),
+                            )
+                            .on_drag_hover::<TestDragData>(
+                                cx.listener(|this, &hovered, _window, _cx| {
+                                    this.drag_hovered = Some(hovered);
+                                }),
+                            ),
                     )
             }
         }
@@ -809,20 +823,19 @@ mod test {
         // Mouse down on source
         cx.simulate_mouse_down(source_center, gpui::MouseButton::Left, gpui::Modifiers::none());
 
-        // Move past drag threshold (2px)
+        // Move past drag threshold (2px) to initiate drag
         cx.simulate_mouse_move(
             point(source_center.x + px(5.), source_center.y),
             gpui::MouseButton::Left,
             gpui::Modifiers::none(),
         );
 
-        // Move into target
+        // Move into target element
         cx.simulate_mouse_move(
             target_center,
             gpui::MouseButton::Left,
             gpui::Modifiers::none(),
         );
-        cx.run_until_parked();
 
         view.update(cx, |test_view, _| {
             assert!(
@@ -847,7 +860,6 @@ mod test {
             gpui::MouseButton::Left,
             gpui::Modifiers::none(),
         );
-        cx.run_until_parked();
 
         view.update(cx, |test_view, _| {
             assert!(
