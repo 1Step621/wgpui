@@ -784,7 +784,7 @@ mod tests {
                 key_context.add("Terminal");
                 window.set_key_context(key_context);
                 window.handle_input(&self.focus_handle, self.clone(), cx);
-                window.on_action(std::any::TypeId::of::<TestAction>(), |_, _, _, _| {});
+                window.on_action(std::any::TypeId::of::<TestAction>(), 0, |_, _, _, _| {});
             }
         }
         impl IntoElement for CustomElement {
