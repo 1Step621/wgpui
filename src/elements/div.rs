@@ -2223,7 +2223,7 @@ impl Interactivity {
                     return;
                 }
                 let Some(active_drag) = &cx.active_drag else { return; };
-                if active_drag.value.type_id() != drag_type_id {
+                if active_drag.value.as_ref().type_id() != drag_type_id {
                     return;
                 }
                 let is_hovered = hitbox.is_hovered(window);
