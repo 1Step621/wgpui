@@ -546,6 +546,7 @@ impl Interactivity {
     /// Bind the given callback to fire when the mouse enters this element's bounds.
     /// Unlike on_hover, this fires regardless of whether a drag is active.
     pub fn on_mouse_enter(&mut self, listener: impl Fn(&mut Window, &mut App) + 'static) {
+        eprintln!("[INTERACTIVITY] on_mouse_enter called, count before push: {}", self.mouse_enter_listeners.len());
         self.mouse_enter_listeners.push(Box::new(listener));
     }
 
@@ -1763,11 +1764,14 @@ impl Interactivity {
                     window.with_content_mask(
                         style.overflow_mask(bounds, window.rem_size()),
                         |window| {
-                            let hitbox = if self.should_insert_hitbox(&style, window, cx) {
-                                Some(window.insert_hitbox(bounds, self.hitbox_behavior))
-                            } else {
-                                None
-                            };
+        let insert = self.should_insert_hitbox(&style, window, cx);
+        eprintln!("[PAINT] should_insert_hitbox={}, enter_listeners_len={}, leave_listeners_len={}, drag_listeners_len={}",
+            insert, self.mouse_enter_listeners.len(), self.mouse_leave_listeners.len(), self.drag_hover_listeners.len());
+        let hitbox = if insert {
+            Some(window.insert_hitbox(bounds, self.hitbox_behavior))
+        } else {
+            None
+        };
 
                             let scroll_offset =
                                 self.clamp_scroll_position(bounds, &style, window, cx);
@@ -1781,7 +1785,7 @@ impl Interactivity {
     }
 
     fn should_insert_hitbox(&self, style: &Style, window: &Window, cx: &App) -> bool {
-        self.hitbox_behavior != HitboxBehavior::Normal
+        let result = self.hitbox_behavior != HitboxBehavior::Normal
             || self.window_control.is_some()
             || style.mouse_cursor.is_some()
             || self.group.is_some()
@@ -1801,7 +1805,16 @@ impl Interactivity {
             || self.drag_listener.is_some()
             || !self.drop_listeners.is_empty()
             || self.tooltip_builder.is_some()
-            || window.is_inspector_picking(cx)
+            || window.is_inspector_picking(cx);
+        eprintln!("[SHOULD_INSERT] result={} enter={} leave={} drag_hover={} hover_style={} hover_listener={}",
+            result,
+            self.mouse_enter_listeners.len(),
+            self.mouse_leave_listeners.len(),
+            self.drag_hover_listeners.len(),
+            self.hover_style.is_some(),
+            self.hover_listener.is_some(),
+        );
+        result
     }
 
     fn clamp_scroll_position(
@@ -1945,6 +1958,7 @@ impl Interactivity {
                                                 );
                                             }
 
+                                            eprintln!("[PAINT_INNER] calling paint_mouse_listeners");
                                             self.paint_mouse_listeners(
                                                 hitbox,
                                                 element_state.as_mut(),
@@ -2106,6 +2120,11 @@ impl Interactivity {
         window: &mut Window,
         cx: &mut App,
     ) {
+        eprintln!("[PAINT_MOUSE] entered, drag_hover={} enter={} leave={}",
+            self.drag_hover_listeners.len(),
+            self.mouse_enter_listeners.len(),
+            self.mouse_leave_listeners.len(),
+        );
         let is_focused = self
             .tracked_focus_handle
             .as_ref()
@@ -2212,7 +2231,9 @@ impl Interactivity {
             });
         }
 
+        eprintln!("[PAINT_MOUSE] element_state.is_some={}", element_state.is_some());
         if let Some(element_state) = element_state {
+            eprintln!("[PAINT_MOUSE] entering element_state block");
             if !click_listeners.is_empty() || drag_listener.is_some() {
                 let pending_mouse_down = element_state
                     .pending_mouse_down
@@ -2376,20 +2397,34 @@ impl Interactivity {
                     .get_or_insert_with(Default::default)
                     .clone();
 
+                eprintln!(
+                    "[DRAG_HOVER] registering drag_hover listener for type {:?} hitbox {:?}",
+                    drag_type_id, hitbox.id,
+                );
+
                 window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
                     if phase != DispatchPhase::Bubble {
                         return;
                     }
-                    let Some(active_drag) = &cx.active_drag else { return; };
+                    let Some(active_drag) = &cx.active_drag else {
+                        eprintln!("[DRAG_HOVER] no active drag, skipping");
+                        return;
+                    };
                     if active_drag.value.type_id() != drag_type_id {
+                        eprintln!("[DRAG_HOVER] type mismatch");
                         return;
                     }
                     let is_hovered = hitbox.is_hovered(window);
                     let mut state = drag_hover_state.borrow_mut();
                     let was_hovered = state.entry(drag_type_id).or_insert(false);
+                    eprintln!(
+                        "[DRAG_HOVER] move check: is_hovered={}, was_hovered={}",
+                        is_hovered, *was_hovered,
+                    );
                     if is_hovered != *was_hovered {
                         *was_hovered = is_hovered;
                         drop(state);
+                        eprintln!("[DRAG_HOVER] firing listener with {}", is_hovered);
                         listener(&is_hovered, window, cx);
                     }
                 });
@@ -2404,21 +2439,34 @@ impl Interactivity {
                     .get_or_insert_with(Default::default)
                     .clone();
 
+                eprintln!(
+                    "[MOUSE_EVENTS] registering {} enter + {} leave listeners for hitbox {:?}",
+                    enter_listeners.len(),
+                    leave_listeners.len(),
+                    hitbox.id,
+                );
+
                 window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
                     if phase != DispatchPhase::Bubble {
                         return;
                     }
                     let is_hovered = hitbox.is_hovered(window);
                     let mut state = mouse_enter_leave_state.borrow_mut();
+                    eprintln!(
+                        "[MOUSE_EVENTS] mouse_move enter/leave check: is_hovered={}, prev_state={}",
+                        is_hovered, *state,
+                    );
                     if is_hovered != *state {
                         *state = is_hovered;
                         drop(state);
                         if is_hovered {
                             for listener in &enter_listeners {
+                                eprintln!("[MOUSE_EVENTS] calling on_mouse_enter");
                                 listener(window, cx);
                             }
                         } else {
                             for listener in &leave_listeners {
+                                eprintln!("[MOUSE_EVENTS] calling on_mouse_leave");
                                 listener(window, cx);
                             }
                         }
