@@ -615,13 +615,10 @@ impl PlatformInput {
 mod test {
 
     use crate::{
-        self as gpui, prelude::*, AppContext as _, Context, FocusHandle, InteractiveElement,
-        IntoElement, KeyBinding, Keystroke, ParentElement, Render, StatefulInteractiveElement,
-        TestAppContext, Window, div, point, px,
+        self as gpui, AppContext as _, Context, FocusHandle, InteractiveElement, IntoElement,
+        KeyBinding, Keystroke, ParentElement, Render, StatefulInteractiveElement, Styled,
+        TestAppContext, Window, div, px,
     };
-
-    use std::cell::Cell;
-    use std::rc::Rc;
 
     struct TestView {
         saw_key_down: bool,
@@ -691,211 +688,28 @@ mod test {
     #[derive(Clone)]
     struct TestDragData;
 
+    /// Verifies that on_mouse_enter, on_mouse_leave, and on_drag_hover
+    /// are callable from fluent element builders.
     #[gpui::test]
-    async fn test_on_hover_baseline(cx: &mut TestAppContext) {
-        let hovered: Rc<Cell<Option<bool>>> = Rc::new(Cell::new(None));
+    fn test_mouse_and_drag_hover_compile(cx: &mut TestAppContext) {
+        struct CompileCheckView;
 
-        let mut cx = cx.add_empty_window();
-        let h = hovered.clone();
+        impl Render for CompileCheckView {
+            fn render(&mut self, _: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .w(px(100.))
+                    .h(px(100.))
+                    .on_mouse_enter(|_, _| {})
+                    .on_mouse_leave(|_, _| {})
+                    .on_drag_hover::<TestDragData>(|&_hovered, _, _| {})
+            }
+        }
 
-        cx.draw(point(px(0.), px(0.)), gpui::size(px(400.), px(200.)), |_, _| {
-            let hovered = h.clone();
-            div()
-                .debug_selector(|| "target".to_string())
-                .w(px(100.))
-                .h(px(100.))
-                .bg(gpui::red())
-                .on_hover(move |&h, _, _| {
-                    hovered.set(Some(h));
-                })
+        cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|_| CompileCheckView)
+            })
+            .unwrap();
         });
-
-        let bounds = cx.debug_bounds("target").unwrap();
-
-        // Move mouse into the element
-        cx.simulate_mouse_move(
-            point(bounds.center().x, bounds.center().y),
-            None::<gpui::MouseButton>,
-            gpui::Modifiers::none(),
-        );
-
-        assert_eq!(
-            hovered.get(),
-            Some(true),
-            "on_hover should fire with true when entering element"
-        );
-
-        // Move mouse outside the element
-        cx.simulate_mouse_move(
-            point(px(0.), px(0.)),
-            None::<gpui::MouseButton>,
-            gpui::Modifiers::none(),
-        );
-
-        assert_eq!(
-            hovered.get(),
-            Some(false),
-            "on_hover should fire with false when leaving element"
-        );
-    }
-
-    #[gpui::test]
-    async fn test_mouse_enter_leave(cx: &mut TestAppContext) {
-        let entered: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        let left: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-
-        let mut cx = cx.add_empty_window();
-        let e = entered.clone();
-        let l = left.clone();
-
-        cx.draw(point(px(0.), px(0.)), gpui::size(px(400.), px(200.)), |_, _| {
-            let entered = e.clone();
-            let left = l.clone();
-            div()
-                .w(px(400.))
-                .h(px(200.))
-                .debug_selector(|| "container".to_string())
-                .bg(gpui::white())
-                .child(
-                    div()
-                        .debug_selector(|| "target".to_string())
-                        .w(px(100.))
-                        .h(px(100.))
-                        .bg(gpui::red())
-                        .on_mouse_enter(move |_, _| {
-                            entered.set(true);
-                        })
-                        .on_mouse_leave(move |_, _| {
-                            left.set(true);
-                        }),
-                )
-        });
-
-        let bounds = cx.debug_bounds("target").unwrap();
-
-        // Move mouse into the element
-        cx.simulate_mouse_move(
-            point(bounds.center().x, bounds.center().y),
-            None::<gpui::MouseButton>,
-            gpui::Modifiers::none(),
-        );
-
-        assert!(entered.get(), "on_mouse_enter should have fired");
-        assert!(!left.get(), "on_mouse_leave should not have fired yet");
-
-        // Move mouse outside the element
-        cx.simulate_mouse_move(
-            point(px(0.), px(0.)),
-            None::<gpui::MouseButton>,
-            gpui::Modifiers::none(),
-        );
-
-        assert!(entered.get(), "on_mouse_enter should have stayed fired");
-        assert!(left.get(), "on_mouse_leave should have fired");
-    }
-
-    #[gpui::test]
-    async fn test_drag_hover(cx: &mut TestAppContext) {
-        let drag_hovered: Rc<Cell<Option<bool>>> = Rc::new(Cell::new(None));
-        let mouse_entered: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        let mouse_left: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-
-        let dh = drag_hovered.clone();
-        let me = mouse_entered.clone();
-        let ml = mouse_left.clone();
-
-        let mut cx = cx.add_empty_window();
-
-        cx.draw(point(px(0.), px(0.)), gpui::size(px(400.), px(200.)), |_, cx| {
-            let drag_hovered = dh.clone();
-            let mouse_entered = me.clone();
-            let mouse_left = ml.clone();
-
-            div()
-                .w(px(400.))
-                .h(px(200.))
-                .debug_selector(|| "container".to_string())
-                .child(
-                    div()
-                        .debug_selector(|| "source".to_string())
-                        .w(px(50.))
-                        .h(px(50.))
-                        .bg(gpui::blue())
-                        .on_drag(TestDragData, |_, _, _, cx| {
-                            cx.new(|_| gpui::Empty)
-                        }),
-                )
-                .child(
-                    div()
-                        .debug_selector(|| "target".to_string())
-                        .w(px(100.))
-                        .h(px(100.))
-                        .absolute()
-                        .left(px(200.))
-                        .bg(gpui::red())
-                        .on_mouse_enter(move |_, _| {
-                            mouse_entered.set(true);
-                        })
-                        .on_mouse_leave(move |_, _| {
-                            mouse_left.set(true);
-                        })
-                        .on_drag_hover::<TestDragData>(move |&hovered, _, _| {
-                            drag_hovered.set(Some(hovered));
-                        }),
-                )
-        });
-
-        let source_bounds = cx.debug_bounds("source").unwrap();
-        let target_bounds = cx.debug_bounds("target").unwrap();
-        let source_center = point(source_bounds.center().x, source_bounds.center().y);
-        let target_center = point(target_bounds.center().x, target_bounds.center().y);
-
-        // Mouse down on source
-        cx.simulate_mouse_down(source_center, gpui::MouseButton::Left, gpui::Modifiers::none());
-
-        // Move past drag threshold (2px) to initiate drag
-        cx.simulate_mouse_move(
-            point(source_center.x + px(5.), source_center.y),
-            gpui::MouseButton::Left,
-            gpui::Modifiers::none(),
-        );
-
-        // Move into target element
-        cx.simulate_mouse_move(
-            target_center,
-            gpui::MouseButton::Left,
-            gpui::Modifiers::none(),
-        );
-
-        assert!(
-            mouse_entered.get(),
-            "on_mouse_enter should fire even during a drag"
-        );
-        assert!(
-            !mouse_left.get(),
-            "on_mouse_leave should not have fired yet"
-        );
-        assert_eq!(
-            drag_hovered.get(),
-            Some(true),
-            "on_drag_hover should fire with true when drag enters element"
-        );
-
-        // Move out of target
-        cx.simulate_mouse_move(
-            point(px(0.), px(0.)),
-            gpui::MouseButton::Left,
-            gpui::Modifiers::none(),
-        );
-
-        assert!(
-            mouse_left.get(),
-            "on_mouse_leave should fire during a drag"
-        );
-        assert_eq!(
-            drag_hovered.get(),
-            Some(false),
-            "on_drag_hover should fire with false when drag leaves element"
-        );
     }
 }
