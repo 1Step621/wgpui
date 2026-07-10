@@ -201,6 +201,10 @@ name = "wgpu_surface_stress"
 path = "examples/learn/wgpu_surface_stress.rs"
 
 [[example]]
+name = "mouse_events"
+path = "examples/learn/mouse_events.rs"
+
+[[example]]
 name = "blur_showcase"
 path = "examples/learn/blur_showcase.rs"
 
