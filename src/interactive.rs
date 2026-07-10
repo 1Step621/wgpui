@@ -697,23 +697,19 @@ mod test {
 
         impl Render for TestEnterLeaveView {
             fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-                let entered = self.entered;
-                let left = self.left;
+                let enter = cx.entity().downgrade();
+                let leave = cx.entity().downgrade();
                 div()
                     .debug_selector(|| "target".to_string())
                     .w(px(100.))
                     .h(px(100.))
                     .bg(gpui::red())
-                    .on_mouse_enter(
-                        cx.listener(|this, _window, _cx| {
-                            this.entered = true;
-                        }),
-                    )
-                    .on_mouse_leave(
-                        cx.listener(|this, _window, _cx| {
-                            this.left = true;
-                        }),
-                    )
+                    .on_mouse_enter(move |_, cx| {
+                        enter.update(cx, |this, _| this.entered = true).ok();
+                    })
+                    .on_mouse_leave(move |_, cx| {
+                        leave.update(cx, |this, _| this.left = true).ok();
+                    })
             }
         }
 
@@ -765,6 +761,10 @@ mod test {
 
         impl Render for TestDragHoverView {
             fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let enter = cx.entity().downgrade();
+                let leave = cx.entity().downgrade();
+                let drag_enter = cx.entity().downgrade();
+                let drag_leave = cx.entity().downgrade();
                 div()
                     .w(px(400.))
                     .h(px(200.))
@@ -786,21 +786,19 @@ mod test {
                             .absolute()
                             .left(px(200.))
                             .bg(gpui::red())
-                            .on_mouse_enter(
-                                cx.listener(|this, _window, _cx| {
-                                    this.mouse_entered = true;
-                                }),
-                            )
-                            .on_mouse_leave(
-                                cx.listener(|this, _window, _cx| {
-                                    this.mouse_left = true;
-                                }),
-                            )
-                            .on_drag_hover::<TestDragData>(
-                                cx.listener(|this, &hovered, _window, _cx| {
-                                    this.drag_hovered = Some(hovered);
-                                }),
-                            ),
+                            .on_mouse_enter(move |_, cx| {
+                                enter.update(cx, |this, _| this.mouse_entered = true).ok();
+                            })
+                            .on_mouse_leave(move |_, cx| {
+                                leave.update(cx, |this, _| this.mouse_left = true).ok();
+                            })
+                            .on_drag_hover::<TestDragData>(move |&hovered, _, cx| {
+                                if hovered {
+                                    drag_enter.update(cx, |this, _| this.drag_hovered = Some(true)).ok();
+                                } else {
+                                    drag_leave.update(cx, |this, _| this.drag_hovered = Some(false)).ok();
+                                }
+                            }),
                     )
             }
         }
