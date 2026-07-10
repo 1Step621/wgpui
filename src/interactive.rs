@@ -736,8 +736,7 @@ mod test {
         view.update(cx, |test_view, _| {
             assert!(test_view.entered, "on_mouse_enter should have fired");
             assert!(!test_view.left, "on_mouse_leave should not have fired yet");
-        })
-        .unwrap();
+        });
 
         // Move mouse outside the element
         cx.simulate_mouse_move(
@@ -749,8 +748,7 @@ mod test {
         view.update(cx, |test_view, _| {
             assert!(test_view.entered, "on_mouse_enter should have stayed fired");
             assert!(test_view.left, "on_mouse_leave should have fired");
-        })
-        .unwrap();
+        });
     }
 
     #[gpui::test]
