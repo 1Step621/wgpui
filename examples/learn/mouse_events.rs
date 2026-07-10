@@ -1,52 +1,39 @@
 //! Mouse Events & Drag Hover Example
 //!
-//! Demonstrates the new on_mouse_enter, on_mouse_leave, and on_drag_hover callbacks.
-//!
-//! ## How to test
-//!
-//! ### on_mouse_enter / on_mouse_leave
-//! 1. Move your mouse into the blue box — "Entered" lights up, box turns green
-//! 2. Move your mouse out of the blue box — "Left" lights up, box turns blue again
-//! 3. These fire even while a drag is active (unlike on_hover)
-//!
-//! ### on_drag_hover
-//! 1. Click and drag the orange "Drag Me" box
-//! 2. While dragging, move the cursor over the blue box — "Dragging Over" lights up
-//! 3. Move the cursor out of the blue box while still dragging — clears
-//! 4. Release to drop
+//! Demonstrates on_hover (blocks during drags) vs on_mouse_enter/leave (fire
+//! during drags) and on_drag_hover (typed drag enter/leave).
 
 #[path = "../prelude.rs"]
 mod example_prelude;
 use example_prelude::init_example;
 
 use gpui::{
-    App, Application, Bounds, Context, Entity, Hsla, IntoElement, MouseButton,
-    Pixels, Point, Render, Styled, Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
+    App, Application, Bounds, Context, Hsla, IntoElement, Render, Styled, Window,
+    WindowBounds, WindowOptions, div, prelude::*, px, size,
 };
 
 struct DragPayload;
 
 struct MouseEventsExample {
-    /// True while the cursor is inside the hover target (any state, including drags)
     hovered: bool,
-    /// True while a drag of DragPayload is inside the hover target
+    mouse_inside: bool,
     drag_hovered: bool,
 }
 
 impl Render for MouseEventsExample {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let bg = if self.drag_hovered {
-            gpui::green()
-        } else if self.hovered {
-            gpui::green()
+        let target_bg: Hsla = if self.drag_hovered {
+            gpui::rgb(0x22c55e).into()
+        } else if self.mouse_inside {
+            gpui::rgb(0x3b82f6).into()
         } else {
-            gpui::blue()
+            gpui::rgb(0x1e3a5f).into()
         };
 
-        let on_enter = cx.entity().downgrade();
-        let on_leave = cx.entity().downgrade();
-        let on_drag_enter = cx.entity().downgrade();
-        let on_drag_leave = cx.entity().downgrade();
+        let mi = cx.entity().downgrade();
+        let mo = cx.entity().downgrade();
+        let de = cx.entity().downgrade();
+        let dl = cx.entity().downgrade();
 
         div()
             .size_full()
@@ -65,8 +52,9 @@ impl Render for MouseEventsExample {
                 div()
                     .text_color(gpui::rgb(0x8888aa))
                     .text_sm()
-                    .child("1. Hover the blue box — on_mouse_enter/leave fire")
-                    .child("2. Drag the orange box over the blue box — on_drag_hover fires"),
+                    .child("1. Hover the target — on_hover AND on_mouse_enter fire")
+                    .child("2. Drag the orange box over the target — on_hover STOPS, on_mouse_enter continues")
+                    .child("3. on_drag_hover fires ONLY when dragging the orange box over the target"),
             )
             .child(
                 div()
@@ -74,43 +62,52 @@ impl Render for MouseEventsExample {
                     .flex_row()
                     .gap_6()
                     .items_start()
-                    .child(self.render_status_panel())
+                    .child(render_status_panel(
+                        self.hovered,
+                        self.mouse_inside,
+                        self.drag_hovered,
+                    ))
                     .child(
                         div()
+                            .id("target")
                             .w(px(200.))
                             .h(px(200.))
                             .rounded_lg()
-                            .bg(bg)
+                            .bg(target_bg)
                             .flex()
                             .items_center()
                             .justify_center()
                             .text_color(gpui::white())
                             .text_lg()
-                            .child(
+                            .child({
                                 if self.drag_hovered {
                                     "DROP HERE"
-                                } else if self.hovered {
-                                    "HOVERED"
+                                } else if self.mouse_inside {
+                                    "INSIDE"
                                 } else {
                                     "TARGET"
-                                },
-                            )
+                                }
+                            })
+                            .on_hover(cx.listener(move |this, &h, _, _| {
+                                this.hovered = h;
+                            }))
                             .on_mouse_enter(move |_, cx| {
-                                let _ = on_enter.update(cx, |this, _| this.hovered = true);
+                                let _ = mi.update(cx, |this, _| this.mouse_inside = true);
                             })
                             .on_mouse_leave(move |_, cx| {
-                                let _ = on_leave.update(cx, |this, _| this.hovered = false);
+                                let _ = mo.update(cx, |this, _| this.mouse_inside = false);
                             })
-                            .on_drag_hover::<DragPayload>(move |&hovered, _, cx| {
-                                if hovered {
-                                    let _ = on_drag_enter.update(cx, |this, _| this.drag_hovered = true);
+                            .on_drag_hover::<DragPayload>(move |&h, _, cx| {
+                                if h {
+                                    let _ = de.update(cx, |this, _| this.drag_hovered = true);
                                 } else {
-                                    let _ = on_drag_leave.update(cx, |this, _| this.drag_hovered = false);
+                                    let _ = dl.update(cx, |this, _| this.drag_hovered = false);
                                 }
                             }),
                     )
                     .child(
                         div()
+                            .id("source")
                             .w(px(120.))
                             .h(px(120.))
                             .rounded_lg()
@@ -128,43 +125,39 @@ impl Render for MouseEventsExample {
     }
 }
 
-impl MouseEventsExample {
-    fn render_status_panel(&self) -> impl IntoElement {
-        let hovered = self.hovered;
-        let drag_hovered = self.drag_hovered;
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .p_6()
-            .rounded_lg()
-            .bg(gpui::rgb(0x16213e))
-            .border_1()
-            .border_color(gpui::rgb(0x0f3460))
-            .child(
-                div()
-                    .text_color(gpui::white())
-                    .child("Status"),
-            )
-            .child(status_row("Mouse Entered", hovered))
-            .child(status_row("Mouse Left", !hovered))
-            .child(status_row("Dragging Over", drag_hovered))
-    }
+fn render_status_panel(hovered: bool, inside: bool, drag_hovered: bool) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .p_6()
+        .rounded_lg()
+        .bg(gpui::rgb(0x16213e))
+        .border_1()
+        .border_color(gpui::rgb(0x0f3460))
+        .child(div().text_color(gpui::white()).child("Status"))
+        .child(status_row("on_hover", hovered))
+        .child(status_row("on_mouse_enter", inside))
+        .child(status_row("on_drag_hover", drag_hovered))
 }
 
 fn status_row(label: &str, active: bool) -> impl IntoElement {
-    let color: Hsla = if active { gpui::green() } else { gpui::rgb(0x333333).into() };
-    let text_color: Hsla = if active { gpui::white() } else { gpui::rgb(0x666666).into() };
+    let color: Hsla = if active {
+        gpui::green()
+    } else {
+        gpui::rgb(0x333333).into()
+    };
+    let text_color: Hsla = if active {
+        gpui::white()
+    } else {
+        gpui::rgb(0x666666).into()
+    };
     div()
         .flex()
         .items_center()
         .gap_2()
         .child(div().w(px(12.)).h(px(12.)).rounded_full().bg(color))
-        .child(
-            div()
-                .text_color(text_color)
-                .child(label.to_string()),
-        )
+        .child(div().text_color(text_color).child(label.to_string()))
 }
 
 fn main() {
@@ -179,6 +172,7 @@ fn main() {
             |_, cx| {
                 cx.new(|_| MouseEventsExample {
                     hovered: false,
+                    mouse_inside: false,
                     drag_hovered: false,
                 })
             },
