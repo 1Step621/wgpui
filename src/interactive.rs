@@ -615,10 +615,12 @@ impl PlatformInput {
 mod test {
 
     use crate::{
-        self as gpui, AppContext as _, Context, FocusHandle, InteractiveElement, IntoElement,
-        KeyBinding, Keystroke, ParentElement, Render, StatefulInteractiveElement,
+        self as gpui, prelude::*, AppContext as _, Context, FocusHandle, InteractiveElement,
+        IntoElement, KeyBinding, Keystroke, ParentElement, Render, StatefulInteractiveElement,
         TestAppContext, Window, div, point, px,
     };
+
+    use gpui::Styled as _;
 
     struct TestView {
         saw_key_down: bool,
