@@ -1,7 +1,4 @@
-//! Mouse Events & Drag Hover Example
-//!
-//! Demonstrates on_hover (blocks during drags) vs on_mouse_enter/leave (fire
-//! during drags) and on_drag_hover (typed drag enter/leave).
+//! Mouse Events & Drag Hover Example — matches the style of interactive_elements.rs
 
 #[path = "../prelude.rs"]
 mod example_prelude;
@@ -12,7 +9,23 @@ use gpui::{
     WindowBounds, WindowOptions, div, prelude::*, px, size,
 };
 
+#[derive(Clone, Copy)]
 struct DragPayload;
+
+impl Render for DragPayload {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w(px(120.))
+            .h(px(40.))
+            .bg(gpui::rgb(0xe85d04))
+            .rounded_lg()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_color(gpui::white())
+            .child("Dragging...")
+    }
+}
 
 struct MouseEventsExample {
     hovered: bool,
@@ -52,9 +65,9 @@ impl Render for MouseEventsExample {
                 div()
                     .text_color(gpui::rgb(0x8888aa))
                     .text_sm()
-                    .child("1. Hover the target — on_hover AND on_mouse_enter fire")
-                    .child("2. Drag the orange box over the target — on_hover STOPS, on_mouse_enter continues")
-                    .child("3. on_drag_hover fires ONLY when dragging the orange box over the target"),
+                    .child("1. Hover target — on_hover AND on_mouse_enter fire")
+                    .child("2. Drag the orange box over target — on_hover STOPS, on_mouse_enter continues")
+                    .child("3. on_drag_hover fires ONLY when dragging over target"),
             )
             .child(
                 div()
@@ -79,16 +92,14 @@ impl Render for MouseEventsExample {
                             .justify_center()
                             .text_color(gpui::white())
                             .text_lg()
-                            .child({
-                                if self.drag_hovered {
-                                    "DROP HERE"
-                                } else if self.mouse_inside {
-                                    "INSIDE"
-                                } else {
-                                    "TARGET"
-                                }
+                            .child(if self.drag_hovered {
+                                "DROP HERE"
+                            } else if self.mouse_inside {
+                                "INSIDE"
+                            } else {
+                                "TARGET"
                             })
-                            .on_hover(cx.listener(move |this, &h, _, _| {
+                            .on_hover(cx.listener(|this, &h, _, _| {
                                 this.hovered = h;
                             }))
                             .on_mouse_enter(move |_, cx| {
@@ -117,8 +128,8 @@ impl Render for MouseEventsExample {
                             .justify_center()
                             .text_color(gpui::white())
                             .child("Drag Me")
-                            .on_drag(DragPayload, |_, _, _, cx| {
-                                cx.new(|_| gpui::Empty)
+                            .on_drag(DragPayload, |data: &DragPayload, position, _, cx| {
+                                cx.new(|_| *data)
                             }),
                     ),
             )
