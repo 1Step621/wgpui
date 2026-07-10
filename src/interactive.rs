@@ -849,8 +849,7 @@ mod test {
                 Some(true),
                 "on_drag_hover should fire with true when drag enters element"
             );
-        })
-        .unwrap();
+        });
 
         // Move out of target
         cx.simulate_mouse_move(
@@ -869,7 +868,6 @@ mod test {
                 Some(false),
                 "on_drag_hover should fire with false when drag leaves element"
             );
-        })
-        .unwrap();
+        });
     }
 }
