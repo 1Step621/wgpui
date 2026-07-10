@@ -693,31 +693,16 @@ mod test {
 
     #[gpui::test]
     async fn test_mouse_enter_leave(cx: &mut TestAppContext) {
-        struct TestEnterLeaveView {
-            entered: Rc<Cell<bool>>,
-            left: Rc<Cell<bool>>,
-        }
-
-        impl Render for TestEnterLeaveView {
-            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-                let entered = self.entered.clone();
-                let left = self.left.clone();
-                div()
-                    .w(px(100.))
-                    .h(px(100.))
-                    .bg(gpui::red())
-                    .on_mouse_enter(move |_, _| {
-                        entered.set(true);
-                    })
-                    .on_mouse_leave(move |_, _| {
-                        left.set(true);
-                    })
-            }
-        }
+        let entered: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let left: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
         let mut cx = cx.add_empty_window();
+        let e = entered.clone();
+        let l = left.clone();
 
-        cx.draw(point(px(0.), px(0.)), gpui::size(px(400.), px(200.)), |_, cx| {
+        cx.draw(point(px(0.), px(0.)), gpui::size(px(400.), px(200.)), |_, _| {
+            let entered = e.clone();
+            let left = l.clone();
             div()
                 .w(px(400.))
                 .h(px(200.))
