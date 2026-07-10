@@ -692,6 +692,54 @@ mod test {
     struct TestDragData;
 
     #[gpui::test]
+    async fn test_on_hover_baseline(cx: &mut TestAppContext) {
+        let hovered: Rc<Cell<Option<bool>>> = Rc::new(Cell::new(None));
+
+        let mut cx = cx.add_empty_window();
+        let h = hovered.clone();
+
+        cx.draw(point(px(0.), px(0.)), gpui::size(px(400.), px(200.)), |_, _| {
+            let hovered = h.clone();
+            div()
+                .debug_selector(|| "target".to_string())
+                .w(px(100.))
+                .h(px(100.))
+                .bg(gpui::red())
+                .on_hover(move |&h, _, _| {
+                    hovered.set(Some(h));
+                })
+        });
+
+        let bounds = cx.debug_bounds("target").unwrap();
+
+        // Move mouse into the element
+        cx.simulate_mouse_move(
+            point(bounds.center().x, bounds.center().y),
+            None::<gpui::MouseButton>,
+            gpui::Modifiers::none(),
+        );
+
+        assert_eq!(
+            hovered.get(),
+            Some(true),
+            "on_hover should fire with true when entering element"
+        );
+
+        // Move mouse outside the element
+        cx.simulate_mouse_move(
+            point(px(0.), px(0.)),
+            None::<gpui::MouseButton>,
+            gpui::Modifiers::none(),
+        );
+
+        assert_eq!(
+            hovered.get(),
+            Some(false),
+            "on_hover should fire with false when leaving element"
+        );
+    }
+
+    #[gpui::test]
     async fn test_mouse_enter_leave(cx: &mut TestAppContext) {
         let entered: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let left: Rc<Cell<bool>> = Rc::new(Cell::new(false));
