@@ -528,6 +528,35 @@ impl Interactivity {
     /// The imperative API equivalent to [`StatefulInteractiveElement::on_hover`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
+    /// Bind the given callback on drag enter and leave events for drags of type `D`.
+    /// The boolean is `true` when a drag of type `D` enters the element and `false` when it leaves.
+    /// Only fires while a drag of type `D` is active.
+    pub fn on_drag_hover<D: 'static>(
+        &mut self,
+        listener: impl Fn(&bool, &mut Window, &mut App) + 'static,
+    ) {
+        self.drag_hover_listeners.push((
+            TypeId::of::<D>(),
+            Box::new(listener),
+        ));
+    }
+
+    /// Bind the given callback on the hover start and end events of this element. Note that the boolean
+    /// passed to the callback is true when the hover starts and false when it ends.
+    /// Bind the given callback to fire when the mouse enters this element's bounds.
+    /// Unlike on_hover, this fires regardless of whether a drag is active.
+    pub fn on_mouse_enter(&mut self, listener: impl Fn(&mut Window, &mut App) + 'static) {
+        self.mouse_enter_listeners.push(Box::new(listener));
+    }
+
+    /// Bind the given callback to fire when the mouse leaves this element's bounds.
+    /// Unlike on_hover, this fires regardless of whether a drag is active.
+    pub fn on_mouse_leave(&mut self, listener: impl Fn(&mut Window, &mut App) + 'static) {
+        self.mouse_leave_listeners.push(Box::new(listener));
+    }
+
+    /// Bind the given callback on the hover start and end events of this element. Note that the boolean
+    /// passed to the callback is true when the hover starts and false when it ends.
     pub fn on_hover(&mut self, listener: impl Fn(&bool, &mut Window, &mut App) + 'static)
     where
         Self: Sized,
@@ -1161,6 +1190,40 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Bind the given callback on drag enter and leave events for drags of type `D`.
+    /// The boolean is `true` when a drag of type `D` enters the element and `false` when it leaves.
+    /// Only fires while a drag of type `D` is active.
+    /// The fluent API equivalent to [`Interactivity::on_drag_hover`].
+    ///
+    /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
+    fn on_drag_hover<D: 'static>(
+        mut self,
+        listener: impl Fn(&bool, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().on_drag_hover::<D>(listener);
+        self
+    }
+
+    /// Bind the given callback to fire when the mouse enters this element's bounds.
+    /// Unlike on_hover, this fires regardless of whether a drag is active.
+    /// The fluent API equivalent to [`Interactivity::on_mouse_enter`].
+    ///
+    /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
+    fn on_mouse_enter(mut self, listener: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        self.interactivity().on_mouse_enter(listener);
+        self
+    }
+
+    /// Bind the given callback to fire when the mouse leaves this element's bounds.
+    /// Unlike on_hover, this fires regardless of whether a drag is active.
+    /// The fluent API equivalent to [`Interactivity::on_mouse_leave`].
+    ///
+    /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
+    fn on_mouse_leave(mut self, listener: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        self.interactivity().on_mouse_leave(listener);
+        self
+    }
+
     /// Bind the given callback on the hover start and end events of this element. Note that the boolean
     /// passed to the callback is true when the hover starts and false when it ends.
     /// The fluent API equivalent to [`Interactivity::on_hover`].
@@ -1520,13 +1583,19 @@ pub struct Interactivity {
     pub(crate) focus_visible_style: Option<Box<StyleRefinement>>,
     pub(crate) hover_style: Option<Box<StyleRefinement>>,
     pub(crate) group_hover_style: Option<GroupStyle>,
+    pub(crate) group_drag_over_styles: Vec<(TypeId, GroupStyle)>,
     pub(crate) active_style: Option<Box<StyleRefinement>>,
     pub(crate) group_active_style: Option<GroupStyle>,
     pub(crate) drag_over_styles: Vec<(
         TypeId,
         Box<dyn Fn(&dyn Any, &mut Window, &mut App) -> StyleRefinement>,
     )>,
-    pub(crate) group_drag_over_styles: Vec<(TypeId, GroupStyle)>,
+    pub(crate) drag_hover_listeners: Vec<(
+        TypeId,
+        Box<dyn Fn(&bool, &mut Window, &mut App)>,
+    )>,
+    pub(crate) mouse_enter_listeners: Vec<Box<dyn Fn(&mut Window, &mut App)>>,
+    pub(crate) mouse_leave_listeners: Vec<Box<dyn Fn(&mut Window, &mut App)>>,
     pub(crate) mouse_down_listeners: Vec<MouseDownListener>,
     pub(crate) mouse_up_listeners: Vec<MouseUpListener>,
     pub(crate) mouse_move_listeners: Vec<MouseMoveListener>,
@@ -1721,6 +1790,9 @@ impl Interactivity {
             || self.hover_style.is_some()
             || self.group_hover_style.is_some()
             || self.hover_listener.is_some()
+            || !self.drag_hover_listeners.is_empty()
+            || !self.mouse_enter_listeners.is_empty()
+            || !self.mouse_leave_listeners.is_empty()
             || !self.mouse_up_listeners.is_empty()
             || !self.mouse_down_listeners.is_empty()
             || !self.mouse_move_listeners.is_empty()
@@ -2297,6 +2369,63 @@ impl Interactivity {
                 });
             }
 
+            for (drag_type_id, listener) in self.drag_hover_listeners.drain(..) {
+                let hitbox = hitbox.clone();
+                let drag_hover_state = element_state
+                    .drag_hover_state
+                    .get_or_insert_with(Default::default)
+                    .clone();
+
+                window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Bubble {
+                        return;
+                    }
+                    let Some(active_drag) = &cx.active_drag else { return; };
+                    if active_drag.value.type_id() != drag_type_id {
+                        return;
+                    }
+                    let is_hovered = hitbox.is_hovered(window);
+                    let mut state = drag_hover_state.borrow_mut();
+                    let was_hovered = state.entry(drag_type_id).or_insert(false);
+                    if is_hovered != *was_hovered {
+                        *was_hovered = is_hovered;
+                        drop(state);
+                        listener(&is_hovered, window, cx);
+                    }
+                });
+            }
+
+            if !self.mouse_enter_listeners.is_empty() || !self.mouse_leave_listeners.is_empty() {
+                let enter_listeners = mem::take(&mut self.mouse_enter_listeners);
+                let leave_listeners = mem::take(&mut self.mouse_leave_listeners);
+                let hitbox = hitbox.clone();
+                let mouse_enter_leave_state = element_state
+                    .mouse_enter_leave_state
+                    .get_or_insert_with(Default::default)
+                    .clone();
+
+                window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Bubble {
+                        return;
+                    }
+                    let is_hovered = hitbox.is_hovered(window);
+                    let mut state = mouse_enter_leave_state.borrow_mut();
+                    if is_hovered != *state {
+                        *state = is_hovered;
+                        drop(state);
+                        if is_hovered {
+                            for listener in &enter_listeners {
+                                listener(window, cx);
+                            }
+                        } else {
+                            for listener in &leave_listeners {
+                                listener(window, cx);
+                            }
+                        }
+                    }
+                });
+            }
+
             if let Some(tooltip_builder) = self.tooltip_builder.take() {
                 let active_tooltip = element_state
                     .active_tooltip
@@ -2597,6 +2726,8 @@ pub struct InteractiveElementState {
     pub(crate) focus_handle: Option<FocusHandle>,
     pub(crate) clicked_state: Option<Rc<RefCell<ElementClickedState>>>,
     pub(crate) hover_state: Option<Rc<RefCell<bool>>>,
+    pub(crate) drag_hover_state: Option<Rc<RefCell<HashMap<TypeId, bool>>>>,
+    pub(crate) mouse_enter_leave_state: Option<Rc<RefCell<bool>>>,
     pub(crate) pending_mouse_down: Option<Rc<RefCell<Option<MouseDownEvent>>>>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
