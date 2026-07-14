@@ -117,8 +117,8 @@ objc2-foundation = { version = "0.2", features = ["NSData"] }
 
 [dev-dependencies]
 backtrace = "0.3"
-helio = { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "b83e715713cf9e784435c98c9df63ae38be9734e" }
-helio-default-graphs = { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "b83e715713cf9e784435c98c9df63ae38be9734e" }
+helio = { workspace = true }
+helio-default-graphs = { workspace = true }
 glam = "0.33.2"
 env_logger = "0.11"
 collections = { package = "gpui_collections", version = "0.2.2", features = [
