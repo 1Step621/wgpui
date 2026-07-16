@@ -3,6 +3,7 @@ use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use wgpu::util::DeviceExt;
+use wgpu::CurrentSurfaceTexture;
 
 use crate::{
     AtlasTextureId, AtlasTile, BackdropFilter, DevicePixels, FilterBoundary, GpuSpecs,
@@ -1515,7 +1516,7 @@ impl WgpuRenderer {
             context
                 .instance
                 .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-                    raw_display_handle: window.display_handle()?.as_raw(),
+                    raw_display_handle: Some(window.display_handle()?.as_raw()),
                     raw_window_handle: window.window_handle()?.as_raw(),
                 })?
         };
@@ -1570,6 +1571,7 @@ impl WgpuRenderer {
             height,
             present_mode,
             alpha_mode,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             view_formats: vec![],
             // TODO(mdeand): Make this configurable?
             desired_maximum_frame_latency: 2,
@@ -1863,32 +1865,33 @@ impl WgpuRenderer {
         // reconfigure and retry once; if the second attempt also fails we
         // simply drop this frame.
         let surface_texture = {
-            let first = self.surface.get_current_texture();
-            match first {
-                Ok(t) => t,
-                Err(wgpu::SurfaceError::Outdated)
-                | Err(wgpu::SurfaceError::Lost)
-                | Err(wgpu::SurfaceError::Other) => {
+            match self.surface.get_current_texture() {
+                CurrentSurfaceTexture::Success(t)
+                | CurrentSurfaceTexture::Suboptimal(t) => t,
+                CurrentSurfaceTexture::Outdated
+                | CurrentSurfaceTexture::Lost
+                | CurrentSurfaceTexture::Validation => {
                     // Reconfigure with the current known size and retry.
                     self.surface
                         .configure(&self.context.device, &self.surface_configuration);
                     match self.surface.get_current_texture() {
-                        Ok(t) => t,
-                        Err(e) => {
+                        CurrentSurfaceTexture::Success(t)
+                        | CurrentSurfaceTexture::Suboptimal(t) => t,
+                        other => {
                             log::warn!(
                                 "Skipping frame: failed to acquire swap chain texture after reconfigure: {:?}",
-                                e
+                                other
                             );
                             return;
                         }
                     }
                 }
-                Err(wgpu::SurfaceError::Timeout) => {
+                CurrentSurfaceTexture::Timeout => {
                     log::warn!("Skipping frame: swap chain acquire timed out");
                     return;
                 }
-                Err(wgpu::SurfaceError::OutOfMemory) => {
-                    log::warn!("Skipping frame: out of memory");
+                CurrentSurfaceTexture::Occluded => {
+                    log::warn!("Skipping frame: swap chain acquire occluded");
                     return;
                 }
             }
@@ -2530,7 +2533,7 @@ impl WgpuRenderer {
         log::debug!("Renderer::draw: submitting command buffer");
         self.context.queue.submit(Some(command_encoder.finish()));
         log::debug!("Renderer::draw: presenting surface");
-        surface_texture.present();
+        self.context.queue.present(surface_texture);
         log::debug!("Renderer::draw: frame complete");
     }
 
@@ -2584,29 +2587,31 @@ impl WgpuRenderer {
 
         // Acquire swapchain (handle retryable surface errors the same as regular draw).
         let surface_texture = match self.surface.get_current_texture() {
-            Ok(t) => t,
-            Err(wgpu::SurfaceError::Outdated)
-            | Err(wgpu::SurfaceError::Lost)
-            | Err(wgpu::SurfaceError::Other) => {
+            CurrentSurfaceTexture::Success(t)
+            | CurrentSurfaceTexture::Suboptimal(t) => t,
+            CurrentSurfaceTexture::Outdated
+            | CurrentSurfaceTexture::Lost
+            | CurrentSurfaceTexture::Validation => {
                 self.surface
                     .configure(&self.context.device, &self.surface_configuration);
                 match self.surface.get_current_texture() {
-                    Ok(t) => t,
-                    Err(e) => {
+                    CurrentSurfaceTexture::Success(t)
+                    | CurrentSurfaceTexture::Suboptimal(t) => t,
+                    other => {
                         log::warn!(
                             "Fast blit failed to acquire swapchain after reconfigure: {:?}",
-                            e
+                            other
                         );
                         return false;
                     }
                 }
             }
-            Err(wgpu::SurfaceError::Timeout) => {
+            CurrentSurfaceTexture::Timeout => {
                 log::warn!("Fast blit failed: swapchain acquire timed out");
                 return false;
             }
-            Err(wgpu::SurfaceError::OutOfMemory) => {
-                log::warn!("Fast blit failed: out of memory");
+            CurrentSurfaceTexture::Occluded => {
+                log::warn!("Fast blit failed: swapchain acquire occluded");
                 return false;
             }
         };
@@ -2705,7 +2710,7 @@ impl WgpuRenderer {
         }
 
         self.context.queue.submit(Some(encoder.finish()));
-        surface_texture.present();
+        self.context.queue.present(surface_texture);
 
         // Clear redraw flags only for surfaces that presented fresh frames.
         for surface_id in pending_surfaces {

@@ -41,7 +41,10 @@ impl WgpuContext {
     pub fn new(options: &WgpuOptions) -> anyhow::Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
-            ..Default::default()
+            flags: wgpu::InstanceFlags::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            display: None,
         });
 
         // Features WGPUI itself needs for its rendering pipeline.
@@ -49,7 +52,7 @@ impl WgpuContext {
             | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
             | wgpu::Features::TEXTURE_BINDING_ARRAY
             | wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING
-            | wgpu::Features::SHADER_PRIMITIVE_INDEX
+            | wgpu::Features::PRIMITIVE_INDEX
             | wgpu::Features::INDIRECT_FIRST_INSTANCE;
 
         // Combine with any additional features requested by the application.
