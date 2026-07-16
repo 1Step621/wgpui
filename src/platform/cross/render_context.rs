@@ -48,9 +48,7 @@ impl WgpuContext {
         });
 
         // Features WGPUI itself needs for its rendering pipeline.
-        let wgpui_features = wgpu::Features::TIMESTAMP_QUERY
-            | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
-            | wgpu::Features::TEXTURE_BINDING_ARRAY
+        let wgpui_features = wgpu::Features::TEXTURE_BINDING_ARRAY
             | wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING
             | wgpu::Features::PRIMITIVE_INDEX
             | wgpu::Features::INDIRECT_FIRST_INSTANCE;
@@ -60,12 +58,14 @@ impl WgpuContext {
 
         let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
 
-        // On macOS, MULTI_DRAW_INDIRECT_COUNT is optional — prefer adapters that expose it
-        // but do not require it, since Metal may not advertise it on all hardware.
-        // On all other platforms, require it outright for full indirect draw support.
+        // On macOS, some features are optional — prefer adapters that expose them
+        // but do not require them, since Metal may not advertise them on all hardware.
+        // On all other platforms, require them outright.
         #[cfg(target_os = "macos")]
         let (adapter, device_features) = {
-            let optional_features = wgpu::Features::MULTI_DRAW_INDIRECT_COUNT;
+            let optional_features = wgpu::Features::MULTI_DRAW_INDIRECT_COUNT
+                | wgpu::Features::TIMESTAMP_QUERY
+                | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
             let adapter = adapters
                 .into_iter()
                 .filter(|adapter| adapter.features().contains(required_features))
@@ -86,7 +86,10 @@ impl WgpuContext {
 
         #[cfg(not(target_os = "macos"))]
         let (adapter, device_features) = {
-            let required_features = required_features | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT;
+            let required_features = required_features
+                | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT
+                | wgpu::Features::TIMESTAMP_QUERY
+                | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
             let adapter = adapters
                 .into_iter()
                 .find(|adapter| adapter.features().contains(required_features))
