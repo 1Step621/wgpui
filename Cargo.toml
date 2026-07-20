@@ -37,7 +37,7 @@ doctest = false
 device_query = "2.1"
 pollster = "0.4.0"
 winit = "0.30.12"
-wgpu = { version = "30", default-features = false, features = [
+wgpu = { git = "https://github.com/Far-Beyond-Pulsar/wgpu", rev = "fce5b80e8017304449124b12637ec324417e40c8", default-features = false, features = [
     "web",
     "webgpu",
     "dx12",
