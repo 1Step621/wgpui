@@ -37,7 +37,7 @@ doctest = false
 device_query = "2.1"
 pollster = "0.4.0"
 winit = "0.30.12"
-wgpu = { version = "30.0.0", default-features = false, features = [
+wgpu = { version = "30", default-features = false, features = [
     "web",
     "webgpu",
     "dx12",
@@ -117,9 +117,8 @@ objc2-foundation = { version = "0.2", features = ["NSData"] }
 
 [dev-dependencies]
 backtrace = "0.3"
-helio = { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "b88e366d6a6792e34d5b9c7afd1a197a78c54747" }
-helio-default-graphs = { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "b88e366d6a6792e34d5b9c7afd1a197a78c54747" }
-glam = "0.33.2"
+helio = { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "f124aeac0057c8f11c159931ea0c57d4c3b7fef9" }
+glam = "0.29"
 env_logger = "0.11"
 collections = { package = "gpui_collections", version = "0.2.2", features = [
     "test-support",
