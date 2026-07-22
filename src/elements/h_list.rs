@@ -286,10 +286,16 @@ impl Element for HList {
             cx,
             |_style, mut logical_scroll_offset, hitbox, window, cx| {
                 if self.item_count > 0 {
-                    let is_scrolled = !logical_scroll_offset.x.is_zero();
                     let max_scroll_offset = padded_bounds.size.width - content_width;
-                    if is_scrolled && logical_scroll_offset.x < max_scroll_offset {
+
+                    if max_scroll_offset >= px(0.) {
+                        shared_scroll_offset.borrow_mut().x = px(0.);
+                        logical_scroll_offset.x = px(0.);
+                    } else if !logical_scroll_offset.x.is_zero()
+                        && logical_scroll_offset.x < max_scroll_offset
+                    {
                         shared_scroll_offset.borrow_mut().x = max_scroll_offset;
+                        logical_scroll_offset.x = max_scroll_offset;
                     }
 
                     let applied_deferred_scroll = shared_scroll_to_item.is_some();

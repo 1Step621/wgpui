@@ -388,18 +388,23 @@ impl Element for UniformList {
                 if self.item_count > 0 {
                     let content_height = item_height * self.item_count;
 
-                    let is_scrolled_vertically = !logical_scroll_offset.y.is_zero();
                     let max_scroll_offset = padded_bounds.size.height - content_height;
 
-                    if is_scrolled_vertically && logical_scroll_offset.y < max_scroll_offset {
+                    if max_scroll_offset >= Pixels::ZERO {
+                        shared_scroll_offset.borrow_mut().y = Pixels::ZERO;
+                        logical_scroll_offset.y = Pixels::ZERO;
+                    } else if !logical_scroll_offset.y.is_zero()
+                        && logical_scroll_offset.y < max_scroll_offset
+                    {
                         shared_scroll_offset.borrow_mut().y = max_scroll_offset;
+                        logical_scroll_offset.y = max_scroll_offset;
                     }
 
-                    let content_width = content_size.width + padding.left + padding.right;
                     let is_scrolled_horizontally =
                         can_scroll_horizontally && !logical_scroll_offset.x.is_zero();
-                    if is_scrolled_horizontally && content_width <= padded_bounds.size.width {
+                    if is_scrolled_horizontally && content_size.width <= padded_bounds.size.width {
                         shared_scroll_offset.borrow_mut().x = Pixels::ZERO;
+                        logical_scroll_offset.x = Pixels::ZERO;
                     }
 
                     let applied_deferred_scroll = shared_scroll_to_item.is_some();
