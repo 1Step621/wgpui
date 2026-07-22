@@ -371,9 +371,10 @@ impl Element for HList {
                         visual_scroll_offset.x = scroll_state.smooth_scroll.current();
                     }
 
+                    let visible_width = padded_bounds.size.width * 1.5;
                     let first_visible = (-(visual_scroll_offset.x + padding.left) / item_width)
                         .floor() as usize;
-                    let last_visible = ((-visual_scroll_offset.x + padded_bounds.size.width)
+                    let last_visible = ((-visual_scroll_offset.x + visible_width)
                         / item_width)
                         .ceil() as usize;
 
