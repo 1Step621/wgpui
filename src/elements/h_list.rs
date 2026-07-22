@@ -1,7 +1,7 @@
-//! A horizontally-scrollable virtual list. Each item is measured individually so
-//! that items with different natural widths (e.g. tab labels of varying length)
-//! are all positioned correctly without clipping.  Suitable for small-to-medium
-//! sized lists (tens to low hundreds of items).
+//! A horizontally-scrollable virtual list with per-item natural-width measurement.
+//! Items are rendered at their minimum-content width so tab labels, close buttons,
+//! and other content always fit.  Positions are calculated from the cumulative sum
+//! of each item's actual rendered width.
 
 use super::ListHorizontalSizingBehavior;
 use crate::elements::smooth_scroll::SmoothScrollState;
@@ -14,9 +14,7 @@ use crate::{
 use smallvec::SmallVec;
 use std::{cell::RefCell, cmp, ops::Range, rc::Rc, usize};
 
-/// Create a new horizontal virtual list.  Items are given [`AvailableSpace::MinContent`]
-/// width so each one reports its natural size; positions are calculated from the
-/// cumulative sum of all measured widths.
+/// Create a new horizontal virtual list.
 #[track_caller]
 pub fn h_list<R>(
     id: impl Into<ElementId>,
@@ -59,7 +57,6 @@ pub struct HList {
     render_items: Box<
         dyn for<'a> Fn(Range<usize>, &'a mut Window, &'a mut App) -> SmallVec<[AnyElement; 64]>,
     >,
-    /// Per-item widths, populated lazily on the first prepaint.
     item_widths: Vec<Pixels>,
     interactivity: Interactivity,
     scroll_handle: Option<HListScrollHandle>,
@@ -72,7 +69,7 @@ pub struct HListFrameState {
     items: SmallVec<[AnyElement; 32]>,
 }
 
-/// A handle for controlling the scroll position of a horizontal list.
+/// A handle for controlling the scroll position.
 #[derive(Clone, Debug, Default)]
 pub struct HListScrollHandle(pub Rc<RefCell<HListScrollState>>);
 
@@ -89,7 +86,7 @@ pub struct HListScrollState {
     pub smooth_scroll: SmoothScrollState,
 }
 
-/// A deferred request to scroll an [`HList`] to a specific item.
+/// A deferred request to scroll to a specific item.
 #[derive(Clone, Copy, Debug)]
 pub struct HListDeferredScroll {
     /// The index of the item to scroll to.
@@ -102,7 +99,7 @@ pub struct HListDeferredScroll {
     pub scroll_strict: bool,
 }
 
-/// Measured size of an item and its container during layout.
+/// Measured size of an item and its container.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct HListItemSize {
     /// The size of the item.
@@ -162,31 +159,6 @@ impl Styled for HList {
     }
 }
 
-impl HList {
-    /// Ensure all items have been measured.
-    fn ensure_widths(&mut self, window: &mut Window, cx: &mut App) {
-        if self.item_widths.len() == self.item_count || self.item_count == 0 {
-            return;
-        }
-        self.item_widths.clear();
-        for ix in 0..self.item_count {
-            let mut items = (self.render_items)(ix..ix + 1, window, cx);
-            let width = items
-                .pop()
-                .and_then(|mut item| {
-                    let sz = item.layout_as_root(
-                        size(AvailableSpace::MinContent, AvailableSpace::MinContent),
-                        window,
-                        cx,
-                    );
-                    (sz.width > Pixels::ZERO).then_some(sz.width)
-                })
-                .unwrap_or(px(80.));
-            self.item_widths.push(width);
-        }
-    }
-}
-
 impl Element for HList {
     type RequestLayoutState = HListFrameState;
     type PrepaintState = Option<Hitbox>;
@@ -207,12 +179,12 @@ impl Element for HList {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let max_items = self.item_count;
-        let item_size = self
-            .item_widths
-            .first()
-            .copied()
-            .map(|w| Size { width: w, height: px(24.) })
-            .unwrap_or_else(|| self.measure_one(None, window, cx));
+        let avg_width = if self.item_widths.is_empty() {
+            px(120.)
+        } else {
+            let sum: Pixels = self.item_widths.iter().copied().fold(Pixels::ZERO, |a, w| a + w);
+            px(sum.value() / self.item_widths.len() as f32)
+        };
 
         let layout_id = self.interactivity.request_layout(
             global_id,
@@ -225,20 +197,16 @@ impl Element for HList {
                         window.request_measured_layout(
                             style,
                             move |known_dimensions, available_space, _window, _cx| {
-                                let desired_width = item_size.width * max_items as f32;
+                                let desired_width = avg_width * max_items as f32;
                                 let height = known_dimensions.height.unwrap_or(
                                     match available_space.height {
                                         AvailableSpace::Definite(x) => x,
-                                        AvailableSpace::MinContent | AvailableSpace::MaxContent => {
-                                            item_size.height
-                                        }
+                                        _ => px(24.),
                                     },
                                 );
                                 let width = match available_space.width {
                                     AvailableSpace::Definite(w) => desired_width.min(w),
-                                    AvailableSpace::MinContent | AvailableSpace::MaxContent => {
-                                        desired_width
-                                    }
+                                    _ => desired_width,
                                 };
                                 size(width, height)
                             },
@@ -283,13 +251,11 @@ impl Element for HList {
                 - point(border.right + padding.right, border.bottom + padding.bottom),
         );
 
-        // Lazily measure all items so we have per-item widths.
-        self.ensure_widths(window, cx);
-
-        let content_width: Pixels = self
-            .item_widths
-            .iter()
-            .fold(Pixels::ZERO, |acc, &w| acc + w);
+        let content_width: Pixels = if self.item_widths.is_empty() {
+            px(120.) * self.item_count as f32
+        } else {
+            self.item_widths.iter().fold(Pixels::ZERO, |a, &w| a + w)
+        };
         let content_height = padded_bounds.size.height.max(px(24.));
         let content_size = Size {
             width: content_width,
@@ -328,7 +294,7 @@ impl Element for HList {
 
                     let applied_deferred_scroll = shared_scroll_to_item.is_some();
 
-                    // --- deferred scroll-to-item ------------------------------------------------
+                    // deferred scroll-to-item (uses named widths from previous frame)
                     if let Some(HListDeferredScroll {
                         mut item_index,
                         mut strategy,
@@ -338,8 +304,14 @@ impl Element for HList {
                     {
                         let list_width = padded_bounds.size.width;
                         let mut updated_scroll_offset = shared_scroll_offset.borrow_mut();
-                        let item_left: Pixels = self.item_widths[..item_index].iter().fold(Pixels::ZERO, |a, &w| a + w);
-                        let item_width = self.item_widths[item_index];
+                        let item_left: Pixels = self.item_widths[..item_index]
+                            .iter()
+                            .fold(Pixels::ZERO, |a, &w| a + w);
+                        let item_width = self
+                            .item_widths
+                            .get(item_index)
+                            .copied()
+                            .unwrap_or(px(120.));
                         let item_right = item_left + item_width;
                         let scroll_left = -updated_scroll_offset.x;
                         let offset_pixels: Pixels = self.item_widths[..offset]
@@ -383,7 +355,7 @@ impl Element for HList {
                         logical_scroll_offset = *updated_scroll_offset;
                     }
 
-                    // --- smooth scroll ---------------------------------------------------------
+                    // smooth scroll
                     let mut visual_scroll_offset = logical_scroll_offset;
                     if let Some(scroll_handle) = &self.scroll_handle {
                         let mut scroll_state = scroll_handle.0.borrow_mut();
@@ -400,7 +372,12 @@ impl Element for HList {
                         visual_scroll_offset.x = scroll_state.smooth_scroll.current();
                     }
 
-                    // --- find visible range via cumulative offsets -------------------------------
+                    // ensure item_widths matches item_count
+                    while self.item_widths.len() < self.item_count {
+                        self.item_widths.push(px(120.));
+                    }
+
+                    // find visible range using item_widths
                     let scroll_left = -visual_scroll_offset.x;
                     let view_right = scroll_left + padded_bounds.size.width;
 
@@ -416,10 +393,11 @@ impl Element for HList {
                         })
                         .unwrap_or(0);
 
-                    // Reset cum and find last visible with overscan.
-                    cum = self.item_widths[..first_visible].iter().fold(Pixels::ZERO, |a, &w| a + w);
+                    cum = self.item_widths[..first_visible]
+                        .iter()
+                        .fold(Pixels::ZERO, |a, &w| a + w);
                     let mut last_visible = first_visible;
-                    let overscan_target = view_right + padded_bounds.size.width * 0.5;
+                    let overscan_target = view_right + padded_bounds.size.width;
                     for w in &self.item_widths[first_visible..] {
                         cum += *w;
                         last_visible += 1;
@@ -429,14 +407,10 @@ impl Element for HList {
                     }
                     let visible_range = cmp::min(last_visible, self.item_count);
 
-                    // --- render visible items ----------------------------------------------------
+                    // render visible items
                     let visible_count = visible_range - first_visible;
                     if visible_count > 0 {
-                        let items = (self.render_items)(
-                            first_visible..visible_range,
-                            window,
-                            cx,
-                        );
+                        let items = (self.render_items)(first_visible..visible_range, window, cx);
 
                         let content_mask = ContentMask { bounds };
                         let base_x = padded_bounds.origin.x + visual_scroll_offset.x;
@@ -447,16 +421,23 @@ impl Element for HList {
                                 .iter()
                                 .fold(Pixels::ZERO, |a, &w| a + w);
                             for mut item in items {
-                                let item_w = self.item_widths[first_visible + frame_state.items.len()];
                                 let item_origin = point(base_x + cum_offset, base_y);
-                                let available_space = size(
-                                    AvailableSpace::Definite(item_w),
+                                let available = size(
+                                    AvailableSpace::MaxContent,
                                     AvailableSpace::Definite(padded_bounds.size.height),
                                 );
-                                item.layout_as_root(available_space, window, cx);
+                                let actual = item.layout_as_root(available, window, cx);
+                                let actual_w = actual.width.max(px(1.));
                                 item.prepaint_at(item_origin, window, cx);
                                 frame_state.items.push(item);
-                                cum_offset += item_w;
+
+                                // update stored width to match what actually rendered
+                                let idx = first_visible + frame_state.items.len() - 1;
+                                if idx < self.item_widths.len() {
+                                    self.item_widths[idx] = actual_w;
+                                }
+
+                                cum_offset += actual_w;
                             }
                         });
                     }
@@ -502,28 +483,7 @@ impl IntoElement for HList {
 }
 
 impl HList {
-    /// Measure a single item (used before per-item widths are populated).
-    fn measure_one(
-        &self,
-        list_height: Option<Pixels>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Size<Pixels> {
-        if self.item_count == 0 {
-            return Size::default();
-        }
-        let mut items = (self.render_items)(0..1, window, cx);
-        let Some(mut item) = items.pop() else {
-            return Size::default();
-        };
-        let available = size(
-            AvailableSpace::MinContent,
-            list_height.map_or(AvailableSpace::MinContent, AvailableSpace::Definite),
-        );
-        item.layout_as_root(available, window, cx)
-    }
-
-    /// Track and render scroll state of this list with reference to the given scroll handle.
+    /// Track and render scroll state with the given handle.
     pub fn track_scroll(mut self, handle: &HListScrollHandle) -> Self {
         self.interactivity.tracked_scroll_handle = Some(handle.0.borrow().base_handle.clone());
         self.scroll_handle = Some(handle.clone());
@@ -536,7 +496,7 @@ impl HList {
         self
     }
 
-    /// Sets the horizontal sizing behavior.
+    /// Sets the horizontal sizing behavior (scroll vs fit).
     pub fn with_horizontal_sizing_behavior(
         mut self,
         behavior: ListHorizontalSizingBehavior,
