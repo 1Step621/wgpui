@@ -372,9 +372,24 @@ impl Element for HList {
                         visual_scroll_offset.x = scroll_state.smooth_scroll.current();
                     }
 
-                    // ensure item_widths matches item_count
-                    while self.item_widths.len() < self.item_count {
-                        self.item_widths.push(px(120.));
+                    // ensure item_widths matches item_count — measure any
+                    // unmeasured items at MaxContent so positions are correct
+                    // from the very first frame.
+                    let old_len = self.item_widths.len();
+                    for ix in old_len..self.item_count {
+                        let mut measured = (self.render_items)(ix..ix + 1, window, cx);
+                        let w = measured
+                            .pop()
+                            .and_then(|mut item| {
+                                let sz = item.layout_as_root(
+                                    size(AvailableSpace::MaxContent, AvailableSpace::MinContent),
+                                    window,
+                                    cx,
+                                );
+                                (sz.width > Pixels::ZERO).then_some(sz.width)
+                            })
+                            .unwrap_or(px(120.));
+                        self.item_widths.push(w);
                     }
 
                     // find visible range using item_widths
