@@ -10,7 +10,7 @@ use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, Element, ElementId, Entity,
     GlobalElementId, Hitbox, InspectorElementId, InteractiveElement, Interactivity, IntoElement,
     IsZero, LayoutId, ListSizingBehavior, Overflow, Pixels, Point, ScrollHandle, Size,
-    StyleRefinement, Styled, Window, point, size,
+    StyleRefinement, Styled, Window, point, px, size,
 };
 use smallvec::SmallVec;
 use std::{cell::RefCell, cmp, ops::Range, rc::Rc, usize};
@@ -198,7 +198,7 @@ impl Element for HList {
                         window.request_measured_layout(
                             style,
                             move |known_dimensions, available_space, _window, _cx| {
-                                let desired_width = item_size.width * max_items;
+                                let desired_width = item_size.width.max(px(80.)) * max_items;
                                 let height = known_dimensions.height.unwrap_or(match available_space
                                     .height
                                 {
@@ -257,15 +257,19 @@ impl Element for HList {
         );
 
         let longest_item_size = self.measure_item(None, window, cx);
-        let content_width = longest_item_size.width * self.item_count;
+        let item_width = longest_item_size.width.max(px(80.));
+        let content_width = item_width * self.item_count;
         let content_size = Size {
             width: content_width,
             height: padded_bounds.size.height.max(longest_item_size.height),
         };
 
-        let shared_scroll_offset = self.interactivity.scroll_offset.clone().unwrap();
+        let shared_scroll_offset = self
+            .interactivity
+            .scroll_offset
+            .clone()
+            .unwrap_or_else(|| Rc::new(RefCell::new(Point::default())));
         let mut logical_scroll_offset = *shared_scroll_offset.borrow();
-        let item_width = longest_item_size.width;
         let shared_scroll_to_item = self.scroll_handle.as_mut().and_then(|handle| {
             let mut handle = handle.0.borrow_mut();
             handle.last_item_size = Some(HListItemSize {
@@ -373,8 +377,11 @@ impl Element for HList {
                         / item_width)
                         .ceil() as usize;
 
-                    let visible_range =
-                        first_visible..cmp::min(last_visible, self.item_count);
+                    let visible_range = if self.item_count <= 20 {
+                        0..self.item_count
+                    } else {
+                        first_visible..cmp::min(last_visible, self.item_count)
+                    };
 
                     let items = (self.render_items)(visible_range.clone(), window, cx);
 
