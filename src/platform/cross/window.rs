@@ -439,6 +439,7 @@ impl PlatformWindow for CrossWindow {
             surface_id,
             registry,
             present_trigger,
+            ctx.gpu_submit_lock.clone(),
             width,
             height,
             format,
