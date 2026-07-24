@@ -2745,7 +2745,6 @@ impl WgpuRenderer {
         }
         log::debug!("Renderer::draw: frame complete");
 
-        crate::render_stats::tick_frame();
     }
 
     /// Fast path: blit all visible surfaces in a single swapchain pass.
