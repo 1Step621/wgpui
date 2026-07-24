@@ -890,6 +890,30 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                 match state {
                     winit::event::ElementState::Pressed => {
                         self.pressed_button = Some(mouse_button);
+                        if matches!(mouse_button, MouseButton::Navigate(_)) {
+                            self.set_active_context(event_loop);
+                            if let Some(window_id) = self.hovered_window_id.get() {
+                                if let Some(window) = self.windows.get(&window_id) {
+                                    let position = window.0.state.mouse_position.get();
+                                    let modifiers = self.current_modifiers;
+                                    let platform_event =
+                                        PlatformInput::MouseDown(MouseDownEvent {
+                                            button: mouse_button,
+                                            position,
+                                            modifiers,
+                                            click_count: 1,
+                                            first_mouse: false,
+                                        });
+                                    window.0.state.callbacks.invoke_mut(
+                                        &window.0.state.callbacks.on_input,
+                                        |cb| {
+                                            cb(platform_event.clone());
+                                        },
+                                    );
+                                }
+                            }
+                            self.clear_active_context();
+                        }
                     }
                     winit::event::ElementState::Released => {
                         if self.pressed_button == Some(mouse_button) {
