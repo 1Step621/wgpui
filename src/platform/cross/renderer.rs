@@ -2951,11 +2951,48 @@ impl WgpuRenderer {
         }
     }
 
-    /// Present without running compositor (fast blit already updated swapchain)
+    /// Re-present the last composed frame without running the compositor.
+    ///
+    /// Used when the window needs to put something on screen but nothing changed
+    /// — an OS-driven repaint, or the post-input presents that keep the display
+    /// from underclocking its refresh rate. Because the compositor renders into
+    /// the persistent framebuffer, the previous frame is still intact and this is
+    /// a single full-screen blit (tens of microseconds) instead of rebuilding and
+    /// re-rasterising the whole view tree.
     pub fn present_framebuffer_only(&self) {
-        // NOTE: Fast blit already presented to swapchain, so this is a no-op
-        // When we implement persistent framebuffer properly, this will blit framebuffer → swapchain
-        log::debug!("Present framebuffer only (no compositor) - fast blit already presented");
+        let _total = crate::render_stats::scope("present_framebuffer_only TOTAL");
+        crate::render_stats::count("present-only blits");
+
+        if self.persistent_framebuffer_view.is_none() {
+            return;
+        }
+
+        let surface_texture = {
+            let _acquire = crate::render_stats::scope("  present-only: swapchain acquire");
+            match self.surface.get_current_texture() {
+                CurrentSurfaceTexture::Success(t) | CurrentSurfaceTexture::Suboptimal(t) => t,
+                other => {
+                    // Don't reconfigure here: this path is best-effort, and the next
+                    // real draw handles recovery.
+                    log::debug!("present_framebuffer_only: skipping, acquire gave {:?}", other);
+                    return;
+                }
+            }
+        };
+
+        let mut encoder = self
+            .context
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("present_framebuffer_only"),
+            });
+        let swapchain_view = surface_texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        self.blit_framebuffer_to_swapchain(&mut encoder, &swapchain_view);
+
+        self.context.queue.submit(Some(encoder.finish()));
+        self.context.queue.present(surface_texture);
     }
 
     pub fn update_drawable_size(&mut self, size: geometry::Size<DevicePixels>) {
