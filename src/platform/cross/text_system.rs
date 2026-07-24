@@ -348,7 +348,10 @@ impl CosmicTextSystemState {
                         .data
                         .chunks_exact(4)
                         .flat_map(|pixel| {
-                            let alpha = pixel[0].max(pixel[1]).max(pixel[2]).max(pixel[3]);
+                            let alpha = (pixel[0] as f32 * 0.2126
+                                + pixel[1] as f32 * 0.7152
+                                + pixel[2] as f32 * 0.0722)
+                                as u8;
                             [255, 255, 255, alpha]
                         })
                         .collect(),
@@ -359,7 +362,12 @@ impl CosmicTextSystemState {
                     SwashContent::SubpixelMask => image
                         .data
                         .chunks_exact(4)
-                        .map(|pixel| pixel[0].max(pixel[1]).max(pixel[2]).max(pixel[3]))
+                        .map(|pixel| {
+                            (pixel[0] as f32 * 0.2126
+                                + pixel[1] as f32 * 0.7152
+                                + pixel[2] as f32 * 0.0722)
+                                as u8
+                        })
                         .collect(),
                     SwashContent::Color => {
                         image.data.chunks_exact(4).map(|pixel| pixel[3]).collect()
