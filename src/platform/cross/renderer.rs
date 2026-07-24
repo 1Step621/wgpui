@@ -1792,7 +1792,12 @@ impl WgpuRenderer {
     ///
     /// All `Surface::configure` calls must go through here.
     fn reconfigure_surface(&self) {
-        let _exclusive = self.context.gpu_submit_lock.write();
+        crate::render_stats::count("Surface::configure calls");
+        let _exclusive = {
+            let _wait = crate::render_stats::scope("reconfigure: wait for submit lock");
+            self.context.gpu_submit_lock.write()
+        };
+        let _cfg = crate::render_stats::scope("reconfigure: Surface::configure");
         self.surface
             .configure(&self.context.device, &self.surface_configuration);
     }
@@ -1853,6 +1858,8 @@ impl WgpuRenderer {
 
     pub fn draw(&mut self, scene: &Scene) {
         log::debug!("Renderer::draw: starting frame");
+        let _total = crate::render_stats::scope("renderer::draw TOTAL");
+        crate::render_stats::count("compositor draws");
 
         let mut command_encoder =
             self.context
@@ -2048,6 +2055,7 @@ impl WgpuRenderer {
         // reconfigure and retry once; if the second attempt also fails we
         // simply drop this frame.
         let surface_texture = {
+            let _acquire = crate::render_stats::scope("  draw: swapchain acquire");
             match self.surface.get_current_texture() {
                 CurrentSurfaceTexture::Success(t)
                 | CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -2055,6 +2063,7 @@ impl WgpuRenderer {
                 | CurrentSurfaceTexture::Lost
                 | CurrentSurfaceTexture::Validation => {
                     // Reconfigure with the current known size and retry.
+                    crate::render_stats::count("swapchain reconfigure (draw retry)");
                     self.reconfigure_surface();
                     match self.surface.get_current_texture() {
                         CurrentSurfaceTexture::Success(t)
@@ -2236,6 +2245,7 @@ impl WgpuRenderer {
             .expect("persistent framebuffer must exist")
             .clone();
 
+        let _batches = crate::render_stats::scope("  draw: primitive batches");
         {
             let mut pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main"),
@@ -2715,16 +2725,27 @@ impl WgpuRenderer {
             }
         }
 
-        let swapchain_view = surface_texture
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        self.blit_framebuffer_to_swapchain(&mut command_encoder, &swapchain_view);
+        {
+            let _blit = crate::render_stats::scope("  draw: framebuffer->swapchain blit");
+            let swapchain_view = surface_texture
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            self.blit_framebuffer_to_swapchain(&mut command_encoder, &swapchain_view);
+        }
 
         log::debug!("Renderer::draw: submitting command buffer");
-        self.context.queue.submit(Some(command_encoder.finish()));
+        {
+            let _submit = crate::render_stats::scope("  draw: queue.submit");
+            self.context.queue.submit(Some(command_encoder.finish()));
+        }
         log::debug!("Renderer::draw: presenting surface");
-        self.context.queue.present(surface_texture);
+        {
+            let _present = crate::render_stats::scope("  draw: queue.present");
+            self.context.queue.present(surface_texture);
+        }
         log::debug!("Renderer::draw: frame complete");
+
+        crate::render_stats::tick_frame();
     }
 
     /// Fast path: blit all visible surfaces in a single swapchain pass.
@@ -2958,10 +2979,14 @@ impl WgpuRenderer {
             return;
         }
 
+        let _total = crate::render_stats::scope("update_drawable_size TOTAL");
+        crate::render_stats::count("update_drawable_size (size changed)");
+
         self.surface_configuration.width = width;
         self.surface_configuration.height = height;
         self.reconfigure_surface();
         self.surface_configured = true;
+        let _realloc = crate::render_stats::scope("  resize: realloc fullscreen textures");
 
         // Recreate persistent framebuffer at new size
         let persistent_framebuffer = self

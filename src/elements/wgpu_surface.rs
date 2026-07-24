@@ -113,6 +113,7 @@ impl WgpuSurfaceHandle {
     /// }
     /// ```
     pub fn submit_guard(&self) -> parking_lot::RwLockReadGuard<'_, ()> {
+        let _t = crate::render_stats::scope("surface: wait for submit_guard");
         self.inner.gpu_submit_lock.read()
     }
 

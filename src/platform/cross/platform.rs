@@ -1164,21 +1164,49 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                     return;
                 }
 
+                crate::render_stats::count("RedrawRequested");
+
                 // Try fast blit path for pending surfaces
                 let mut fast_blit_succeeded = false;
+                let mut had_pending_surfaces = false;
                 if let Some(renderer) = window.0.renderer.get() {
                     let renderer_ref = renderer.borrow();
                     if let Some(pending_surfaces) = renderer_ref.get_pending_surfaces() {
+                        had_pending_surfaces = true;
+                        crate::render_stats::count("fast blit attempted");
+                        let _t = crate::render_stats::scope("fast blit");
                         fast_blit_succeeded = renderer_ref.blit_surfaces_direct(&pending_surfaces);
                     }
                 }
+                if had_pending_surfaces && !fast_blit_succeeded {
+                    crate::render_stats::count("fast blit DECLINED -> force_render");
+                }
+                if !had_pending_surfaces {
+                    crate::render_stats::count("no pending surfaces");
+                }
 
+                // Force a full compositor pass ONLY when a surface published a new
+                // frame that the fast path then declined to blit - that frame has to
+                // reach the screen somehow.
+                //
+                // Previously this was `!fast_blit_succeeded`, which is also true when
+                // there are no surfaces at all (`get_pending_surfaces()` returns None).
+                // Every RedrawRequested therefore called `window.refresh()`, marking
+                // the whole window dirty and bypassing cached view reuse, so the entire
+                // view tree re-rendered at display refresh rate whether or not anything
+                // had changed. Windows with no surface at all paid it too.
+                let force_render = had_pending_surfaces && !fast_blit_succeeded;
+                if force_render {
+                    crate::render_stats::count("force_render=true (full window.refresh)");
+                }
+
+                let _t = crate::render_stats::scope("on_request_frame callback");
                 window.0.state.callbacks.invoke_mut(
                     &window.0.state.callbacks.on_request_frame,
                     |cb| {
                         cb(crate::RequestFrameOptions {
                             // Only force compositor if fast blit failed
-                            force_render: !fast_blit_succeeded,
+                            force_render,
                             require_presentation: true,
                         });
                     },

@@ -207,6 +207,7 @@ impl SurfaceRegistry {
 
     /// Get the display buffer's `TextureView` (what the compositor reads from).
     pub fn front_view(&self, id: SurfaceId) -> Option<wgpu::TextureView> {
+        let _t = crate::render_stats::scope("registry: front_view lock (compositor)");
         let surfaces = self.surfaces.lock().unwrap();
         surfaces.get(&id).map(|tb| {
             let (_, _, display) = TripleBuffer::unpack_state(tb.state.load(Ordering::Acquire));
@@ -221,6 +222,7 @@ impl SurfaceRegistry {
         &self,
         id: SurfaceId,
     ) -> Option<(wgpu::TextureView, (u32, u32))> {
+        let _t = crate::render_stats::scope("registry: back_view lock (render thread)");
         let surfaces = self.surfaces.lock().unwrap();
         surfaces.get(&id).map(|tb| {
             let (rendering, _, _) = TripleBuffer::unpack_state(tb.state.load(Ordering::Acquire));
@@ -237,6 +239,8 @@ impl SurfaceRegistry {
     /// Also skips resize if compositor is actively using the buffers (redraw_pending).
     /// Returns `true` if the resize completed, `false` if it was skipped due to active composition.
     pub fn resize(&self, device: &wgpu::Device, id: SurfaceId, width: u32, height: u32) -> bool {
+        let _total = crate::render_stats::scope("SurfaceRegistry::resize TOTAL");
+
         // Cheap checks under the lock; bail before doing any allocation.
         let format = {
             let surfaces = self.surfaces.lock().unwrap();
@@ -268,7 +272,11 @@ impl SurfaceRegistry {
         // 2. Calling poll from compositor thread causes device corruption
         // 3. WGPU internally ref-counts textures, so old views remain valid until dropped
         // 4. The skip-if-redraw-pending check above prevents resize during active composition
-        let new_tb = Self::create_triple_buffer(device, width, height, format);
+        let new_tb = {
+            let _t = crate::render_stats::scope("  resize: alloc triple buffer (unlocked)");
+            crate::render_stats::count("triple buffer reallocs");
+            Self::create_triple_buffer(device, width, height, format)
+        };
 
         // Re-check under the lock: the surface may have been removed, resized by a
         // racing caller, or picked up by the compositor while we were allocating.
