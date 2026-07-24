@@ -237,8 +237,12 @@ impl SurfaceRegistry {
     /// Also skips resize if compositor is actively using the buffers (redraw_pending).
     /// Returns `true` if the resize completed, `false` if it was skipped due to active composition.
     pub fn resize(&self, device: &wgpu::Device, id: SurfaceId, width: u32, height: u32) -> bool {
-        let mut surfaces = self.surfaces.lock().unwrap();
-        if let Some(tb) = surfaces.get_mut(&id) {
+        // Cheap checks under the lock; bail before doing any allocation.
+        let format = {
+            let surfaces = self.surfaces.lock().unwrap();
+            let Some(tb) = surfaces.get(&id) else {
+                return false;
+            };
             if tb.width == width && tb.height == height {
                 return true;
             }
@@ -250,18 +254,38 @@ impl SurfaceRegistry {
                 return false;
             }
 
-            // NOTE: We do NOT call device.poll() here because:
-            // 1. The render thread owns the device and may be actively using it
-            // 2. Calling poll from compositor thread causes device corruption
-            // 3. WGPU internally ref-counts textures, so old views remain valid until dropped
-            // 4. The skip-if-redraw-pending check above prevents resize during active composition
+            tb.format
+        };
 
-            // Now safe to recreate textures
-            let new_tb = Self::create_triple_buffer(device, width, height, tb.format);
-            *tb = new_tb;
+        // Allocate WITHOUT holding the lock. Three full-size textures is slow
+        // (tens of milliseconds at fullscreen), and this mutex is on the per-frame
+        // path of both the compositor (`front_view`) and every external render
+        // thread (`back_view_with_size`, the buffer swaps). Holding it across the
+        // allocation stalls all of them, and callers retry this in a loop.
+        //
+        // NOTE: We do NOT call device.poll() here because:
+        // 1. The render thread owns the device and may be actively using it
+        // 2. Calling poll from compositor thread causes device corruption
+        // 3. WGPU internally ref-counts textures, so old views remain valid until dropped
+        // 4. The skip-if-redraw-pending check above prevents resize during active composition
+        let new_tb = Self::create_triple_buffer(device, width, height, format);
+
+        // Re-check under the lock: the surface may have been removed, resized by a
+        // racing caller, or picked up by the compositor while we were allocating.
+        // Dropping `new_tb` on those paths just releases the textures we just made.
+        let mut surfaces = self.surfaces.lock().unwrap();
+        let Some(tb) = surfaces.get_mut(&id) else {
+            return false;
+        };
+        if tb.width == width && tb.height == height {
             return true;
         }
-        false
+        if tb.redraw_pending.load(Ordering::Relaxed) {
+            return false;
+        }
+
+        *tb = new_tb;
+        true
     }
 
     /// Get the current size of a surface.
