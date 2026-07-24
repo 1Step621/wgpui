@@ -1580,6 +1580,12 @@ pub struct WgpuRenderer {
 
     // Layout version counter (incremented when compositor runs)
     layout_version: Arc<AtomicU64>,
+
+    // Whether `Surface::configure` has been called successfully at least once.
+    // The surface is configured lazily (a zero-sized window cannot be configured
+    // at construction), and `update_drawable_size` must not skip that first call
+    // just because the size it was handed matches what the config already records.
+    surface_configured: bool,
 }
 
 impl WgpuRenderer {
@@ -1742,7 +1748,7 @@ impl WgpuRenderer {
         let (group_textures, group_views) =
             create_filter_group_textures(&context.device, width, height, format);
 
-        Ok(Self {
+        let mut renderer = Self {
             context: context.clone(),
             surface: ManuallyDrop::new(surface),
             surface_configuration,
@@ -1762,7 +1768,18 @@ impl WgpuRenderer {
             group_views,
             surface_bounds_cache: Arc::new(Mutex::new(HashMap::new())),
             layout_version: Arc::new(AtomicU64::new(0)),
-        })
+            surface_configured: false,
+        };
+
+        // Configure up front when we already have a usable size, so the very first
+        // frame can acquire a swapchain image. A zero-sized window stays
+        // unconfigured until `update_drawable_size` supplies real dimensions.
+        if width > 0 && height > 0 {
+            renderer.reconfigure_surface();
+            renderer.surface_configured = true;
+        }
+
+        Ok(renderer)
     }
 
     /// Reconfigure the swapchain, excluding external render threads for the
@@ -2928,7 +2945,15 @@ impl WgpuRenderer {
         // go idle) and reallocates six full-screen textures. Window managers emit
         // repeated resize events at the same size - notably throughout a macOS
         // fullscreen transition - so bail out when nothing actually changed.
-        if self.surface_configuration.width == width && self.surface_configuration.height == height
+        //
+        // `surface_configured` must be part of this test: the surface is configured
+        // lazily, and the first call here routinely arrives at the size the config
+        // already records. Skipping it would leave the surface unconfigured and
+        // fail the first `get_current_texture` with "Surface is not configured for
+        // presentation".
+        if self.surface_configured
+            && self.surface_configuration.width == width
+            && self.surface_configuration.height == height
         {
             return;
         }
@@ -2936,6 +2961,7 @@ impl WgpuRenderer {
         self.surface_configuration.width = width;
         self.surface_configuration.height = height;
         self.reconfigure_surface();
+        self.surface_configured = true;
 
         // Recreate persistent framebuffer at new size
         let persistent_framebuffer = self
