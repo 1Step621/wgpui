@@ -2921,8 +2921,20 @@ impl WgpuRenderer {
     }
 
     pub fn update_drawable_size(&mut self, size: geometry::Size<DevicePixels>) {
-        self.surface_configuration.width = size.width.0 as u32;
-        self.surface_configuration.height = size.height.0 as u32;
+        let width = size.width.0 as u32;
+        let height = size.height.0 as u32;
+
+        // Every call below reconfigures the swapchain (which waits for the GPU to
+        // go idle) and reallocates six full-screen textures. Window managers emit
+        // repeated resize events at the same size - notably throughout a macOS
+        // fullscreen transition - so bail out when nothing actually changed.
+        if self.surface_configuration.width == width && self.surface_configuration.height == height
+        {
+            return;
+        }
+
+        self.surface_configuration.width = width;
+        self.surface_configuration.height = height;
         self.reconfigure_surface();
 
         // Recreate persistent framebuffer at new size
