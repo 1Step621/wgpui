@@ -1165,6 +1165,10 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                 }
 
                 crate::render_stats::count("RedrawRequested");
+                // Report from here rather than from `draw()`: with force_render fixed,
+                // idle frames never reach the compositor at all, and the stats must
+                // still show that.
+                crate::render_stats::tick_frame();
 
                 // Try fast blit path for pending surfaces
                 let mut fast_blit_succeeded = false;
