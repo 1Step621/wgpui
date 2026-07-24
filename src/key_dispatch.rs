@@ -655,6 +655,8 @@ mod tests {
         }
     }
 
+    gpui::register_action!(TestAction);
+
     #[test]
     fn test_keybinding_for_action_bounds() {
         let keymap = Keymap::new(vec![KeyBinding::new(
@@ -663,13 +665,9 @@ mod tests {
             Some("ProjectPanel"),
         )]);
 
-        let mut registry = ActionRegistry::default();
-
-        registry.load_action::<TestAction>();
-
         let keymap = Rc::new(RefCell::new(keymap));
 
-        let tree = DispatchTree::new(keymap, Rc::new(registry));
+        let tree = DispatchTree::new(keymap, Rc::new(ActionRegistry::default()));
 
         let contexts = vec![
             KeyContext::parse("Workspace").unwrap(),
@@ -689,9 +687,7 @@ mod tests {
             KeyBinding::new("space f g", TestAction, Some("ContextB")),
         ];
         let keymap = Rc::new(RefCell::new(Keymap::new(bindings)));
-        let mut registry = ActionRegistry::default();
-        registry.load_action::<TestAction>();
-        let mut tree = DispatchTree::new(keymap, Rc::new(registry));
+        let mut tree = DispatchTree::new(keymap, Rc::new(ActionRegistry::default()));
 
         type DispatchPath = SmallVec<[super::DispatchNodeId; 32]>;
         fn dispatch(
