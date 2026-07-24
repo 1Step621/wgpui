@@ -140,7 +140,7 @@ impl CubeRenderState {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: 24,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &[
@@ -155,7 +155,7 @@ impl CubeRenderState {
                             format: wgpu::VertexFormat::Float32x3,
                         },
                     ],
-                }],
+                })],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -245,8 +245,13 @@ impl CubeRenderState {
     fn render(&mut self, view: &wgpu::TextureView) {
         let t = self.start_time.elapsed().as_secs_f32() * self.speed + self.phase;
         let aspect = self.width as f32 / self.height.max(1) as f32;
-        let proj = glam::Mat4::perspective_rh(std::f32::consts::FRAC_PI_4, aspect, 0.1, 100.0);
-        let camera = glam::Mat4::look_at_rh(
+        let proj = glam::camera::rh::proj::directx::perspective(
+            std::f32::consts::FRAC_PI_4,
+            aspect,
+            0.1,
+            100.0,
+        );
+        let camera = glam::camera::rh::view::look_at_mat4(
             glam::Vec3::new(0.0, 0.9, 2.5),
             glam::Vec3::ZERO,
             glam::Vec3::Y,
