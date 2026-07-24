@@ -433,15 +433,12 @@ impl PlatformWindow for CrossWindow {
             }
         });
 
-        // capture winit window Arc so handle can request redraw directly
-        let winit_arc = self.0.winit_window.get().cloned();
         Some(WgpuSurfaceHandle::new(
             ctx.device.clone(),
             ctx.queue.clone(),
             surface_id,
             registry,
             present_trigger,
-            winit_arc,
             width,
             height,
             format,
