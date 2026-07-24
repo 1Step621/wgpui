@@ -31,7 +31,6 @@ mod path_builder;
 mod platform;
 pub mod prelude;
 mod profiler;
-pub mod render_stats;
 mod queue;
 mod scene;
 mod shared_string;

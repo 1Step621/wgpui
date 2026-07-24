@@ -16,12 +16,11 @@ struct WgpuSurfaceHandleInner {
     registry: Arc<SurfaceRegistry>,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    /// Requests a repaint of the owning window. This always routes through the
-    /// event-loop proxy: `winit::window::Window::request_redraw()` is a main-thread
-    /// API on macOS, so calling it directly from a render thread is not reliable.
     present_trigger: Arc<dyn Fn() + Send + Sync>,
-    /// Device-level guard shared with the renderer. See `WgpuContext::gpu_submit_lock`.
-    gpu_submit_lock: Arc<parking_lot::RwLock<()>>,
+    /// Optional direct handle to the winit window.  Having an `Arc` lets
+    /// us call `request_redraw()` from another thread without touching the
+    /// event bus.
+    winit_window: Option<Arc<winit::window::Window>>,
     size: Mutex<(u32, u32)>,
     pending_resize: Mutex<Option<(u32, u32)>>,
     deferred_resize: Mutex<Option<(u32, u32)>>,
@@ -62,7 +61,7 @@ impl WgpuSurfaceHandle {
         surface_id: SurfaceId,
         registry: Arc<SurfaceRegistry>,
         present_trigger: Arc<dyn Fn() + Send + Sync>,
-        gpu_submit_lock: Arc<parking_lot::RwLock<()>>,
+        winit_window: Option<Arc<winit::window::Window>>,
         width: u32,
         height: u32,
         format: wgpu::TextureFormat,
@@ -74,7 +73,7 @@ impl WgpuSurfaceHandle {
                 device,
                 queue,
                 present_trigger,
-                gpu_submit_lock,
+                winit_window,
                 size: Mutex::new((width, height)),
                 pending_resize: Mutex::new(None),
                 deferred_resize: Mutex::new(None),
@@ -87,34 +86,6 @@ impl WgpuSurfaceHandle {
     /// The wgpu `Device` for creating GPU resources and command encoders.
     pub fn device(&self) -> &wgpu::Device {
         &self.inner.device
-    }
-
-    /// Acquire permission to submit GPU work on this surface's device.
-    ///
-    /// **External render threads must hold this across encoding, `queue.submit()`
-    /// and present.** The device and queue handed out by [`device()`](Self::device)
-    /// and [`queue()`](Self::queue) are shared with the compositor, and
-    /// `Surface::configure` (window resize) must observe an idle queue — wgpu
-    /// aborts the process with `GpuWaitTimeout` if anything submits while it waits.
-    ///
-    /// This is a **read** guard: any number of surfaces may hold one simultaneously
-    /// and none of them block each other, so each render thread keeps its own frame
-    /// pacing. Only a resize takes the exclusive side, and only for as long as the
-    /// swapchain takes to reconfigure.
-    ///
-    /// # Example
-    /// ```no_run
-    /// loop {
-    ///     let guard = surface.submit_guard();
-    ///     let (view, (w, h)) = surface.back_view_with_size()?;
-    ///     // ... encode and submit ...
-    ///     surface.present_synced_silent(submission_idx);
-    ///     drop(guard);
-    /// }
-    /// ```
-    pub fn submit_guard(&self) -> parking_lot::RwLockReadGuard<'_, ()> {
-        let _t = crate::render_stats::scope("surface: wait for submit_guard");
-        self.inner.gpu_submit_lock.read()
     }
 
     /// The wgpu `Queue` for submitting command buffers.
@@ -172,26 +143,13 @@ impl WgpuSurfaceHandle {
             .registry
             .set_redraw_pending(self.inner.surface_id);
 
-        (self.inner.present_trigger)();
+        if let Some(winit) = &self.inner.winit_window {
+            winit.request_redraw();
+        } else {
+            (self.inner.present_trigger)();
+        }
 
         // Return immediately - no blocking
-    }
-
-    /// Swap the rendered frame into the ready slot with GPU synchronization, but
-    /// without requesting a window redraw or marking the surface as needing one.
-    ///
-    /// Use this when the GPUI draw cycle already runs continuously (the element's
-    /// view calls [`Window::request_animation_frame`]) and therefore drives
-    /// compositing itself. The compositor promotes this frame to `display` on its
-    /// next pass over the element.
-    ///
-    /// Prefer this over [`present_synced()`](Self::present_synced) for render
-    /// threads embedded in a live GPUI view: `present_synced` drives repaints from
-    /// the render thread, which forces a full window refresh per presented frame.
-    pub fn present_synced_silent(&self, submission_index: wgpu::SubmissionIndex) {
-        self.inner
-            .registry
-            .swap_rendering_ready(self.inner.surface_id, submission_index);
     }
 
     /// Present the rendered frame without GPU synchronization (deprecated).
@@ -213,7 +171,11 @@ impl WgpuSurfaceHandle {
             .registry
             .set_redraw_pending(self.inner.surface_id);
 
-        (self.inner.present_trigger)();
+        if let Some(winit) = &self.inner.winit_window {
+            winit.request_redraw();
+        } else {
+            (self.inner.present_trigger)();
+        }
 
         // Return immediately - no blocking
     }

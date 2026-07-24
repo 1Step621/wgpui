@@ -29,15 +29,6 @@ struct TripleBuffer {
     // Redraw coalescing: prevents flooding compositor with thousands of requests/sec
     redraw_pending: std::sync::atomic::AtomicBool,
 
-    // Set when the render side swaps a freshly rendered frame into `ready`, cleared
-    // when the compositor promotes it to `display`.
-    //
-    // The renderer and the compositor run at independent rates, so `swap_ready_display`
-    // MUST NOT swap when no new frame has landed: swapping ready<->display twice in a
-    // row rotates a stale (or blank) buffer back into `display`, which shows up as the
-    // viewport alternating between the current frame and an old one.
-    frame_ready: std::sync::atomic::AtomicBool,
-
     width: u32,
     height: u32,
     format: wgpu::TextureFormat,
@@ -127,10 +118,6 @@ impl SurfaceRegistry {
                     Err(updated) => current = updated,
                 }
             }
-
-            // Publish after the swap so a compositor that observes the flag is
-            // guaranteed to see the new `ready` index.
-            tb.frame_ready.store(true, Ordering::Release);
         }
     }
 
@@ -152,28 +139,18 @@ impl SurfaceRegistry {
                     Err(updated) => current = updated,
                 }
             }
-
-            tb.frame_ready.store(true, Ordering::Release);
         }
     }
 
-    /// Atomically swap ready and display buffers, if a new frame is actually waiting.
+    /// Atomically swap ready and display buffers with GPU synchronization.
     ///
-    /// Returns `true` if a swap occurred, `false` if no new frame has been presented
-    /// since the last swap (the compositor should keep sampling the current display
-    /// buffer, which stays valid).
+    /// Polls the GPU to check if the ready buffer's work is complete before swapping.
+    /// This ensures the compositor never samples incomplete frames.
     ///
-    /// The `frame_ready` gate is what makes independent render/composite rates safe.
-    /// Without it, a compositor pass that runs when the render thread has not produced
-    /// a frame rotates the previous display buffer back in, so the viewport alternates
-    /// between the current frame and a stale one.
+    /// Returns `true` if a swap occurred, `false` if GPU work is incomplete (compositor
+    /// should reuse the current display buffer).
     pub fn swap_ready_display(&self, _device: &wgpu::Device, id: SurfaceId) -> bool {
         if let Some(tb) = self.surfaces.lock().unwrap().get(&id) {
-            // No new frame since the last promotion - keep the current display buffer.
-            if !tb.frame_ready.swap(false, Ordering::AcqRel) {
-                return false;
-            }
-
             // Atomic swap: ready ↔ display
             // NOTE: We do NOT call device.poll() here because:
             // 1. The render thread owns the device and is actively using it
@@ -207,7 +184,6 @@ impl SurfaceRegistry {
 
     /// Get the display buffer's `TextureView` (what the compositor reads from).
     pub fn front_view(&self, id: SurfaceId) -> Option<wgpu::TextureView> {
-        let _t = crate::render_stats::scope("registry: front_view lock (compositor)");
         let surfaces = self.surfaces.lock().unwrap();
         surfaces.get(&id).map(|tb| {
             let (_, _, display) = TripleBuffer::unpack_state(tb.state.load(Ordering::Acquire));
@@ -222,7 +198,6 @@ impl SurfaceRegistry {
         &self,
         id: SurfaceId,
     ) -> Option<(wgpu::TextureView, (u32, u32))> {
-        let _t = crate::render_stats::scope("registry: back_view lock (render thread)");
         let surfaces = self.surfaces.lock().unwrap();
         surfaces.get(&id).map(|tb| {
             let (rendering, _, _) = TripleBuffer::unpack_state(tb.state.load(Ordering::Acquire));
@@ -239,14 +214,8 @@ impl SurfaceRegistry {
     /// Also skips resize if compositor is actively using the buffers (redraw_pending).
     /// Returns `true` if the resize completed, `false` if it was skipped due to active composition.
     pub fn resize(&self, device: &wgpu::Device, id: SurfaceId, width: u32, height: u32) -> bool {
-        let _total = crate::render_stats::scope("SurfaceRegistry::resize TOTAL");
-
-        // Cheap checks under the lock; bail before doing any allocation.
-        let format = {
-            let surfaces = self.surfaces.lock().unwrap();
-            let Some(tb) = surfaces.get(&id) else {
-                return false;
-            };
+        let mut surfaces = self.surfaces.lock().unwrap();
+        if let Some(tb) = surfaces.get_mut(&id) {
             if tb.width == width && tb.height == height {
                 return true;
             }
@@ -258,42 +227,18 @@ impl SurfaceRegistry {
                 return false;
             }
 
-            tb.format
-        };
+            // NOTE: We do NOT call device.poll() here because:
+            // 1. The render thread owns the device and may be actively using it
+            // 2. Calling poll from compositor thread causes device corruption
+            // 3. WGPU internally ref-counts textures, so old views remain valid until dropped
+            // 4. The skip-if-redraw-pending check above prevents resize during active composition
 
-        // Allocate WITHOUT holding the lock. Three full-size textures is slow
-        // (tens of milliseconds at fullscreen), and this mutex is on the per-frame
-        // path of both the compositor (`front_view`) and every external render
-        // thread (`back_view_with_size`, the buffer swaps). Holding it across the
-        // allocation stalls all of them, and callers retry this in a loop.
-        //
-        // NOTE: We do NOT call device.poll() here because:
-        // 1. The render thread owns the device and may be actively using it
-        // 2. Calling poll from compositor thread causes device corruption
-        // 3. WGPU internally ref-counts textures, so old views remain valid until dropped
-        // 4. The skip-if-redraw-pending check above prevents resize during active composition
-        let new_tb = {
-            let _t = crate::render_stats::scope("  resize: alloc triple buffer (unlocked)");
-            crate::render_stats::count("triple buffer reallocs");
-            Self::create_triple_buffer(device, width, height, format)
-        };
-
-        // Re-check under the lock: the surface may have been removed, resized by a
-        // racing caller, or picked up by the compositor while we were allocating.
-        // Dropping `new_tb` on those paths just releases the textures we just made.
-        let mut surfaces = self.surfaces.lock().unwrap();
-        let Some(tb) = surfaces.get_mut(&id) else {
-            return false;
-        };
-        if tb.width == width && tb.height == height {
+            // Now safe to recreate textures
+            let new_tb = Self::create_triple_buffer(device, width, height, tb.format);
+            *tb = new_tb;
             return true;
         }
-        if tb.redraw_pending.load(Ordering::Relaxed) {
-            return false;
-        }
-
-        *tb = new_tb;
-        true
+        false
     }
 
     /// Get the current size of a surface.
@@ -383,7 +328,6 @@ impl SurfaceRegistry {
             state: AtomicU8::new(TripleBuffer::pack_state(0, 1, 2)),
             submission_indices: Mutex::new([None, None, None]),
             redraw_pending: std::sync::atomic::AtomicBool::new(false),
-            frame_ready: std::sync::atomic::AtomicBool::new(false),
             width: w,
             height: h,
             format,

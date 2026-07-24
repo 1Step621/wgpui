@@ -1206,37 +1206,22 @@ impl Window {
                         && last_input_timestamp.get().elapsed() < Duration::from_secs(1));
 
                 if invalidator.is_dirty() || request_frame_options.force_render {
-                    if invalidator.is_dirty() {
-                        crate::render_stats::count("frame: entered via is_dirty");
-                    } else {
-                        crate::render_stats::count("frame: entered via force_render ONLY");
-                    }
                     measure("frame duration", || {
                         handle
                             .update(&mut cx, |_, window, cx| {
                                 if request_frame_options.force_render {
                                     // Bypass cached view reuse so we don't replay stale
                                     // atlas tile references after a GPU device recovery.
-                                    let _t = crate::render_stats::scope("window.refresh()");
                                     window.refresh();
                                 }
-                                let arena_clear_needed = {
-                                    let _t = crate::render_stats::scope(
-                                        "window.draw() [element tree + compositor]",
-                                    );
-                                    window.draw(cx)
-                                };
-                                {
-                                    let _t = crate::render_stats::scope("window.present()");
-                                    window.present();
-                                }
+                                let arena_clear_needed = window.draw(cx);
+                                window.present();
                                 // drop the arena elements after present to reduce latency
                                 arena_clear_needed.clear();
                             })
                             .log_err();
                     })
                 } else if needs_present {
-                    crate::render_stats::count("frame: present-only (cheap path)");
                     // Fast path: framebuffer already updated by surface blit, just present it
                     handle
                         .update(&mut cx, |_, window, _| window.present_framebuffer_only())
