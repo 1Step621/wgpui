@@ -677,6 +677,7 @@ struct WgpuPipelines {
     poly_sprites_bind_group_layout: wgpu::BindGroupLayout,
     surfaces_bind_group_layout: wgpu::BindGroupLayout,
     paths_bind_group_layout: wgpu::BindGroupLayout,
+    framebuffer_blit_bind_group_layout: wgpu::BindGroupLayout,
 
     globals_bind_group: wgpu::BindGroup,
     color_adjustments_bind_group: wgpu::BindGroup,
@@ -689,6 +690,7 @@ struct WgpuPipelines {
     poly_sprites_pipeline: wgpu::RenderPipeline,
     surfaces_pipeline: wgpu::RenderPipeline,
     paths_pipeline: wgpu::RenderPipeline,
+    framebuffer_blit_pipeline: wgpu::RenderPipeline,
 }
 
 impl WgpuPipelines {
@@ -745,6 +747,16 @@ impl WgpuPipelines {
                     label: Some("poly_sprites shader"),
                     source: wgpu::ShaderSource::Wgsl(
                         include_str!("shaders/poly_sprites.wgsl").into(),
+                    ),
+                });
+
+        let framebuffer_blit_shader =
+            context
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("framebuffer_blit_shader"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        include_str!("shaders/framebuffer_blit.wgsl").into(),
                     ),
                 });
 
@@ -1077,6 +1089,40 @@ impl WgpuPipelines {
                     immediate_size: 0,
                 });
 
+        let framebuffer_blit_bind_group_layout =
+            context
+                .device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("framebuffer_blit_bind_group_layout"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                            count: None,
+                        },
+                    ],
+                });
+
+        let framebuffer_blit_pipeline_layout =
+            context
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("framebuffer_blit_pipeline_layout"),
+                    bind_group_layouts: &[Some(&framebuffer_blit_bind_group_layout)],
+                    immediate_size: 0,
+                });
+
         let globals_bind_group = context
             .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1158,6 +1204,7 @@ impl WgpuPipelines {
             sprites_bind_group_layout,
             poly_sprites_bind_group_layout,
             paths_bind_group_layout,
+            framebuffer_blit_bind_group_layout,
 
             globals_bind_group,
             color_adjustments_bind_group,
@@ -1379,6 +1426,40 @@ impl WgpuPipelines {
                     cache: None,
                 },
             ),
+
+            // Final pass of every frame: framebuffer -> swapchain. Writes every
+            // pixel with no blending, so the swapchain's prior (stale) contents
+            // are irrelevant.
+            framebuffer_blit_pipeline: context.device.create_render_pipeline(
+                &wgpu::RenderPipelineDescriptor {
+                    label: Some("framebuffer_blit"),
+                    layout: Some(&framebuffer_blit_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &framebuffer_blit_shader,
+                        entry_point: Some("vs_blit"),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        buffers: &[],
+                    },
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        ..Default::default()
+                    },
+                    depth_stencil: None,
+                    fragment: Some(wgpu::FragmentState {
+                        module: &framebuffer_blit_shader,
+                        entry_point: Some("fs_blit"),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: surface_configuration.format,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                },
+            ),
         }
     }
 }
@@ -1470,6 +1551,7 @@ pub struct WgpuRenderer {
     surface_configuration: wgpu::SurfaceConfiguration,
     atlas_sampler: wgpu::Sampler,
     surface_sampler: wgpu::Sampler,
+    framebuffer_blit_sampler: wgpu::Sampler,
     atlas: Arc<WgpuAtlas>,
     pipelines: WgpuPipelines,
     rendering_parameters: RenderingParameters,
@@ -1591,6 +1673,17 @@ impl WgpuRenderer {
             ..Default::default()
         });
 
+        // 1:1 blit, so nearest sampling is both exact and cheaper than linear.
+        let framebuffer_blit_sampler = context.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("framebuffer_blit_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+
         let backdrop_blur_sampler = context.device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("backdrop_blur_sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -1615,7 +1708,10 @@ impl WgpuRenderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            // COPY_SRC: the backdrop blur snapshots the framebuffer mid-frame.
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
 
@@ -1653,6 +1749,7 @@ impl WgpuRenderer {
             atlas,
             atlas_sampler,
             surface_sampler,
+            framebuffer_blit_sampler,
             backdrop_blur_sampler,
             pipelines,
             rendering_parameters: RenderingParameters::from_env(),
@@ -1666,6 +1763,60 @@ impl WgpuRenderer {
             surface_bounds_cache: Arc::new(Mutex::new(HashMap::new())),
             layout_version: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Copy the persistent framebuffer onto the acquired swapchain image.
+    ///
+    /// Every path that presents a frame ends here. The blit writes every pixel
+    /// with blending disabled, so whatever stale content the rotating swapchain
+    /// image happened to hold is fully overwritten.
+    fn blit_framebuffer_to_swapchain(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        swapchain_view: &wgpu::TextureView,
+    ) {
+        let Some(framebuffer_view) = self.persistent_framebuffer_view.as_ref() else {
+            return;
+        };
+
+        let bind_group = self
+            .context
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("framebuffer_blit_bind_group"),
+                layout: &self.pipelines.framebuffer_blit_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(framebuffer_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.framebuffer_blit_sampler),
+                    },
+                ],
+            });
+
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("framebuffer_blit_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: swapchain_view,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+                resolve_target: None,
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+
+        pass.set_pipeline(&self.pipelines.framebuffer_blit_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.draw(0..3, 0..1);
     }
 
     pub fn draw(&mut self, scene: &Scene) {
@@ -2043,14 +2194,22 @@ impl WgpuRenderer {
                 }],
             });
 
+        // The compositor renders into the persistent framebuffer, which is blitted
+        // to the swapchain at the end of the frame. Keeping a full copy of the last
+        // composed frame is what lets incremental paths (`blit_surfaces_direct`)
+        // use `LoadOp::Load` meaningfully - the swapchain cannot serve that role
+        // because it rotates through several images.
+        let framebuffer_view = self
+            .persistent_framebuffer_view
+            .as_ref()
+            .expect("persistent framebuffer must exist")
+            .clone();
+
         {
-            // Render to swapchain directly for now (TODO: render to framebuffer, then blit)
             let mut pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &surface_texture
-                        .texture
-                        .create_view(&wgpu::TextureViewDescriptor::default()),
+                    view: &framebuffer_view,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
@@ -2182,19 +2341,21 @@ impl WgpuRenderer {
                         // End the current render pass to copy texture
                         drop(pass);
 
-                        // Copy surface texture to backdrop_blur_texture for sampling
-                        if let Some(ref blur_texture) = self.backdrop_blur_texture {
-                            // Use actual surface texture size (may differ from configured size)
-                            let surface_size = surface_texture.texture.size();
+                        // Snapshot what has been composed so far so the blur can sample it.
+                        if let (Some(blur_texture), Some(framebuffer)) = (
+                            self.backdrop_blur_texture.as_ref(),
+                            self.persistent_framebuffer.as_ref(),
+                        ) {
+                            let framebuffer_size = framebuffer.size();
 
                             // Only copy if sizes match (otherwise skip to avoid validation error)
-                            if surface_size.width == blur_texture.width()
-                                && surface_size.height == blur_texture.height()
+                            if framebuffer_size.width == blur_texture.width()
+                                && framebuffer_size.height == blur_texture.height()
                             {
                                 command_encoder.copy_texture_to_texture(
-                                    surface_texture.texture.as_image_copy(),
+                                    framebuffer.as_image_copy(),
                                     blur_texture.as_image_copy(),
-                                    surface_size,
+                                    framebuffer_size,
                                 );
                             }
                         }
@@ -2203,9 +2364,7 @@ impl WgpuRenderer {
                         pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some("main_resumed"),
                             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: &surface_texture
-                                    .texture
-                                    .create_view(&wgpu::TextureViewDescriptor::default()),
+                                view: &framebuffer_view,
                                 ops: wgpu::Operations {
                                     load: wgpu::LoadOp::Load,
                                     store: wgpu::StoreOp::Store,
@@ -2275,12 +2434,9 @@ impl WgpuRenderer {
                             // `group_textures[depth]`.
                             drop(pass);
 
-                            let surface_view = surface_texture
-                                .texture
-                                .create_view(&wgpu::TextureViewDescriptor::default());
                             let parent_view: &wgpu::TextureView = match filter_stack.last() {
                                 Some((_, Some(parent_depth))) => &self.group_views[*parent_depth],
-                                _ => &surface_view,
+                                _ => &framebuffer_view,
                             };
 
                             pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2528,7 +2684,10 @@ impl WgpuRenderer {
             }
         }
 
-        // TODO: Blit persistent framebuffer to swapchain (needs proper pipeline)
+        let swapchain_view = surface_texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        self.blit_framebuffer_to_swapchain(&mut command_encoder, &swapchain_view);
 
         log::debug!("Renderer::draw: submitting command buffer");
         self.context.queue.submit(Some(command_encoder.finish()));
@@ -2626,13 +2785,20 @@ impl WgpuRenderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        let Some(framebuffer_view) = self.persistent_framebuffer_view.as_ref() else {
+            return false;
+        };
+
         {
+            // Draw the surfaces over the last fully composed frame. `LoadOp::Load`
+            // is correct here because the framebuffer persists across frames; doing
+            // this against the swapchain would load an image two or three frames old.
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("fast_surface_blit_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &swapchain_view,
+                    view: framebuffer_view,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load, // Preserve existing swapchain content
+                        load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
                     resolve_target: None,
@@ -2709,6 +2875,8 @@ impl WgpuRenderer {
             }
         }
 
+        self.blit_framebuffer_to_swapchain(&mut encoder, &swapchain_view);
+
         self.context.queue.submit(Some(encoder.finish()));
         self.context.queue.present(surface_texture);
 
@@ -2760,8 +2928,10 @@ impl WgpuRenderer {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: self.surface_configuration.format,
+                // COPY_SRC: the backdrop blur snapshots the framebuffer mid-frame.
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             });
 
