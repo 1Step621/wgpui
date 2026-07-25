@@ -1506,6 +1506,15 @@ pub struct WgpuRenderer {
     // plain field.
     #[cfg(feature = "flamegraph")]
     gpu_query_manager: parking_lot::Mutex<Option<crate::flamegraph_gpu::GpuQueryManager>>,
+
+    // On-demand GPU deep capture (issue #60). `None` except for the brief
+    // window between a `flamegraph::request_deep_capture()` call firing on a
+    // `draw()` and that capture's resource readback completing a few frames
+    // later -- see `flamegraph_gpu`'s Phase 4 section doc comment for why
+    // this is a completely separate, non-persistent path from
+    // `gpu_query_manager` above rather than sharing its machinery.
+    #[cfg(feature = "flamegraph")]
+    deep_capture: parking_lot::Mutex<Option<crate::flamegraph_gpu::DeepCapturePendingReadback>>,
 }
 
 impl WgpuRenderer {
@@ -1683,6 +1692,8 @@ impl WgpuRenderer {
             layout_version: Arc::new(AtomicU64::new(0)),
             #[cfg(feature = "flamegraph")]
             gpu_query_manager: parking_lot::Mutex::new(None),
+            #[cfg(feature = "flamegraph")]
+            deep_capture: parking_lot::Mutex::new(None),
         })
     }
 
@@ -1741,6 +1752,28 @@ impl WgpuRenderer {
                 command_encoder.write_timestamp(reserved.query_set(), reserved.begin_index());
             }
             reserved
+        };
+
+        // On-demand GPU deep capture (issue #60): harvest any previous deep
+        // capture whose readback has completed (non-blocking, same
+        // render-thread poll pattern as the query manager above), then arm a
+        // new recorder for *this* frame if one was requested and none is
+        // currently in flight. See `flamegraph_gpu`'s Phase 4 section doc
+        // comment for the full lifecycle this participates in.
+        #[cfg(feature = "flamegraph")]
+        let mut deep_capture_recorder: Option<crate::flamegraph_gpu::DeepCaptureRecorder> = {
+            let mut guard = self.deep_capture.lock();
+            if let Some(pending) = guard.as_mut()
+                && let Some(capture) = pending.poll(&self.context.device)
+            {
+                crate::flamegraph::complete_deep_capture(capture);
+                *guard = None;
+            }
+            if guard.is_none() && crate::flamegraph::take_deep_capture_request() {
+                Some(crate::flamegraph_gpu::DeepCaptureRecorder::new())
+            } else {
+                None
+            }
         };
 
         self.atlas.before_frame(&mut command_encoder);
@@ -2150,6 +2183,16 @@ impl WgpuRenderer {
             // `MAX_FILTER_DEPTH` and is being painted inline, unisolated).
             let mut filter_stack: Vec<(FilterBoundary, Option<usize>)> = Vec::new();
 
+            // Deep capture (issue #60): tracks which render pass `pass`
+            // currently points at, so each recorded draw call's `pass_label`
+            // reflects reality even though `pass` gets reassigned mid-loop
+            // (backdrop filters/filter groups end and re-begin it). Kept
+            // outside the `#[cfg(feature = "flamegraph")]` recorder itself
+            // since it's just a `&'static str`, cheaper than gating every one
+            // of its several assignment sites.
+            #[cfg(feature = "flamegraph")]
+            let mut current_pass_label: &'static str = "main";
+
             for batch in scene.batches() {
                 match batch {
                     PrimitiveBatch::Quads(quads) => {
@@ -2161,6 +2204,19 @@ impl WgpuRenderer {
                         quads_first_instance += count;
                         #[cfg(feature = "flamegraph")]
                         crate::record_draw_call(crate::DrawCallKind::Quads, count);
+                        #[cfg(feature = "flamegraph")]
+                        if let Some(recorder) = deep_capture_recorder.as_mut() {
+                            recorder.record_draw_call(
+                                crate::DrawCallKind::Quads,
+                                "quads",
+                                current_pass_label,
+                                0..4,
+                                quads_first_instance - count..quads_first_instance,
+                                2,
+                                Some(crate::flamegraph::DeepCaptureBufferKind::Quads),
+                                None,
+                            );
+                        }
                     }
 
                     PrimitiveBatch::MonochromeSprites {
@@ -2204,6 +2260,19 @@ impl WgpuRenderer {
                         mono_sprites_first_instance += count;
                         #[cfg(feature = "flamegraph")]
                         crate::record_draw_call(crate::DrawCallKind::MonoSprites, count);
+                        #[cfg(feature = "flamegraph")]
+                        if let Some(recorder) = deep_capture_recorder.as_mut() {
+                            recorder.record_draw_call(
+                                crate::DrawCallKind::MonoSprites,
+                                "mono_sprites",
+                                current_pass_label,
+                                0..4,
+                                mono_sprites_first_instance - count..mono_sprites_first_instance,
+                                4,
+                                Some(crate::flamegraph::DeepCaptureBufferKind::MonoSprites),
+                                Some(((texture_id.kind as u64) << 32) | texture_id.index as u64),
+                            );
+                        }
                     }
                     PrimitiveBatch::PolychromeSprites {
                         texture_id,
@@ -2245,6 +2314,19 @@ impl WgpuRenderer {
                         poly_sprites_first_instance += count;
                         #[cfg(feature = "flamegraph")]
                         crate::record_draw_call(crate::DrawCallKind::PolySprites, count);
+                        #[cfg(feature = "flamegraph")]
+                        if let Some(recorder) = deep_capture_recorder.as_mut() {
+                            recorder.record_draw_call(
+                                crate::DrawCallKind::PolySprites,
+                                "poly_sprites",
+                                current_pass_label,
+                                0..4,
+                                poly_sprites_first_instance - count..poly_sprites_first_instance,
+                                3,
+                                Some(crate::flamegraph::DeepCaptureBufferKind::PolySprites),
+                                Some(((texture_id.kind as u64) << 32) | texture_id.index as u64),
+                            );
+                        }
                     }
                     PrimitiveBatch::Shadows(shadows) => {
                         let count = shadows.len() as u32;
@@ -2255,6 +2337,19 @@ impl WgpuRenderer {
                         shadows_first_instance += count;
                         #[cfg(feature = "flamegraph")]
                         crate::record_draw_call(crate::DrawCallKind::Shadows, count);
+                        #[cfg(feature = "flamegraph")]
+                        if let Some(recorder) = deep_capture_recorder.as_mut() {
+                            recorder.record_draw_call(
+                                crate::DrawCallKind::Shadows,
+                                "shadows",
+                                current_pass_label,
+                                0..4,
+                                shadows_first_instance - count..shadows_first_instance,
+                                2,
+                                Some(crate::flamegraph::DeepCaptureBufferKind::Shadows),
+                                None,
+                            );
+                        }
                     }
                     PrimitiveBatch::BackdropFilters(backdrop_filters) => {
                         let count = backdrop_filters.len() as u32;
@@ -2306,6 +2401,10 @@ impl WgpuRenderer {
                             occlusion_query_set: None,
                             multiview_mask: None,
                         });
+                        #[cfg(feature = "flamegraph")]
+                        {
+                            current_pass_label = "main_resumed";
+                        }
 
                         // Now render the backdrop blur quads
                         pass.set_pipeline(&self.pipelines.backdrop_filters_pipeline);
@@ -2319,6 +2418,19 @@ impl WgpuRenderer {
                         backdrop_filters_first_instance += count;
                         #[cfg(feature = "flamegraph")]
                         crate::record_draw_call(crate::DrawCallKind::BackdropFilters, count);
+                        #[cfg(feature = "flamegraph")]
+                        if let Some(recorder) = deep_capture_recorder.as_mut() {
+                            recorder.record_draw_call(
+                                crate::DrawCallKind::BackdropFilters,
+                                "backdrop_filters",
+                                current_pass_label,
+                                0..4,
+                                backdrop_filters_first_instance - count..backdrop_filters_first_instance,
+                                3,
+                                Some(crate::flamegraph::DeepCaptureBufferKind::BackdropFilters),
+                                None,
+                            );
+                        }
                     }
                     PrimitiveBatch::FilterBoundary(index) => {
                         let boundary = scene.filter_boundaries[index];
@@ -2356,6 +2468,10 @@ impl WgpuRenderer {
                                     occlusion_query_set: None,
                                     multiview_mask: None,
                                 });
+                                #[cfg(feature = "flamegraph")]
+                                {
+                                    current_pass_label = "filter_group";
+                                }
 
                                 filter_stack.push((boundary, Some(depth)));
                             }
@@ -2405,6 +2521,10 @@ impl WgpuRenderer {
                                 occlusion_query_set: None,
                                 multiview_mask: None,
                             });
+                            #[cfg(feature = "flamegraph")]
+                            {
+                                current_pass_label = "filter_group_resumed";
+                            }
 
                             // Composite the blurred group content back over the parent using
                             // the same backdrop-filter pipeline, sampling from the group's
@@ -2481,6 +2601,19 @@ impl WgpuRenderer {
                         underlines_first_instance += count;
                         #[cfg(feature = "flamegraph")]
                         crate::record_draw_call(crate::DrawCallKind::Underlines, count);
+                        #[cfg(feature = "flamegraph")]
+                        if let Some(recorder) = deep_capture_recorder.as_mut() {
+                            recorder.record_draw_call(
+                                crate::DrawCallKind::Underlines,
+                                "underlines",
+                                current_pass_label,
+                                0..4,
+                                underlines_first_instance - count..underlines_first_instance,
+                                2,
+                                Some(crate::flamegraph::DeepCaptureBufferKind::Underlines),
+                                None,
+                            );
+                        }
                     }
                     PrimitiveBatch::Surfaces(surfaces) => {
                         log::debug!("Renderer: processing {} surface(s)", surfaces.len());
@@ -2602,6 +2735,19 @@ impl WgpuRenderer {
                                     pass.draw(0..4, 0..1);
                                     #[cfg(feature = "flamegraph")]
                                     crate::record_draw_call(crate::DrawCallKind::Surfaces, 1);
+                                    #[cfg(feature = "flamegraph")]
+                                    if let Some(recorder) = deep_capture_recorder.as_mut() {
+                                        recorder.record_draw_call(
+                                            crate::DrawCallKind::Surfaces,
+                                            "surfaces",
+                                            current_pass_label,
+                                            0..4,
+                                            0..1,
+                                            2,
+                                            None,
+                                            None,
+                                        );
+                                    }
 
                                     // CRITICAL: Keep view alive until after render pass ends
                                     // The bind_group holds a reference to it
@@ -2634,6 +2780,19 @@ impl WgpuRenderer {
                             paths_vertex_offset += vertex_count;
                             #[cfg(feature = "flamegraph")]
                             crate::record_draw_call(crate::DrawCallKind::Paths, paths.len() as u32);
+                            #[cfg(feature = "flamegraph")]
+                            if let Some(recorder) = deep_capture_recorder.as_mut() {
+                                recorder.record_draw_call(
+                                    crate::DrawCallKind::Paths,
+                                    "paths",
+                                    current_pass_label,
+                                    paths_vertex_offset - vertex_count..paths_vertex_offset,
+                                    0..1,
+                                    2,
+                                    Some(crate::flamegraph::DeepCaptureBufferKind::Paths),
+                                    None,
+                                );
+                            }
                         }
                     }
                 }
@@ -2658,6 +2817,31 @@ impl WgpuRenderer {
             }
         }
 
+        // On-demand GPU deep capture (issue #60): if this frame was armed for
+        // recording, hand off from `DeepCaptureRecorder` to
+        // `DeepCapturePendingReadback` now -- while `finish` still has a
+        // chance to record any buffer-copy commands into `command_encoder`,
+        // before it's finished below. `quads_buffer_ref`/etc. are the same
+        // guards already held (further up in this function, for the
+        // bind-group setup above) for the whole duration of `draw`, so this
+        // reuses them rather than re-locking.
+        #[cfg(feature = "flamegraph")]
+        let deep_capture_pending = deep_capture_recorder.take().map(|recorder| {
+            let buffers: [(crate::flamegraph::DeepCaptureBufferKind, &wgpu::Buffer); 7] = [
+                (crate::flamegraph::DeepCaptureBufferKind::Quads, &quads_buffer_ref),
+                (crate::flamegraph::DeepCaptureBufferKind::Shadows, &shadows_buffer_ref),
+                (crate::flamegraph::DeepCaptureBufferKind::Underlines, &underlines_buffer_ref),
+                (crate::flamegraph::DeepCaptureBufferKind::MonoSprites, &mono_sprites_buffer_ref),
+                (crate::flamegraph::DeepCaptureBufferKind::PolySprites, &poly_sprites_buffer_ref),
+                (
+                    crate::flamegraph::DeepCaptureBufferKind::BackdropFilters,
+                    &backdrop_filters_buffer_ref,
+                ),
+                (crate::flamegraph::DeepCaptureBufferKind::Paths, &paths_vertices_buffer_ref),
+            ];
+            recorder.finish(&self.context.device, &mut command_encoder, &buffers)
+        });
+
         log::debug!("Renderer::draw: submitting command buffer");
         self.context.queue.submit(Some(command_encoder.finish()));
         log::debug!("Renderer::draw: presenting surface");
@@ -2671,6 +2855,19 @@ impl WgpuRenderer {
             if let Some(manager) = guard.as_mut() {
                 manager.begin_readback();
             }
+        }
+
+        // Start this frame's deep-capture readback (if one was armed) now
+        // that its buffer-copy commands, if any, have actually been
+        // submitted, and hand it off to `self.deep_capture` so future
+        // `draw()` calls poll it to completion. Overwrites (rather than
+        // stacking on top of) any prior in-flight deep capture, but that
+        // can't happen in practice: the arm step above only creates a new
+        // recorder when `self.deep_capture` is `None`.
+        #[cfg(feature = "flamegraph")]
+        if let Some(mut pending) = deep_capture_pending {
+            pending.begin_readback();
+            *self.deep_capture.lock() = Some(pending);
         }
 
         log::debug!("Renderer::draw: frame complete");

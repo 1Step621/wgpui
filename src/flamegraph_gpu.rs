@@ -25,10 +25,13 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU8, Ordering},
 };
 
-use crate::flamegraph::{self, GpuClockCalibration, GpuPassKind, GpuSpan, SpanName};
+use crate::flamegraph::{
+    self, DeepCaptureBufferKind, DeepCaptureDrawCall, DrawCallKind, GpuClockCalibration, GpuPassKind, GpuSpan,
+    SpanName,
+};
 
 /// Timestamp-pair budget per frame: main/main_resumed/up to 4 nested filter
 /// groups + resumes/fast_surface_blit, with headroom, plus the whole-encoder
@@ -443,5 +446,451 @@ pub(crate) fn sync_with_active_capture(
             *slot = None;
         }
         _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: on-demand GPU deep capture (issue #60).
+//
+// `DeepCaptureRecorder`/`DeepCapturePendingReadback` deliberately do not
+// reuse `GpuQueryManager`'s triple-buffered generation array: a deep capture
+// is single-shot and torn down the moment its readback completes (see
+// `flamegraph.rs`'s Phase 4 section doc comment), so there is nothing to
+// triple-buffer -- at most one `DeepCapturePendingReadback` exists at a time,
+// held in `WgpuRenderer::deep_capture`. The *shape* of the readback state
+// machine (record during the frame -> copy into a staging buffer before
+// `encoder.finish()` -> `map_async` after submit -> poll non-blockingly on
+// the render thread every frame until ready -> harvest) is intentionally the
+// same pattern `QueryGeneration` above uses, for the same reason documented
+// in this file's module docs: this device may only safely be polled from the
+// render thread that submits to it.
+//
+// Resource readback covers `WgpuContext`'s fixed buffers only (quads,
+// shadows, underlines, mono/poly sprites, backdrop filters, paths vertices)
+// -- not the atlas or surface textures the issue also mentions. See
+// `flamegraph.rs`'s Phase 4 section doc comment for why buffers are read
+// back once per touched kind rather than once per draw call, and this
+// module's final Phase 4 doc note (bottom of file) for why texture readback
+// specifically was scoped out of this round.
+
+/// Accumulates one triggered frame's command stream while `WgpuRenderer::draw`
+/// is recording it. Created fresh by `WgpuRenderer::draw` when
+/// `flamegraph::take_deep_capture_request()` returns true, consumed by
+/// `finish` once the frame's `PrimitiveBatch` loop completes.
+pub(crate) struct DeepCaptureRecorder {
+    draw_calls: Vec<DeepCaptureDrawCall>,
+    /// Distinct `DeepCaptureBufferKind`s seen across `draw_calls` so far, in
+    /// first-seen order. Small (at most 7 possible kinds) so a linear-scan
+    /// `contains` check on every `record_draw_call` is cheaper than a
+    /// `HashSet` and avoids pulling in a hasher for something this size.
+    touched_buffers: Vec<DeepCaptureBufferKind>,
+}
+
+impl DeepCaptureRecorder {
+    pub(crate) fn new() -> Self {
+        Self {
+            draw_calls: Vec::new(),
+            touched_buffers: Vec::new(),
+        }
+    }
+
+    /// Record one `RenderPass::draw` call's full identifying detail. Called
+    /// from every `PrimitiveBatch` match arm in `WgpuRenderer::draw` that
+    /// phase 2's `record_draw_call` (a different, counter-only function of
+    /// the same name in `flamegraph.rs`) already instruments -- same call
+    /// sites, recording detail instead of just a running tally.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_draw_call(
+        &mut self,
+        kind: DrawCallKind,
+        pipeline_label: &'static str,
+        pass_label: &'static str,
+        vertex_range: std::ops::Range<u32>,
+        instance_range: std::ops::Range<u32>,
+        bind_group_count: u32,
+        buffer_kind: Option<DeepCaptureBufferKind>,
+        atlas_texture_id: Option<u64>,
+    ) {
+        if let Some(buffer_kind) = buffer_kind
+            && !self.touched_buffers.contains(&buffer_kind)
+        {
+            self.touched_buffers.push(buffer_kind);
+        }
+
+        let sequence = self.draw_calls.len() as u32;
+        self.draw_calls.push(DeepCaptureDrawCall {
+            sequence,
+            kind,
+            pipeline_label,
+            pass_label,
+            vertex_range: (vertex_range.start, vertex_range.end),
+            instance_range: (instance_range.start, instance_range.end),
+            bind_group_count,
+            buffer_kind,
+            atlas_texture_id,
+        });
+    }
+
+    /// Finish recording and hand off to the readback phase: for every
+    /// distinct buffer kind touched by this frame's command stream, look it
+    /// up in `buffers`, allocate a same-sized `MAP_READ` staging buffer, and
+    /// record a `copy_buffer_to_buffer` from the live buffer into it. Must be
+    /// called after the frame's render-pass loop has ended (so `draw_calls`
+    /// is complete, and the live buffers are no longer borrowed by an active
+    /// `RenderPass`) and before `encoder.finish()` (the copy commands have to
+    /// land in the same encoder submission as the draws they're snapshotting
+    /// after).
+    ///
+    /// `buffers` is expected to list every `DeepCaptureBufferKind` `WgpuContext`
+    /// actually has a fixed buffer for (see that type's variants); a touched
+    /// kind missing from `buffers` is silently skipped rather than panicking,
+    /// since `finish` has no way to distinguish "programmer error" from "this
+    /// buffer kind doesn't apply to the current renderer configuration" --
+    /// either way, dropping one buffer's contents from an otherwise-useful
+    /// capture is better than losing the whole thing.
+    pub(crate) fn finish(
+        self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        buffers: &[(DeepCaptureBufferKind, &wgpu::Buffer)],
+    ) -> DeepCapturePendingReadback {
+        let mut staging = Vec::with_capacity(self.touched_buffers.len());
+        for kind in &self.touched_buffers {
+            let Some((_, source)) = buffers.iter().find(|(candidate, _)| candidate == kind) else {
+                continue;
+            };
+            let size = source.size();
+            if size == 0 {
+                continue;
+            }
+            let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("flamegraph_deep_capture_staging_buffer"),
+                size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            encoder.copy_buffer_to_buffer(source, 0, &staging_buffer, 0, size);
+            staging.push(DeepCaptureStagingBuffer {
+                kind: *kind,
+                size,
+                buffer: staging_buffer,
+                map_state: Arc::new(AtomicU8::new(MAP_STATE_PENDING)),
+            });
+        }
+
+        DeepCapturePendingReadback {
+            draw_calls: self.draw_calls,
+            staging,
+            state: PendingReadbackState::AwaitingSubmit,
+        }
+    }
+}
+
+/// One touched buffer's readback: the live buffer's kind (for tagging the
+/// resulting [`flamegraph::DeepCaptureBufferContents`]), its size (both
+/// buffers are this size -- `copy_buffer_to_buffer` requires matching
+/// lengths), the staging buffer itself, and the async map's completion state.
+struct DeepCaptureStagingBuffer {
+    kind: DeepCaptureBufferKind,
+    size: u64,
+    buffer: wgpu::Buffer,
+    map_state: Arc<AtomicU8>,
+}
+
+const MAP_STATE_PENDING: u8 = 0;
+const MAP_STATE_OK: u8 = 1;
+const MAP_STATE_ERR: u8 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingReadbackState {
+    /// `finish` has recorded the copy commands but the encoder holding them
+    /// has not been submitted yet -- `map_async` must not be called until it
+    /// has (mapping a buffer that a not-yet-submitted copy still targets is a
+    /// wgpu validation error).
+    AwaitingSubmit,
+    /// `begin_readback` has been called; waiting on `staging`'s maps.
+    MapPending,
+}
+
+/// A deep capture's command stream, mid-readback. Held in
+/// `WgpuRenderer::deep_capture` from the frame it was recorded until
+/// `poll` reports the readback complete, at which point `WgpuRenderer::draw`
+/// drops it -- freeing any staging buffers it holds -- and publishes the
+/// result via `flamegraph::complete_deep_capture`.
+pub(crate) struct DeepCapturePendingReadback {
+    draw_calls: Vec<DeepCaptureDrawCall>,
+    staging: Vec<DeepCaptureStagingBuffer>,
+    state: PendingReadbackState,
+}
+
+impl DeepCapturePendingReadback {
+    /// Start the async readback maps for every staging buffer `finish`
+    /// created. Must be called once, after the encoder `finish` recorded copy
+    /// commands into has actually been submitted to the queue -- mirrors
+    /// `GpuQueryManager::begin_readback`'s same ordering requirement, for the
+    /// same reason (see [`PendingReadbackState::AwaitingSubmit`]).
+    pub(crate) fn begin_readback(&mut self) {
+        if self.state != PendingReadbackState::AwaitingSubmit {
+            return;
+        }
+        for staging in &self.staging {
+            let map_state = staging.map_state.clone();
+            staging.buffer.slice(0..staging.size).map_async(wgpu::MapMode::Read, move |result| {
+                map_state.store(
+                    if result.is_ok() { MAP_STATE_OK } else { MAP_STATE_ERR },
+                    Ordering::Release,
+                );
+            });
+        }
+        self.state = PendingReadbackState::MapPending;
+    }
+
+    /// Non-blocking poll (mirrors `GpuQueryManager::poll_readback`'s
+    /// same-thread, non-blocking pattern documented at the top of this
+    /// file). Returns the finished [`flamegraph::DeepCapture`] once every
+    /// touched buffer's map has resolved -- successfully or not, so a single
+    /// failed map can't leave this capture stuck pending forever; the caller
+    /// is expected to drop `self` immediately afterward, satisfying "no
+    /// persistent overhead, no persistent buffers" once a capture is done.
+    pub(crate) fn poll(&mut self, device: &wgpu::Device) -> Option<flamegraph::DeepCapture> {
+        if self.state != PendingReadbackState::MapPending {
+            return None;
+        }
+        let _ = device.poll(wgpu::PollType::Poll);
+        let all_resolved = self
+            .staging
+            .iter()
+            .all(|staging| staging.map_state.load(Ordering::Acquire) != MAP_STATE_PENDING);
+        if !all_resolved {
+            return None;
+        }
+
+        let mut resources_finalized = true;
+        let mut buffer_contents = Vec::with_capacity(self.staging.len());
+        for staging in &self.staging {
+            if staging.map_state.load(Ordering::Acquire) != MAP_STATE_OK {
+                resources_finalized = false;
+                continue;
+            }
+            let slice = staging.buffer.slice(0..staging.size);
+            match slice.get_mapped_range() {
+                Ok(view) => {
+                    buffer_contents.push(flamegraph::DeepCaptureBufferContents {
+                        kind: staging.kind,
+                        bytes: view.to_vec(),
+                    });
+                }
+                Err(_) => resources_finalized = false,
+            }
+            staging.buffer.unmap();
+        }
+
+        Some(flamegraph::DeepCapture {
+            draw_calls: std::mem::take(&mut self.draw_calls),
+            buffer_contents,
+            resources_finalized,
+        })
+    }
+}
+
+// Deferred this round: texture content readback (atlas mono/poly textures,
+// surface textures). The issue's "resource contents" bullet covers both
+// buffers and textures; this implementation covers buffers only.
+//
+// Reasoning for the cut: every fixed buffer above is one `wgpu::Buffer` of a
+// known, stable usage flag set, so one `copy_buffer_to_buffer` + one staging
+// buffer per kind (7 total, worst case) is all `DeepCaptureRecorder::finish`
+// needs. Textures are a meaningfully different shape of problem --
+// `copy_texture_to_buffer` requires `bytes_per_row` padded to
+// `COPY_BYTES_PER_ROW_ALIGNMENT` (256), the atlas has a dynamic, growable
+// number of monochrome/polychrome texture pages (`WgpuAtlasStorage`, not a
+// single fixed handle), and surface textures vary in count/size/format per
+// registered `SurfaceId` (`SurfaceRegistry`). Getting that right (padding
+// math, iterating a dynamic page/surface list, one staging buffer and
+// `map_async` per texture rather than per fixed field) is a distinctly
+// larger and riskier chunk of work than the buffer case, on top of an
+// already GPU-readback-heavy phase. Per this phase's own risk guidance, a
+// smaller correct slice now (full command stream + pipeline/shader identity
+// + fixed-buffer contents) was chosen over forcing texture readback into the
+// same session. `DeepCaptureDrawCall::atlas_texture_id` still identifies
+// *which* atlas texture a sprite call bound, even though this round can't
+// read that texture's pixels back -- a future pass can add
+// `DeepCaptureTextureContents` alongside `DeepCaptureBufferContents` without
+// needing to change anything landed here.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `DeepCaptureRecorder::record_draw_call`/`touched_buffers` are pure
+    // bookkeeping with no wgpu resource involved, so this is covered without
+    // needing a live `wgpu::Device` -- exercising exactly the logic
+    // `WgpuRenderer::draw`'s `PrimitiveBatch` match arms call into, and the
+    // same touched-buffer tracking `finish` (tested below, where a device is
+    // available) relies on to know which buffers to stage.
+    #[test]
+    fn record_draw_call_builds_command_stream_with_deduped_touched_buffers() {
+        let mut recorder = DeepCaptureRecorder::new();
+
+        recorder.record_draw_call(
+            DrawCallKind::Quads,
+            "quads",
+            "main",
+            0..4,
+            0..10,
+            2,
+            Some(DeepCaptureBufferKind::Quads),
+            None,
+        );
+        recorder.record_draw_call(
+            DrawCallKind::MonoSprites,
+            "mono_sprites",
+            "main",
+            0..4,
+            10..15,
+            4,
+            Some(DeepCaptureBufferKind::MonoSprites),
+            Some(42),
+        );
+        // A second `Quads` call: exercises that `touched_buffers` dedups
+        // rather than recording `DeepCaptureBufferKind::Quads` twice.
+        recorder.record_draw_call(
+            DrawCallKind::Quads,
+            "quads",
+            "main_resumed",
+            0..4,
+            15..20,
+            2,
+            Some(DeepCaptureBufferKind::Quads),
+            None,
+        );
+
+        assert_eq!(recorder.draw_calls.len(), 3, "all three draw calls should be recorded");
+        assert_eq!(
+            recorder.draw_calls.iter().map(|call| call.sequence).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "sequence should be 0-based submission order"
+        );
+        assert_eq!(recorder.draw_calls[0].kind, DrawCallKind::Quads);
+        assert_eq!(recorder.draw_calls[0].pipeline_label, "quads");
+        assert_eq!(recorder.draw_calls[0].pass_label, "main");
+        assert_eq!(recorder.draw_calls[0].vertex_range, (0, 4));
+        assert_eq!(recorder.draw_calls[0].instance_range, (0, 10));
+        assert_eq!(recorder.draw_calls[0].bind_group_count, 2);
+        assert_eq!(recorder.draw_calls[0].buffer_kind, Some(DeepCaptureBufferKind::Quads));
+        assert_eq!(recorder.draw_calls[0].atlas_texture_id, None);
+
+        assert_eq!(recorder.draw_calls[1].kind, DrawCallKind::MonoSprites);
+        assert_eq!(recorder.draw_calls[1].atlas_texture_id, Some(42));
+
+        assert_eq!(
+            recorder.draw_calls[2].pass_label, "main_resumed",
+            "the third call's pass_label should reflect the pass at the time it was recorded, \
+             independent of the first call's"
+        );
+
+        assert_eq!(
+            recorder.touched_buffers,
+            vec![DeepCaptureBufferKind::Quads, DeepCaptureBufferKind::MonoSprites],
+            "Quads should appear once despite being touched by two draw calls, in first-seen order"
+        );
+    }
+
+    #[test]
+    fn record_draw_call_with_no_buffer_kind_does_not_touch_anything() {
+        let mut recorder = DeepCaptureRecorder::new();
+        recorder.record_draw_call(DrawCallKind::Surfaces, "surfaces", "main", 0..4, 0..1, 2, None, None);
+        assert_eq!(recorder.draw_calls.len(), 1);
+        assert!(
+            recorder.touched_buffers.is_empty(),
+            "Surfaces draws a per-call uniform buffer, not a fixed WgpuContext buffer"
+        );
+    }
+
+    /// Creates a headless (surface-less) `wgpu::Device`/`Queue` for testing
+    /// buffer readback, the same way `WgpuContext::new` does minus the
+    /// window-bound `Surface` (which needs a real window handle this test
+    /// doesn't have). Returns `None` rather than panicking when no adapter is
+    /// available -- this repo has no headless-GPU CI fixture (see
+    /// `render_context.rs`'s test module doc comment for the same caveat on
+    /// phase 3's buffer/texture-size accessors), so a sandbox/CI environment
+    /// with no GPU or software rasterizer skips the readback assertions below
+    /// instead of failing the whole suite.
+    fn create_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            flags: wgpu::InstanceFlags::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            display: None,
+        });
+        // Mirrors `WgpuContext::new`'s `enumerate_adapters` + pick-first
+        // approach (`render_context.rs`) rather than `request_adapter`, for
+        // the same reason: no `compatible_surface` is available here (there
+        // is no window), and this crate's established pattern already covers
+        // that case.
+        let adapter = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()))
+            .into_iter()
+            .next()?;
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
+    }
+
+    /// End-to-end readback test: records a command stream referencing a
+    /// single fake "quads" buffer, runs it through `finish` (stages + copies)
+    /// and `begin_readback`/`poll` (maps + harvests), and asserts the
+    /// harvested `DeepCapture`'s buffer contents match what was written --
+    /// the concrete "resource contents at time of use" claim from the issue,
+    /// covering the fixed-buffer slice of it this phase implements.
+    #[test]
+    fn finish_and_poll_read_back_real_buffer_contents() {
+        let Some((device, queue)) = create_headless_device() else {
+            eprintln!(
+                "skipping finish_and_poll_read_back_real_buffer_contents: no wgpu adapter available in this environment"
+            );
+            return;
+        };
+
+        let source_bytes: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let source_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("test_quads_buffer"),
+            size: source_bytes.len() as u64,
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&source_buffer, 0, &source_bytes);
+
+        let mut recorder = DeepCaptureRecorder::new();
+        recorder.record_draw_call(
+            DrawCallKind::Quads,
+            "quads",
+            "main",
+            0..4,
+            0..1,
+            2,
+            Some(DeepCaptureBufferKind::Quads),
+            None,
+        );
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let mut pending = recorder.finish(&device, &mut encoder, &[(DeepCaptureBufferKind::Quads, &source_buffer)]);
+        queue.submit(Some(encoder.finish()));
+        pending.begin_readback();
+
+        let capture = loop {
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            if let Some(capture) = pending.poll(&device) {
+                break capture;
+            }
+        };
+
+        assert_eq!(capture.draw_calls.len(), 1);
+        assert!(capture.resources_finalized, "the one touched buffer's readback should have succeeded");
+        let contents = capture
+            .buffer_contents(DeepCaptureBufferKind::Quads)
+            .expect("Quads buffer should have been read back");
+        assert_eq!(
+            contents.bytes, source_bytes,
+            "readback bytes should match exactly what was written to the source buffer"
+        );
     }
 }
