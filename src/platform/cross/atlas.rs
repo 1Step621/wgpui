@@ -41,6 +41,25 @@ impl WgpuAtlas {
             raw_view: texture.raw_view.clone(),
         }
     }
+
+    /// Sum of every live atlas texture's backing memory, monochrome and
+    /// polychrome combined (Phase 3 of the profiling epic, issue #59).
+    #[cfg(feature = "flamegraph")]
+    pub(crate) fn memory_usage(&self) -> u64 {
+        let state = self.0.lock();
+        atlas_texture_list_memory_usage(&state.storage.monochrome_textures)
+            + atlas_texture_list_memory_usage(&state.storage.polychrome_textures)
+    }
+}
+
+#[cfg(feature = "flamegraph")]
+fn atlas_texture_list_memory_usage(textures: &AtlasTextureList<WgpuAtlasTexture>) -> u64 {
+    textures
+        .textures
+        .iter()
+        .flatten()
+        .map(|texture| super::render_context::texture_memory_bytes(&texture.raw))
+        .sum()
 }
 
 impl PlatformAtlas for WgpuAtlas {

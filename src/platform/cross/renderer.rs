@@ -3001,6 +3001,33 @@ impl WgpuRenderer {
             height: DevicePixels(self.surface_configuration.height as i32),
         }
     }
+
+    /// On-demand GPU memory snapshot for this renderer (Phase 3 of the
+    /// profiling epic, issue #59): mostly summing sizes that already exist
+    /// on already-owned wgpu resources, no new tracking required.
+    #[cfg(feature = "flamegraph")]
+    pub(crate) fn gpu_memory_snapshot(&self) -> crate::GpuMemorySnapshot {
+        crate::GpuMemorySnapshot {
+            fixed_buffer_bytes: self.context.fixed_buffer_memory_usage(),
+            atlas_bytes: self.atlas.memory_usage(),
+            surface_registry_bytes: self.context.surface_registry.memory_usage(),
+            swapchain_bytes: self.swapchain_memory_usage(),
+        }
+    }
+
+    /// Best-effort swapchain memory estimate from `surface_configuration`'s
+    /// dimensions/format. wgpu doesn't expose the presentation engine's
+    /// actual backing image count, so `desired_maximum_frame_latency` (the
+    /// one buffering-depth signal WGPUI itself configures) stands in for it.
+    #[cfg(feature = "flamegraph")]
+    fn swapchain_memory_usage(&self) -> u64 {
+        let bytes_per_texel = super::render_context::texel_size(self.surface_configuration.format);
+        let image_count = self.surface_configuration.desired_maximum_frame_latency.max(1) as u64;
+        (self.surface_configuration.width as u64)
+            * (self.surface_configuration.height as u64)
+            * bytes_per_texel
+            * image_count
+    }
 }
 
 impl Drop for WgpuRenderer {

@@ -1677,6 +1677,31 @@ impl Window {
         &self.text_system
     }
 
+    /// On-demand snapshot of memory held by WGPUI's own CPU-side subsystems
+    /// for this window (Phase 3 of the profiling epic, issue #59): the
+    /// per-frame element arena, this window's text caches, the built-in
+    /// image cache, and the flamegraph capture engine's own footprint. Cheap
+    /// -- a summation over already-allocated caches, not a fresh allocation
+    /// pass -- but not tracked per-frame like spans/counters, so call it as
+    /// needed rather than every frame.
+    #[cfg(feature = "flamegraph")]
+    pub fn memory_snapshot(&self, cx: &App) -> crate::MemorySnapshot {
+        crate::MemorySnapshot {
+            element_arena_bytes: cx.element_arena_capacity_bytes(),
+            text_system: self.text_system.memory_snapshot(),
+            image_cache_bytes: crate::elements::total_retained_image_cache_memory_usage(cx),
+            capture_engine_bytes: crate::capture_engine_memory_usage(),
+        }
+    }
+
+    /// On-demand GPU memory snapshot for this window's renderer (Phase 3 of
+    /// the profiling epic, issue #59). `None` on platforms/backends that
+    /// don't use the WGPU renderer, or before the renderer has been created.
+    #[cfg(feature = "flamegraph")]
+    pub fn gpu_memory_snapshot(&self) -> Option<crate::GpuMemorySnapshot> {
+        self.platform_window.gpu_memory_snapshot()
+    }
+
     /// The current text style. Which is composed of all the style refinements provided to `with_text_style`.
     pub fn text_style(&self) -> TextStyle {
         let mut style = TextStyle::default();

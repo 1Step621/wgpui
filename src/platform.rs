@@ -448,6 +448,15 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         None
     }
 
+    /// Current GPU memory footprint of this window's renderer (Phase 3 of the
+    /// profiling epic, issue #59). Default `None` for platforms/backends that
+    /// don't use the WGPU renderer, matching `create_wgpu_surface`'s
+    /// convention; `CrossWindow` overrides this once its renderer exists.
+    #[cfg(feature = "flamegraph")]
+    fn gpu_memory_snapshot(&self) -> Option<crate::GpuMemorySnapshot> {
+        None
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn as_test(&mut self) -> Option<&mut TestWindow> {
         None
@@ -504,6 +513,16 @@ pub(crate) trait PlatformTextSystem: Send + Sync {
         raster_bounds: Bounds<DevicePixels>,
     ) -> Result<(Size<DevicePixels>, Vec<u8>)>;
     fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout;
+
+    /// Bytes held by this text system's own rasterized-glyph cache, for
+    /// `MemorySnapshot`'s `text_system.glyph_cache_bytes` field (Phase 3 of
+    /// the profiling epic, issue #59). Default `0` for implementations that
+    /// don't maintain their own glyph cache; `CosmicTextSystem` overrides
+    /// this to report `SwashCache`'s size.
+    #[cfg(feature = "flamegraph")]
+    fn glyph_cache_memory_usage(&self) -> u64 {
+        0
+    }
 }
 
 pub(crate) struct NoopTextSystem;

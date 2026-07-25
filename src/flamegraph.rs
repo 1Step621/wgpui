@@ -371,6 +371,18 @@ impl Capture {
         self.frames.len()
     }
 
+    /// Approximate heap bytes retained by this stopped capture's own frames
+    /// (Phase 3 of the profiling epic, issue #59): the CPU/GPU span vectors
+    /// held inside every [`FrameCapture`] in `self.frames`, plus a
+    /// per-`FrameCapture` fixed-field allowance. A profiler that doesn't
+    /// account for its own footprint is misleading, so this is meant to sit
+    /// alongside [`MemorySnapshot::capture_engine_bytes`] (which reports the
+    /// *live*, still-recording engine's footprint) as the equivalent number
+    /// for a trace that has already been stopped and handed to the caller.
+    pub fn retained_trace_bytes(&self) -> u64 {
+        self.frames.iter().map(frame_capture_memory_usage).sum()
+    }
+
     /// Aggregate mean/max statistics over the frames currently held in this
     /// capture's ring buffer (see [`CounterSummary`]'s doc comment). This is
     /// the Phase 2 (issue #58) replacement for the reverted `render_stats`
@@ -1335,6 +1347,161 @@ impl std::fmt::Display for CounterSummary {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 3: on-demand memory snapshots (issue #59).
+//
+// Unlike the spans/counters above, memory sizes are not tracked continuously
+// per-frame -- they're cheap to recompute from the subsystems that already
+// own the data (a wgpu buffer already knows its own `size()`, an `Arena`
+// already knows its own `capacity()`), so there's nothing to accumulate.
+// `MemorySnapshot`/`GpuMemorySnapshot` are plain data, computed and returned
+// fresh on every call.
+//
+// #59 suggested exposing this as `Capture::memory_snapshot()`. That doesn't
+// fit the real merged shape: a stopped `Capture` (this module's only
+// `Capture` type so far, see its doc comment) has no reference back to the
+// live `App`/`Window`/`WgpuRenderer` state the CPU/GPU subsystems actually
+// live in -- `element_arena` is on `App`, the glyph cache is on the
+// process-wide `TextSystem`, the shaped-line cache and GPU renderer are
+// per-`Window`. Forcing the query through `Capture` would mean threading all
+// of that state into a type whose only job today is holding already-finished
+// frames. Instead, each snapshot is computed where its data actually lives:
+// `Window::memory_snapshot` (CPU) and `Window::gpu_memory_snapshot` (GPU),
+// both `#[cfg(feature = "flamegraph")]`-gated same as everything else here.
+// This mirrors, rather than fights, the same lesson phase 1/2 already
+// learned about call sites with no natural path to a specific type --
+// `current_gpu_correlation_frame_index` and the `FRAME_COUNTERS`
+// thread-local accumulator both exist because the natural owner of the data
+// (a `GpuQueryManager` generation, a draw-call counter) isn't the same place
+// that has a handle to the `Capture`/`FrameCapture` it needs to reach.
+// `MemorySnapshot`/`GpuMemorySnapshot` face the mirror-image version of that
+// problem -- the natural owner of a `Capture` doesn't have a handle to the
+// subsystems -- so they get the mirror-image fix: compute at the source
+// instead of routing through `Capture`.
+
+/// On-demand snapshot of memory held by WGPUI's own CPU-side subsystems for
+/// one `Window` (Phase 3 of the profiling epic, issue #59). This is
+/// explicitly not a general-purpose heap profiler -- it reports sizes of
+/// known allocating subsystems (element arena, text caches, image cache, and
+/// the flamegraph engine's own buffers) rather than intercepting every
+/// allocation. See [`Window::memory_snapshot`](crate::Window::memory_snapshot).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct MemorySnapshot {
+    /// Reserved capacity of the per-frame element arena (`Window::draw`'s
+    /// `ElementArenaScope`). See `App::element_arena_capacity_bytes`.
+    pub element_arena_bytes: u64,
+    /// Text system cache sizes. See [`TextSystemMemory`].
+    pub text_system: TextSystemMemory,
+    /// Sum of every registered `RetainAllImageCache`'s currently-loaded image
+    /// bytes. Custom `ImageCache` implementations are not registered and are
+    /// therefore invisible here -- this profiler only has visibility into
+    /// WGPUI's own built-in cache, not arbitrary embedder-provided ones.
+    pub image_cache_bytes: u64,
+    /// The flamegraph capture engine's own live footprint: per-thread
+    /// completed-span ring buffers, plus (if a capture is currently running)
+    /// the frames and pending background spans it's holding. Zero until the
+    /// first span is ever recorded on any thread, consistent with this
+    /// module's zero-overhead-when-idle rule. See
+    /// `capture_engine_memory_usage`.
+    pub capture_engine_bytes: u64,
+}
+
+impl MemorySnapshot {
+    /// Sum of every field above: one headline "how much is WGPUI holding
+    /// onto for this window" number.
+    pub fn total_bytes(&self) -> u64 {
+        self.element_arena_bytes
+            + self.text_system.total_bytes()
+            + self.image_cache_bytes
+            + self.capture_engine_bytes
+    }
+}
+
+/// Text system cache sizes, part of [`MemorySnapshot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TextSystemMemory {
+    /// The rasterized-glyph bitmap cache (cosmic-text's `SwashCache`),
+    /// shared by every window in the `App` (one `PlatformTextSystem` per
+    /// `App`).
+    pub glyph_cache_bytes: u64,
+    /// This window's shaped-line layout cache (`LineLayoutCache`), covering
+    /// both the current and the previous frame's retained entries -- the
+    /// cache deliberately keeps one frame of history so lines that didn't
+    /// change survive a redraw without being re-shaped.
+    pub shaped_line_cache_bytes: u64,
+}
+
+impl TextSystemMemory {
+    /// Sum of both fields above.
+    pub fn total_bytes(&self) -> u64 {
+        self.glyph_cache_bytes + self.shaped_line_cache_bytes
+    }
+}
+
+/// On-demand snapshot of GPU memory held by one window's renderer (Phase 3 of
+/// the profiling epic, issue #59). Mostly summing sizes that already exist on
+/// wgpu resources (`wgpu::Buffer::size`, texture dimensions) rather than any
+/// new tracking. See
+/// [`Window::gpu_memory_snapshot`](crate::Window::gpu_memory_snapshot).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct GpuMemorySnapshot {
+    /// Fixed-size buffers in `render_context.rs` (quads/shadows/sprites/
+    /// paths/underlines/backdrop_filters/globals/color_adjustments), summed
+    /// from each buffer's own `wgpu::Buffer::size()`.
+    pub fixed_buffer_bytes: u64,
+    /// Atlas texture memory (`atlas.rs`), monochrome and polychrome
+    /// textures combined.
+    pub atlas_bytes: u64,
+    /// `SurfaceRegistry`'s triple-buffered offscreen textures, across every
+    /// registered surface.
+    pub surface_registry_bytes: u64,
+    /// The swapchain's own backing textures, computed from
+    /// `surface_configuration`'s dimensions/format -- wgpu doesn't expose
+    /// the presentation engine's actual image count, so this uses
+    /// `desired_maximum_frame_latency` as a best-effort estimate of how many
+    /// images it's holding.
+    pub swapchain_bytes: u64,
+}
+
+impl GpuMemorySnapshot {
+    /// Sum of every field above.
+    pub fn total_bytes(&self) -> u64 {
+        self.fixed_buffer_bytes + self.atlas_bytes + self.surface_registry_bytes + self.swapchain_bytes
+    }
+}
+
+/// The flamegraph capture engine's own live CPU memory footprint: every
+/// thread's completed-span ring buffer capacity (`THREAD_SPAN_BUDGET_BYTES`
+/// each, for every thread that has ever recorded a span), plus -- if a
+/// capture is currently running -- the frames its ring buffer is holding and
+/// any background spans awaiting the next frame close. Cheap: no allocation,
+/// just reading `Vec`/`VecDeque` lengths already held behind locks this
+/// module takes elsewhere. Used by [`MemorySnapshot::capture_engine_bytes`].
+pub(crate) fn capture_engine_memory_usage() -> u64 {
+    let thread_recorder_bytes =
+        (GLOBAL_THREAD_RECORDERS.lock().len() as u64) * (THREAD_SPAN_BUDGET_BYTES as u64);
+
+    let active_capture_bytes = ACTIVE_CAPTURE.lock().as_ref().map_or(0, |state| {
+        let pending_bytes = (state.pending_background_spans.lock().len() as u64)
+            * (core::mem::size_of::<CpuSpan>() as u64);
+        let frames_bytes: u64 = state.finished_frames.lock().iter().map(frame_capture_memory_usage).sum();
+        pending_bytes + frames_bytes
+    });
+
+    thread_recorder_bytes + active_capture_bytes
+}
+
+/// Approximate heap bytes held by one [`FrameCapture`]'s span vectors, plus a
+/// per-frame fixed-field allowance. Shared by `capture_engine_memory_usage`
+/// (a still-running capture's currently-buffered frames) and
+/// `Capture::retained_trace_bytes` (a stopped capture's frames).
+fn frame_capture_memory_usage(frame: &FrameCapture) -> u64 {
+    let cpu_span_bytes = ((frame.cpu_spans.len() + frame.background_spans.len()) as u64)
+        * (core::mem::size_of::<CpuSpan>() as u64);
+    let gpu_span_bytes = (frame.gpu_spans.len() as u64) * (core::mem::size_of::<GpuSpan>() as u64);
+    core::mem::size_of::<FrameCapture>() as u64 + cpu_span_bytes + gpu_span_bytes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1617,5 +1784,93 @@ mod tests {
         assert_eq!(frames.len(), 3);
         let expected: Vec<DecodedFrameCapture> = capture.frames().map(decode_frame).collect();
         assert_eq!(frames, expected);
+
+        // Phase 3 (issue #59): the capture engine's own footprint should be
+        // visible while a capture is running -- three finished frames, each
+        // with the "Window::draw"/"Window::draw_roots" CPU spans recorded
+        // above, are still held by `ACTIVE_CAPTURE` at this point (the
+        // capture hasn't been stopped yet). `capture_engine_memory_usage` is
+        // recomputed from scratch on every call rather than tracked
+        // continuously, so it's safe to call here mid-capture and again
+        // after `stop()` below.
+        assert!(
+            capture_engine_memory_usage() > 0,
+            "engine footprint should be nonzero with frames still buffered and a thread-local span recorder live"
+        );
+
+        // The capture's own retained bytes should equal the sum of each
+        // buffered frame's span vectors (each of the 3 frames here has 2 CPU
+        // spans -- "Window::draw" and "Window::draw_roots" -- and no
+        // background/GPU spans), computed independently of
+        // `frame_capture_memory_usage` to actually exercise the formula
+        // rather than just calling it a second time.
+        let expected_retained_bytes: u64 = capture
+            .frames()
+            .map(|frame| {
+                core::mem::size_of::<FrameCapture>() as u64
+                    + ((frame.cpu_spans.len() + frame.background_spans.len()) as u64)
+                        * (core::mem::size_of::<CpuSpan>() as u64)
+                    + (frame.gpu_spans.len() as u64) * (core::mem::size_of::<GpuSpan>() as u64)
+            })
+            .sum();
+        assert_eq!(capture.retained_trace_bytes(), expected_retained_bytes);
+        assert!(capture.retained_trace_bytes() > 0);
+
+        // A freshly stopped, empty capture should report zero retained
+        // bytes -- there's nothing buffered to hold onto. Sequential with
+        // (not concurrent with) the capture above: only one flamegraph
+        // capture session may be active process-wide, so this test is the
+        // sole owner of that global state for its whole duration rather than
+        // splitting into a second `#[test]` that could race with this one
+        // under the default parallel test runner.
+        let empty_handle = start_capture(CaptureOptions {
+            max_frames: 8,
+            capture_gpu: false,
+        })
+        .expect("the capture above was already stopped, so starting a new one here should succeed");
+        let empty_capture = empty_handle.stop();
+        assert_eq!(empty_capture.frame_count(), 0);
+        assert_eq!(empty_capture.retained_trace_bytes(), 0);
+
+        // Now that every capture from this test is stopped, `ACTIVE_CAPTURE`
+        // is empty, so the engine's live footprint should be nothing but
+        // this thread's own completed-span recorder -- still allocated,
+        // since a thread keeps its ring buffer for its whole lifetime once
+        // first used, which is exactly why this is cheap and safe to call
+        // with no capture running at all.
+        let recorder_count = GLOBAL_THREAD_RECORDERS.lock().len() as u64;
+        assert_eq!(
+            capture_engine_memory_usage(),
+            recorder_count * (THREAD_SPAN_BUDGET_BYTES as u64)
+        );
+    }
+
+    #[test]
+    fn memory_snapshot_total_bytes_sums_every_field() {
+        let snapshot = MemorySnapshot {
+            element_arena_bytes: 1_048_576,
+            text_system: TextSystemMemory {
+                glyph_cache_bytes: 2048,
+                shaped_line_cache_bytes: 4096,
+            },
+            image_cache_bytes: 8192,
+            capture_engine_bytes: 16384,
+        };
+        assert_eq!(snapshot.text_system.total_bytes(), 2048 + 4096);
+        assert_eq!(snapshot.total_bytes(), 1_048_576 + 2048 + 4096 + 8192 + 16384);
+    }
+
+    #[test]
+    fn gpu_memory_snapshot_total_bytes_sums_every_field() {
+        let snapshot = GpuMemorySnapshot {
+            fixed_buffer_bytes: 64 * 1024 * 1024,
+            atlas_bytes: 4 * 1024 * 1024,
+            surface_registry_bytes: 12 * 1024 * 1024,
+            swapchain_bytes: 3 * 1920 * 1080 * 4,
+        };
+        assert_eq!(
+            snapshot.total_bytes(),
+            64 * 1024 * 1024 + 4 * 1024 * 1024 + 12 * 1024 * 1024 + 3 * 1920 * 1080 * 4
+        );
     }
 }

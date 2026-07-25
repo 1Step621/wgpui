@@ -182,6 +182,28 @@ impl PlatformTextSystem for CosmicTextSystem {
     fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
         self.0.write().layout_line(text, font_size, runs)
     }
+
+    // Phase 3 of the profiling epic (issue #59): report the size of
+    // cosmic-text's rasterized-glyph bitmap cache (`SwashCache::image_cache`,
+    // a public field on the upstream type). Only the raster bitmap cache is
+    // counted, not `SwashCache::outline_command_cache` (vector outline
+    // commands used for the outline glyph path) -- the bitmap cache is the
+    // one that actually scales with glyph count/size and dominates this
+    // subsystem's footprint.
+    #[cfg(feature = "flamegraph")]
+    fn glyph_cache_memory_usage(&self) -> u64 {
+        let state = self.0.read();
+        state
+            .swash_cache
+            .image_cache
+            .values()
+            .map(|entry| {
+                let key_bytes = core::mem::size_of::<CacheKey>() as u64;
+                let image_bytes = entry.as_ref().map_or(0, |image| image.data.len() as u64);
+                key_bytes + image_bytes
+            })
+            .sum()
+    }
 }
 
 impl CosmicTextSystemState {
