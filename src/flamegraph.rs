@@ -17,22 +17,28 @@ use std::{
     io::Write,
     sync::{
         Arc, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     thread::ThreadId,
     time::{Instant, SystemTime},
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
-// The data model below derives `Serialize` only, not `Deserialize`. Several
-// fields hold `&'static str` (`SpanName::Static`, `ElementAttribution`'s
-// fields), and a genuinely `'static`-bound `Deserialize` impl can't be derived
-// for those without leaking memory. `export_trace` is a write-only format this
-// round (see module docs); the inline round-trip test in `tests` below
-// decodes into separate owned mirror types instead of these live-process
-// types, which is also what a future out-of-process viewer would do.
+// The data model below derives `Serialize` only, not `Deserialize`, for most
+// types. Several fields hold `&'static str` (`SpanName::Static`,
+// `ElementAttribution`'s fields), and a genuinely `'static`-bound
+// `Deserialize` impl can't be derived for those without leaking memory.
+// `export_trace` is a write-only format this round (see module docs); the
+// inline round-trip test in `tests` below decodes into separate owned mirror
+// types instead of these live-process types, which is also what a future
+// out-of-process viewer would do.
+//
+// The Phase 2 counter types below (`FrameCounters` and everything it's built
+// from) are plain numeric data with no `&'static str` fields, so they derive
+// `Deserialize` directly and are reused as-is by the round-trip test instead
+// of needing their own mirror types.
 
 /// Coarse-grained category for a [`CpuSpan`] or [`GpuSpan`], used by a future
 /// viewer to color/group spans without needing to parse span names.
@@ -195,6 +201,134 @@ pub struct FrameCapture {
     pub frame_start_ns: u64,
     /// Frame end, in nanoseconds relative to the capture's anchor.
     pub frame_end_ns: u64,
+    /// Aggregate "how much work" counters for this frame (Phase 2, issue
+    /// #58), gathered alongside the timing spans above. See
+    /// [`FrameCounters`].
+    pub counters: FrameCounters,
+}
+
+/// Number of `RenderPass::draw` calls and total primitive count issued for
+/// one [`PrimitiveBatch`](crate::platform::cross::renderer) kind during a
+/// frame. "Primitives" means instance count for quads/shadows/sprites/
+/// underlines/backdrop_filters/surfaces, and path count for paths (matching
+/// how each kind is submitted in `WgpuRenderer::draw`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PassCounter {
+    /// Number of `RenderPass::draw` calls issued for this primitive kind.
+    pub draw_calls: u32,
+    /// Total primitive count submitted across those draw calls.
+    pub primitives: u32,
+}
+
+impl PassCounter {
+    fn record(&mut self, primitives: u32) {
+        self.draw_calls = self.draw_calls.saturating_add(1);
+        self.primitives = self.primitives.saturating_add(primitives);
+    }
+}
+
+/// Per-frame draw-call/primitive tallies, one [`PassCounter`] per
+/// `PrimitiveBatch` kind. Tallied directly in `WgpuRenderer::draw`'s
+/// `PrimitiveBatch` match arms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct DrawCallCounters {
+    /// `PrimitiveBatch::Quads`.
+    pub quads: PassCounter,
+    /// `PrimitiveBatch::Shadows`.
+    pub shadows: PassCounter,
+    /// `PrimitiveBatch::MonochromeSprites`.
+    pub mono_sprites: PassCounter,
+    /// `PrimitiveBatch::PolychromeSprites`.
+    pub poly_sprites: PassCounter,
+    /// `PrimitiveBatch::Paths`.
+    pub paths: PassCounter,
+    /// `PrimitiveBatch::Underlines`.
+    pub underlines: PassCounter,
+    /// `PrimitiveBatch::BackdropFilters`.
+    pub backdrop_filters: PassCounter,
+    /// `PrimitiveBatch::Surfaces`.
+    pub surfaces: PassCounter,
+}
+
+impl DrawCallCounters {
+    fn get_mut(&mut self, kind: DrawCallKind) -> &mut PassCounter {
+        match kind {
+            DrawCallKind::Quads => &mut self.quads,
+            DrawCallKind::Shadows => &mut self.shadows,
+            DrawCallKind::MonoSprites => &mut self.mono_sprites,
+            DrawCallKind::PolySprites => &mut self.poly_sprites,
+            DrawCallKind::Paths => &mut self.paths,
+            DrawCallKind::Underlines => &mut self.underlines,
+            DrawCallKind::BackdropFilters => &mut self.backdrop_filters,
+            DrawCallKind::Surfaces => &mut self.surfaces,
+        }
+    }
+}
+
+/// Which `PrimitiveBatch` kind a [`record_draw_call`] call is tallying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DrawCallKind {
+    Quads,
+    Shadows,
+    MonoSprites,
+    PolySprites,
+    Paths,
+    Underlines,
+    BackdropFilters,
+    Surfaces,
+}
+
+/// Per-frame atlas tile allocator activity, tallied in `WgpuAtlas`
+/// (`src/platform/cross/atlas.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AtlasCounters {
+    /// New tiles allocated (a `get_or_insert_with` cache miss that produced a
+    /// tile).
+    pub tiles_allocated: u32,
+    /// Tiles removed from the atlas (`PlatformAtlas::remove`).
+    pub tiles_evicted: u32,
+    /// `get_or_insert_with` calls that found an existing tile.
+    pub cache_hits: u32,
+    /// `get_or_insert_with` calls that did not find an existing tile (whether
+    /// or not building the replacement actually produced a tile).
+    pub cache_misses: u32,
+}
+
+/// Per-frame input/notification activity, tallied in `Window::dispatch_event`
+/// and `App::notify`/`WindowInvalidator::invalidate_view`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct EventCounters {
+    /// `Window::dispatch_event` calls (mouse/keyboard/etc. input).
+    pub input_events_dispatched: u32,
+    /// `AppContext::notify`/`Context::notify` calls.
+    pub notify_calls: u32,
+    /// Entities marked dirty via `WindowInvalidator::invalidate_view`.
+    pub entities_invalidated: u32,
+}
+
+/// Aggregate "how much work" counters for one frame (Phase 2 of the
+/// profiling epic, issue #58), the direct successor to the reverted
+/// `render_stats` module's stderr counters — same data, but attached to the
+/// [`FrameCapture`] it describes instead of being dumped to stderr on a
+/// timer, so it can be queried through [`Capture::counter_summary`].
+///
+/// Attribution note: draw-call/atlas/event work is tallied into a
+/// thread-local accumulator (see `FRAME_COUNTERS` below) that is drained into
+/// whichever `FrameCapture` closes next, mirroring the single-foreground-
+/// thread assumption `CaptureState::last_opened_frame_index` already
+/// documents. `EventCounters` in particular can include work that happened
+/// between the previous frame's close and this frame's open (e.g. input
+/// dispatched while idle, or entities invalidated by a background task
+/// completion) — that is intentional: it is exactly the work that
+/// contributed to this frame being drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct FrameCounters {
+    /// Per-`PrimitiveBatch`-kind draw-call/primitive tallies.
+    pub draw_calls: DrawCallCounters,
+    /// Atlas tile allocator activity.
+    pub atlas: AtlasCounters,
+    /// Input/notification activity.
+    pub events: EventCounters,
 }
 
 /// A stopped capture session: a ring-buffered (by frame count) sequence of
@@ -211,6 +345,19 @@ pub struct Capture {
     // `Capture` view onto a still-running session.
     #[allow(dead_code)]
     enabled: AtomicBool,
+    /// Total `Window::on_request_frame` invocations across the whole session
+    /// that took the full compositor draw path (`Window::draw` +
+    /// `Window::present`). Session-wide rather than ring-buffer-windowed,
+    /// unlike everything in `counter_summary`'s per-frame aggregates: a
+    /// fast-path present (`Window::present_framebuffer_only`) never opens a
+    /// `FrameCapture` at all (there is no compositor work to attribute spans
+    /// or counters to), so this ratio can't be recovered from the ring
+    /// buffer after the fact the way the other stats can. See
+    /// `record_frame_pacing`.
+    pub full_draw_frame_count: u64,
+    /// Total `Window::on_request_frame` invocations across the whole session
+    /// that took the fast, no-compositor present-only path.
+    pub fast_path_frame_count: u64,
 }
 
 impl Capture {
@@ -222,6 +369,92 @@ impl Capture {
     /// Number of frames currently held.
     pub fn frame_count(&self) -> usize {
         self.frames.len()
+    }
+
+    /// Aggregate mean/max statistics over the frames currently held in this
+    /// capture's ring buffer (see [`CounterSummary`]'s doc comment). This is
+    /// the Phase 2 (issue #58) replacement for the reverted `render_stats`
+    /// module's periodic stderr dump — a queryable API instead of a timer.
+    pub fn counter_summary(&self) -> CounterSummary {
+        let frame_count = self.frames.len();
+
+        let (mean_frame_duration_ms, max_frame_duration_ms, fps) = if frame_count == 0 {
+            (0.0, 0.0, 0.0)
+        } else {
+            let mut total_duration_ns: u128 = 0;
+            let mut max_duration_ns: u64 = 0;
+            for frame in &self.frames {
+                let duration_ns = frame.frame_end_ns.saturating_sub(frame.frame_start_ns);
+                total_duration_ns += duration_ns as u128;
+                max_duration_ns = max_duration_ns.max(duration_ns);
+            }
+            let mean_ms = (total_duration_ns as f64 / frame_count as f64) / 1.0e6;
+            let max_ms = max_duration_ns as f64 / 1.0e6;
+
+            let fps = if let (Some(first), Some(last)) = (self.frames.front(), self.frames.back())
+                && frame_count >= 2
+            {
+                let span_ns = last.frame_end_ns.saturating_sub(first.frame_start_ns);
+                if span_ns > 0 {
+                    ((frame_count - 1) as f64) / (span_ns as f64 / 1.0e9)
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+
+            (mean_ms, max_ms, fps)
+        };
+
+        let draw_calls = DrawCallSummary {
+            quads: pass_counter_summary(&self.frames, |counters| counters.quads),
+            shadows: pass_counter_summary(&self.frames, |counters| counters.shadows),
+            mono_sprites: pass_counter_summary(&self.frames, |counters| counters.mono_sprites),
+            poly_sprites: pass_counter_summary(&self.frames, |counters| counters.poly_sprites),
+            paths: pass_counter_summary(&self.frames, |counters| counters.paths),
+            underlines: pass_counter_summary(&self.frames, |counters| counters.underlines),
+            backdrop_filters: pass_counter_summary(&self.frames, |counters| counters.backdrop_filters),
+            surfaces: pass_counter_summary(&self.frames, |counters| counters.surfaces),
+        };
+
+        let total_hits: u64 = self.frames.iter().map(|frame| frame.counters.atlas.cache_hits as u64).sum();
+        let total_misses: u64 = self.frames.iter().map(|frame| frame.counters.atlas.cache_misses as u64).sum();
+        let cache_hit_rate = if total_hits + total_misses > 0 {
+            total_hits as f64 / (total_hits + total_misses) as f64
+        } else {
+            0.0
+        };
+        let atlas = AtlasSummary {
+            tiles_allocated: mean_max(self.frames.iter().map(|frame| frame.counters.atlas.tiles_allocated)),
+            tiles_evicted: mean_max(self.frames.iter().map(|frame| frame.counters.atlas.tiles_evicted)),
+            cache_hits: mean_max(self.frames.iter().map(|frame| frame.counters.atlas.cache_hits)),
+            cache_misses: mean_max(self.frames.iter().map(|frame| frame.counters.atlas.cache_misses)),
+            cache_hit_rate,
+        };
+
+        let events = EventSummary {
+            input_events_dispatched: mean_max(
+                self.frames.iter().map(|frame| frame.counters.events.input_events_dispatched),
+            ),
+            notify_calls: mean_max(self.frames.iter().map(|frame| frame.counters.events.notify_calls)),
+            entities_invalidated: mean_max(
+                self.frames.iter().map(|frame| frame.counters.events.entities_invalidated),
+            ),
+        };
+
+        CounterSummary {
+            frame_count,
+            fps,
+            mean_frame_duration_ms,
+            max_frame_duration_ms,
+            draw_calls,
+            atlas,
+            events,
+            present_mode: current_present_mode(),
+            full_draw_frame_count: self.full_draw_frame_count,
+            fast_path_frame_count: self.fast_path_frame_count,
+        }
     }
 
     /// Write this capture out in WGPUI's versioned binary trace format:
@@ -333,6 +566,8 @@ impl CaptureHandle {
             frames: self.state.finished_frames.lock().clone(),
             max_frames: self.state.max_frames,
             enabled: AtomicBool::new(false),
+            full_draw_frame_count: self.state.full_draw_frames.load(Ordering::Relaxed),
+            fast_path_frame_count: self.state.fast_path_frames.load(Ordering::Relaxed),
         }
     }
 
@@ -482,6 +717,10 @@ struct CaptureState {
     /// Background-thread spans drained but not yet claimed by a frame window.
     /// Partitioned into a frame's `background_spans` at `close_frame` time.
     pending_background_spans: parking_lot::Mutex<Vec<CpuSpan>>,
+    /// Session-wide (not ring-buffer-windowed) frame-pacing counters. See
+    /// `record_frame_pacing` and `Capture::full_draw_frame_count`.
+    full_draw_frames: AtomicU64,
+    fast_path_frames: AtomicU64,
 }
 
 impl CaptureState {
@@ -495,6 +734,8 @@ impl CaptureState {
             open_frames: parking_lot::Mutex::new(HashMap::new()),
             finished_frames: parking_lot::Mutex::new(VecDeque::new()),
             pending_background_spans: parking_lot::Mutex::new(Vec::new()),
+            full_draw_frames: AtomicU64::new(0),
+            fast_path_frames: AtomicU64::new(0),
         }
     }
 
@@ -543,6 +784,7 @@ impl CaptureState {
             gpu_spans_truncated: false,
             frame_start_ns: open_frame.frame_start_ns,
             frame_end_ns,
+            counters: take_frame_counters(),
         };
 
         let mut finished = self.finished_frames.lock();
@@ -740,6 +982,359 @@ macro_rules! flamegraph_span {
     };
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2: aggregate frame counters (issue #58).
+//
+// Draw-call/atlas/event counts are tallied into a thread-local accumulator
+// rather than threaded through call sites as return values, for the same
+// reason `flamegraph_gpu` correlates GPU spans to a frame index via
+// `current_gpu_correlation_frame_index` instead of a parameter threaded
+// through `PlatformWindow::draw`: the call sites (`WgpuRenderer::draw`'s
+// `PrimitiveBatch` match arms, `WgpuAtlas::get_or_insert_with`,
+// `Window::dispatch_event`, `App::notify`) have no natural way to reach the
+// currently-open `FrameCapture`, and all of them run on GPUI's single
+// foreground thread (AGENTS.md), so a thread-local is sufficient and avoids
+// plumbing a capture handle through every one of them.
+thread_local! {
+    static FRAME_COUNTERS: RefCell<FrameCounters> = RefCell::new(FrameCounters::default());
+}
+
+/// Take and reset the calling thread's accumulated counters. Called once per
+/// `close_frame`, from the same foreground thread that opened the frame.
+fn take_frame_counters() -> FrameCounters {
+    FRAME_COUNTERS.with(|counters| counters.take())
+}
+
+/// Tally one `RenderPass::draw` call for `kind`, contributing `primitives`
+/// primitives. Called unconditionally from `WgpuRenderer::draw`'s
+/// `PrimitiveBatch` match arms (behind `#[cfg(feature = "flamegraph")]` at
+/// the call site, since this function only exists in this module); a single
+/// `Ordering::Relaxed` atomic load is the entire cost when capture is
+/// disabled.
+pub(crate) fn record_draw_call(kind: DrawCallKind, primitives: u32) {
+    if !capture_enabled() {
+        return;
+    }
+    FRAME_COUNTERS.with(|counters| counters.borrow_mut().draw_calls.get_mut(kind).record(primitives));
+}
+
+/// Tally a new atlas tile allocation (`get_or_insert_with` cache miss that
+/// produced a tile).
+pub(crate) fn record_atlas_tile_allocated() {
+    if !capture_enabled() {
+        return;
+    }
+    FRAME_COUNTERS.with(|counters| counters.borrow_mut().atlas.tiles_allocated += 1);
+}
+
+/// Tally an atlas tile eviction (`PlatformAtlas::remove`).
+pub(crate) fn record_atlas_tile_evicted() {
+    if !capture_enabled() {
+        return;
+    }
+    FRAME_COUNTERS.with(|counters| counters.borrow_mut().atlas.tiles_evicted += 1);
+}
+
+/// Tally an atlas `get_or_insert_with` call that found an existing tile.
+pub(crate) fn record_atlas_cache_hit() {
+    if !capture_enabled() {
+        return;
+    }
+    FRAME_COUNTERS.with(|counters| counters.borrow_mut().atlas.cache_hits += 1);
+}
+
+/// Tally an atlas `get_or_insert_with` call that did not find an existing
+/// tile.
+pub(crate) fn record_atlas_cache_miss() {
+    if !capture_enabled() {
+        return;
+    }
+    FRAME_COUNTERS.with(|counters| counters.borrow_mut().atlas.cache_misses += 1);
+}
+
+/// Tally a `Window::dispatch_event` call.
+pub(crate) fn record_input_event_dispatched() {
+    if !capture_enabled() {
+        return;
+    }
+    FRAME_COUNTERS.with(|counters| counters.borrow_mut().events.input_events_dispatched += 1);
+}
+
+/// Tally an `App::notify` call.
+pub(crate) fn record_notify_call() {
+    if !capture_enabled() {
+        return;
+    }
+    FRAME_COUNTERS.with(|counters| counters.borrow_mut().events.notify_calls += 1);
+}
+
+/// Tally an entity marked dirty via `WindowInvalidator::invalidate_view`.
+pub(crate) fn record_entity_invalidated() {
+    if !capture_enabled() {
+        return;
+    }
+    FRAME_COUNTERS.with(|counters| counters.borrow_mut().events.entities_invalidated += 1);
+}
+
+/// Tally one `Window::on_request_frame` invocation as either a full
+/// compositor draw or a fast, no-compositor present-only frame. Session-wide
+/// (see `Capture::full_draw_frame_count`'s doc comment for why), so this
+/// updates `CaptureState` directly rather than the thread-local per-frame
+/// accumulator.
+pub(crate) fn record_frame_pacing(is_full_draw: bool) {
+    if !capture_enabled() {
+        return;
+    }
+    if let Some(state) = ACTIVE_CAPTURE.lock().as_ref() {
+        let counter = if is_full_draw {
+            &state.full_draw_frames
+        } else {
+            &state.fast_path_frames
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The wgpu surface present mode currently configured for the renderer.
+/// Session-global rather than per-frame: WGPUI only reads
+/// `GPUI_PRESENT_MODE`/`GPUI_DISABLE_VSYNC` once, at surface creation, so it
+/// does not vary frame-to-frame today. See `set_present_mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PresentMode {
+    /// Vsync enabled (`wgpu::PresentMode::Fifo`), the default.
+    #[default]
+    Fifo,
+    /// `wgpu::PresentMode::Mailbox`.
+    Mailbox,
+    /// `wgpu::PresentMode::Immediate` (`GPUI_DISABLE_VSYNC=1`).
+    Immediate,
+    /// Any other `wgpu::PresentMode` (e.g. `FifoRelaxed`), reported as-is
+    /// without needing this module to depend on `wgpu`.
+    Other,
+}
+
+impl std::fmt::Display for PresentMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            PresentMode::Fifo => "fifo",
+            PresentMode::Mailbox => "mailbox",
+            PresentMode::Immediate => "immediate",
+            PresentMode::Other => "other",
+        })
+    }
+}
+
+static CURRENT_PRESENT_MODE: AtomicU8 = AtomicU8::new(0);
+
+/// Record the renderer's current present mode. Called once from
+/// `WgpuRenderer::new`, unconditionally (not gated on `capture_enabled`):
+/// it's a single relaxed atomic store, rare (once per renderer/surface
+/// creation), and needs to be visible to a capture that starts later in the
+/// session.
+pub(crate) fn set_present_mode(mode: PresentMode) {
+    CURRENT_PRESENT_MODE.store(mode as u8, Ordering::Relaxed);
+}
+
+/// The most recently recorded present mode, or [`PresentMode::Fifo`] (wgpu's
+/// own default) if `set_present_mode` has never been called.
+pub fn current_present_mode() -> PresentMode {
+    match CURRENT_PRESENT_MODE.load(Ordering::Relaxed) {
+        1 => PresentMode::Mailbox,
+        2 => PresentMode::Immediate,
+        3 => PresentMode::Other,
+        _ => PresentMode::Fifo,
+    }
+}
+
+/// Mean and max of a `u32` metric over a window of frames.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct MeanMax {
+    /// Arithmetic mean over the window.
+    pub mean: f64,
+    /// Maximum value seen in the window.
+    pub max: u32,
+}
+
+fn mean_max(values: impl Iterator<Item = u32> + Clone) -> MeanMax {
+    let count = values.clone().count();
+    if count == 0 {
+        return MeanMax::default();
+    }
+    let sum: u64 = values.clone().map(u64::from).sum();
+    let max = values.max().unwrap_or(0);
+    MeanMax {
+        mean: sum as f64 / count as f64,
+        max,
+    }
+}
+
+/// Mean/max of a [`PassCounter`]'s two fields over a window of frames.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct PassCounterSummary {
+    /// Mean/max `RenderPass::draw` call count.
+    pub draw_calls: MeanMax,
+    /// Mean/max primitive count.
+    pub primitives: MeanMax,
+}
+
+fn pass_counter_summary(
+    frames: &VecDeque<FrameCapture>,
+    select: impl Fn(&DrawCallCounters) -> PassCounter,
+) -> PassCounterSummary {
+    PassCounterSummary {
+        draw_calls: mean_max(frames.iter().map(|frame| select(&frame.counters.draw_calls).draw_calls)),
+        primitives: mean_max(frames.iter().map(|frame| select(&frame.counters.draw_calls).primitives)),
+    }
+}
+
+/// Mean/max draw-call/primitive counts per `PrimitiveBatch` kind, over a
+/// window of frames.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct DrawCallSummary {
+    /// `PrimitiveBatch::Quads`.
+    pub quads: PassCounterSummary,
+    /// `PrimitiveBatch::Shadows`.
+    pub shadows: PassCounterSummary,
+    /// `PrimitiveBatch::MonochromeSprites`.
+    pub mono_sprites: PassCounterSummary,
+    /// `PrimitiveBatch::PolychromeSprites`.
+    pub poly_sprites: PassCounterSummary,
+    /// `PrimitiveBatch::Paths`.
+    pub paths: PassCounterSummary,
+    /// `PrimitiveBatch::Underlines`.
+    pub underlines: PassCounterSummary,
+    /// `PrimitiveBatch::BackdropFilters`.
+    pub backdrop_filters: PassCounterSummary,
+    /// `PrimitiveBatch::Surfaces`.
+    pub surfaces: PassCounterSummary,
+}
+
+/// Mean/max atlas activity, plus a session-window cache hit rate, over a
+/// window of frames.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct AtlasSummary {
+    /// Mean/max new tile allocations per frame.
+    pub tiles_allocated: MeanMax,
+    /// Mean/max tile evictions per frame.
+    pub tiles_evicted: MeanMax,
+    /// Mean/max atlas cache hits per frame.
+    pub cache_hits: MeanMax,
+    /// Mean/max atlas cache misses per frame.
+    pub cache_misses: MeanMax,
+    /// `sum(cache_hits) / sum(cache_hits + cache_misses)` over the window, or
+    /// `0.0` if there were no lookups at all. Computed from totals rather
+    /// than as a mean of per-frame ratios, since most frames have zero
+    /// lookups and would otherwise dilute the average toward zero.
+    pub cache_hit_rate: f64,
+}
+
+/// Mean/max input/notification activity, over a window of frames.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct EventSummary {
+    /// Mean/max `Window::dispatch_event` calls per frame.
+    pub input_events_dispatched: MeanMax,
+    /// Mean/max `App::notify` calls per frame.
+    pub notify_calls: MeanMax,
+    /// Mean/max entities invalidated per frame.
+    pub entities_invalidated: MeanMax,
+}
+
+/// Aggregated statistics over the frames currently held in a [`Capture`]'s
+/// ring buffer, from [`Capture::counter_summary`]. Replaces what the
+/// reverted `render_stats` module reported via a periodic stderr dump with a
+/// queryable API: a future viewer (phase 7) can read it directly, or an
+/// embedding app can print it itself (see the `Display` impl below) as a
+/// thin convenience wrapper.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct CounterSummary {
+    /// Frames currently held in the ring buffer this summary was computed
+    /// over (i.e. `Capture::frame_count()` at the time of the call).
+    pub frame_count: usize,
+    /// Frames per second, computed from the time span between the first and
+    /// last frame in the window (not from `1.0 / mean_frame_duration_ms`,
+    /// which would ignore idle time between draws).
+    pub fps: f64,
+    /// Mean frame (draw + present) duration in milliseconds, over the window.
+    pub mean_frame_duration_ms: f64,
+    /// Max frame (draw + present) duration in milliseconds, over the window.
+    pub max_frame_duration_ms: f64,
+    /// Per-`PrimitiveBatch`-kind draw-call/primitive statistics.
+    pub draw_calls: DrawCallSummary,
+    /// Atlas tile allocator statistics.
+    pub atlas: AtlasSummary,
+    /// Input/notification statistics.
+    pub events: EventSummary,
+    /// The renderer's current present mode.
+    pub present_mode: PresentMode,
+    /// See `Capture::full_draw_frame_count`'s doc comment: these two are
+    /// session-wide totals, not bounded to the ring-buffer window like
+    /// everything else in this struct.
+    pub full_draw_frame_count: u64,
+    /// See `Capture::fast_path_frame_count`'s doc comment.
+    pub fast_path_frame_count: u64,
+}
+
+impl std::fmt::Display for CounterSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "=== WGPUI frame counters ({} frames, {:.1} fps, present={}) ===",
+            self.frame_count, self.fps, self.present_mode
+        )?;
+        writeln!(
+            f,
+            "frame duration: mean {:.3}ms max {:.3}ms",
+            self.mean_frame_duration_ms, self.max_frame_duration_ms
+        )?;
+        let total_paced = self.full_draw_frame_count + self.fast_path_frame_count;
+        if total_paced > 0 {
+            writeln!(
+                f,
+                "frame pacing: {} full-draw, {} fast-path ({:.1}% full-draw)",
+                self.full_draw_frame_count,
+                self.fast_path_frame_count,
+                100.0 * self.full_draw_frame_count as f64 / total_paced as f64
+            )?;
+        }
+        writeln!(f, "--- draw calls (mean/max primitives, mean/max draw calls) ---")?;
+        for (name, pass) in [
+            ("quads", &self.draw_calls.quads),
+            ("shadows", &self.draw_calls.shadows),
+            ("mono_sprites", &self.draw_calls.mono_sprites),
+            ("poly_sprites", &self.draw_calls.poly_sprites),
+            ("paths", &self.draw_calls.paths),
+            ("underlines", &self.draw_calls.underlines),
+            ("backdrop_filters", &self.draw_calls.backdrop_filters),
+            ("surfaces", &self.draw_calls.surfaces),
+        ] {
+            writeln!(
+                f,
+                "{:<18} primitives {:>8.1}/{:<6} draw calls {:>6.1}/{:<6}",
+                name, pass.primitives.mean, pass.primitives.max, pass.draw_calls.mean, pass.draw_calls.max
+            )?;
+        }
+        writeln!(
+            f,
+            "--- atlas: allocated {:.1}/{} evicted {:.1}/{} hit-rate {:.1}% ---",
+            self.atlas.tiles_allocated.mean,
+            self.atlas.tiles_allocated.max,
+            self.atlas.tiles_evicted.mean,
+            self.atlas.tiles_evicted.max,
+            self.atlas.cache_hit_rate * 100.0
+        )?;
+        writeln!(
+            f,
+            "--- events: input {:.1}/{} notify {:.1}/{} invalidated {:.1}/{} ---",
+            self.events.input_events_dispatched.mean,
+            self.events.input_events_dispatched.max,
+            self.events.notify_calls.mean,
+            self.events.notify_calls.max,
+            self.events.entities_invalidated.mean,
+            self.events.entities_invalidated.max,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -817,6 +1412,10 @@ mod tests {
         gpu_spans_truncated: bool,
         frame_start_ns: u64,
         frame_end_ns: u64,
+        // `FrameCounters` derives `Deserialize` directly (plain numeric
+        // data, no `&'static str` fields), so it's reused as-is here rather
+        // than needing its own decoded mirror type.
+        counters: FrameCounters,
     }
 
     fn read_trace(bytes: &[u8]) -> anyhow::Result<(TraceHeader, Vec<DecodedFrameCapture>)> {
@@ -898,6 +1497,7 @@ mod tests {
             gpu_spans_truncated: frame.gpu_spans_truncated,
             frame_start_ns: frame.frame_start_ns,
             frame_end_ns: frame.frame_end_ns,
+            counters: frame.counters,
         }
     }
 
@@ -909,7 +1509,7 @@ mod tests {
         })
         .expect("no other capture should be active in this test process at this point");
 
-        for _ in 0..3 {
+        for i in 0..3u32 {
             let frame_index = open_frame_cpu_side(1);
             {
                 let _draw = enter_span(SpanName::Static("Window::draw"), SpanCategory::WindowFrame, None);
@@ -918,13 +1518,65 @@ mod tests {
                         enter_span(SpanName::Static("Window::draw_roots"), SpanCategory::WindowFrame, None);
                 }
             }
+
+            // Phase 2 (issue #58): exercise the FrameCounters call sites the
+            // same way the real instrumentation in renderer.rs/atlas.rs/
+            // window.rs/app.rs does, with values that vary per frame so
+            // mean/max in `counter_summary` are distinguishable from a
+            // constant.
+            record_draw_call(DrawCallKind::Quads, 10 + i * 5); // 10, 15, 20
+            record_draw_call(DrawCallKind::Surfaces, 1);
+            record_atlas_cache_hit();
+            if i == 0 {
+                record_atlas_cache_miss();
+                record_atlas_tile_allocated();
+            }
+            for _ in 0..=i {
+                record_input_event_dispatched();
+            }
+            record_notify_call();
+            record_entity_invalidated();
+            record_frame_pacing(true);
+
             close_frame_cpu_side(frame_index);
         }
 
+        // Two fast-path (present-only) frames: these never open a
+        // FrameCapture (no compositor work to attribute spans/counters to),
+        // so they only show up in the session-wide pacing totals, not in any
+        // individual frame's counters.
+        record_frame_pacing(false);
+        record_frame_pacing(false);
+
         let capture = handle.stop();
         assert_eq!(capture.frame_count(), 3);
+        assert_eq!(capture.full_draw_frame_count, 3);
+        assert_eq!(capture.fast_path_frame_count, 2);
 
-        let frame = capture.frames().next().expect("at least one frame");
+        let frames: Vec<&FrameCapture> = capture.frames().collect();
+        assert_eq!(
+            frames[0].counters.draw_calls.quads,
+            PassCounter { draw_calls: 1, primitives: 10 }
+        );
+        assert_eq!(
+            frames[2].counters.draw_calls.quads,
+            PassCounter { draw_calls: 1, primitives: 20 }
+        );
+        assert_eq!(
+            frames[0].counters.draw_calls.surfaces,
+            PassCounter { draw_calls: 1, primitives: 1 }
+        );
+        assert_eq!(frames[0].counters.atlas.tiles_allocated, 1, "frame 0 allocated a tile");
+        assert_eq!(frames[1].counters.atlas.tiles_allocated, 0, "frame 1 did not allocate a tile");
+        assert_eq!(frames[0].counters.atlas.cache_misses, 1);
+        assert_eq!(frames[1].counters.atlas.cache_misses, 0);
+        assert_eq!(frames[0].counters.atlas.cache_hits, 1);
+        assert_eq!(frames[0].counters.events.input_events_dispatched, 1);
+        assert_eq!(frames[2].counters.events.input_events_dispatched, 3);
+        assert_eq!(frames[0].counters.events.notify_calls, 1);
+        assert_eq!(frames[0].counters.events.entities_invalidated, 1);
+
+        let frame = frames[0];
         let draw = frame
             .cpu_spans
             .iter()
@@ -937,6 +1589,25 @@ mod tests {
             .expect("Window::draw_roots span recorded");
         assert_eq!(draw.depth, 0, "Window::draw should be the outermost span");
         assert_eq!(draw_roots.depth, 1, "Window::draw_roots should nest one level under Window::draw");
+
+        let summary = capture.counter_summary();
+        assert_eq!(summary.frame_count, 3);
+        assert_eq!(summary.draw_calls.quads.primitives.mean, 15.0, "(10 + 15 + 20) / 3");
+        assert_eq!(summary.draw_calls.quads.primitives.max, 20);
+        assert_eq!(summary.draw_calls.quads.draw_calls, MeanMax { mean: 1.0, max: 1 });
+        assert_eq!(summary.atlas.tiles_allocated, MeanMax { mean: 1.0 / 3.0, max: 1 });
+        assert!(
+            (summary.atlas.cache_hit_rate - 0.75).abs() < 1e-9,
+            "3 hits, 1 miss across the window => 0.75, got {}",
+            summary.atlas.cache_hit_rate
+        );
+        assert_eq!(summary.events.input_events_dispatched, MeanMax { mean: 2.0, max: 3 });
+        assert_eq!(summary.full_draw_frame_count, 3);
+        assert_eq!(summary.fast_path_frame_count, 2);
+        // Not asserted against a precise value since it depends on wall-clock
+        // timing between the frames recorded above, but it should always be
+        // finite and non-negative.
+        assert!(summary.fps.is_finite() && summary.fps >= 0.0, "fps was {}", summary.fps);
 
         let mut buffer = Vec::new();
         capture.export_trace(&mut buffer).expect("export_trace should succeed");

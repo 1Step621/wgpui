@@ -2253,6 +2253,8 @@ impl App {
 
     /// Tell GPUI that an entity has changed and observers of it should be notified.
     pub fn notify(&mut self, entity_id: EntityId) {
+        #[cfg(feature = "flamegraph")]
+        crate::record_notify_call();
         let window_invalidators = mem::take(
             self.window_invalidators_by_entity
                 .entry(entity_id)

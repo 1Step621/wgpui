@@ -54,13 +54,21 @@ impl PlatformAtlas for WgpuAtlas {
         let mut atlas = self.0.lock();
 
         match atlas.tiles_by_key.get(key) {
-            Some(tile) => Ok(Some(tile.clone())),
+            Some(tile) => {
+                #[cfg(feature = "flamegraph")]
+                crate::record_atlas_cache_hit();
+                Ok(Some(tile.clone()))
+            }
             None => Ok({
                 profiling::scope!("new tile");
+                #[cfg(feature = "flamegraph")]
+                crate::record_atlas_cache_miss();
 
                 match build()? {
                     Some((size, bytes)) => {
                         let tile = atlas.allocate(size, key.texture_kind());
+                        #[cfg(feature = "flamegraph")]
+                        crate::record_atlas_tile_allocated();
 
                         atlas.upload_texture(tile.texture_id, tile.bounds, &bytes);
                         atlas.tiles_by_key.insert(key.clone(), tile.clone());
@@ -79,6 +87,8 @@ impl PlatformAtlas for WgpuAtlas {
         let Some(id) = atlas.tiles_by_key.remove(key).map(|x| x.texture_id) else {
             return;
         };
+        #[cfg(feature = "flamegraph")]
+        crate::record_atlas_tile_evicted();
 
         let Some(texture_slot) = atlas.storage[id.kind].textures.get_mut(id.index as usize) else {
             return;

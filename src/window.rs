@@ -126,6 +126,8 @@ impl WindowInvalidator {
         let mut inner = self.inner.borrow_mut();
         inner.update_count += 1;
         inner.dirty_views.insert(entity);
+        #[cfg(feature = "flamegraph")]
+        crate::record_entity_invalidated();
         if inner.draw_phase == DrawPhase::None {
             inner.dirty = true;
             cx.push_effect(Effect::Notify { emitter: entity });
@@ -1218,6 +1220,8 @@ impl Window {
                         && last_input_timestamp.get().elapsed() < Duration::from_secs(1));
 
                 if invalidator.is_dirty() || request_frame_options.force_render {
+                    #[cfg(feature = "flamegraph")]
+                    crate::record_frame_pacing(true);
                     measure("frame duration", || {
                         handle
                             .update(&mut cx, |_, window, cx| {
@@ -1234,6 +1238,8 @@ impl Window {
                             .log_err();
                     })
                 } else if needs_present {
+                    #[cfg(feature = "flamegraph")]
+                    crate::record_frame_pacing(false);
                     // Fast path: framebuffer already updated by surface blit, just present it
                     handle
                         .update(&mut cx, |_, window, _| window.present_framebuffer_only())
@@ -4168,6 +4174,8 @@ impl Window {
     /// Dispatch a mouse or keyboard event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
+        #[cfg(feature = "flamegraph")]
+        crate::record_input_event_dispatched();
         self.last_input_timestamp.set(Instant::now());
 
         // Track whether this input was keyboard-based for focus-visible styling
