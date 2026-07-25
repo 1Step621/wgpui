@@ -457,6 +457,16 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         None
     }
 
+    /// The live `wgpu::Device`/`Queue` backing this window's renderer, for
+    /// GPU deep-capture replay (Phase 6 of the profiling epic, issue #62).
+    /// Default `None` for platforms/backends that don't use the WGPU
+    /// renderer or before the renderer exists, matching
+    /// `gpu_memory_snapshot`'s convention.
+    #[cfg(feature = "flamegraph")]
+    fn gpu_device_and_queue(&self) -> Option<(wgpu::Device, wgpu::Queue)> {
+        None
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn as_test(&mut self) -> Option<&mut TestWindow> {
         None

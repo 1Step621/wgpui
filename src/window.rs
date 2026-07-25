@@ -1702,6 +1702,17 @@ impl Window {
         self.platform_window.gpu_memory_snapshot()
     }
 
+    /// The live `wgpu::Device`/`Queue` backing this window's renderer, so a
+    /// GPU deep-capture replay preview (Phase 6 of the profiling epic, issue
+    /// #62, `flamegraph_replay::render_deep_capture_step`) can run against
+    /// the app's real device instead of creating a second one. `None` on
+    /// platforms/backends that don't use the WGPU renderer, or before the
+    /// renderer has been created.
+    #[cfg(feature = "flamegraph")]
+    pub fn gpu_device_and_queue(&self) -> Option<(wgpu::Device, wgpu::Queue)> {
+        self.platform_window.gpu_device_and_queue()
+    }
+
     /// The current text style. Which is composed of all the style refinements provided to `with_text_style`.
     pub fn text_style(&self) -> TextStyle {
         let mut style = TextStyle::default();

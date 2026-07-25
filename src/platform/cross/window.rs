@@ -460,6 +460,14 @@ impl PlatformWindow for CrossWindow {
             .map(|renderer| renderer.borrow().gpu_memory_snapshot())
     }
 
+    #[cfg(feature = "flamegraph")]
+    fn gpu_device_and_queue(&self) -> Option<(wgpu::Device, wgpu::Queue)> {
+        self.0
+            .renderer
+            .get()
+            .map(|renderer| renderer.borrow().gpu_device_and_queue())
+    }
+
     fn gpu_specs(&self) -> Option<crate::GpuSpecs> {
         // TODO(mdeand): Retrieve GPU specs from the graphics context.
         None

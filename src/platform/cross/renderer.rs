@@ -3212,6 +3212,20 @@ impl WgpuRenderer {
         }
     }
 
+    /// The live `wgpu::Device`/`Queue` backing this renderer, for callers
+    /// that want to drive GPU work outside the normal frame path -- e.g.
+    /// `flamegraph_replay::render_deep_capture_step` (Phase 6 of the
+    /// profiling epic, issue #62), so a deep-capture replay preview runs
+    /// against the app's real device instead of spinning up a second,
+    /// separate headless one on every call. `Device`/`Queue` are cheap
+    /// `Clone` handles (wgpu itself reference-counts the underlying
+    /// resources), so returning owned clones here is the idiomatic wgpu
+    /// pattern, not a meaningful cost.
+    #[cfg(feature = "flamegraph")]
+    pub(crate) fn gpu_device_and_queue(&self) -> (wgpu::Device, wgpu::Queue) {
+        (self.context.device.clone(), self.context.queue.clone())
+    }
+
     /// Best-effort swapchain memory estimate from `surface_configuration`'s
     /// dimensions/format. wgpu doesn't expose the presentation engine's
     /// actual backing image count, so `desired_maximum_frame_latency` (the

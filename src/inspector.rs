@@ -74,17 +74,23 @@ mod conditional {
         Layout,
         /// Registered event listeners on the selected element.
         EventListeners,
+        /// CPU+GPU flamegraph/profiler panel, backed by the `flamegraph` capture engine.
+        #[cfg(feature = "flamegraph")]
+        Profiler,
     }
 
     impl InspectorTab {
         /// All tabs in display order.
-        pub fn all() -> [InspectorTab; 4] {
-            [
+        pub fn all() -> Vec<InspectorTab> {
+            let mut tabs = vec![
                 InspectorTab::Elements,
                 InspectorTab::Styles,
                 InspectorTab::Layout,
                 InspectorTab::EventListeners,
-            ]
+            ];
+            #[cfg(feature = "flamegraph")]
+            tabs.push(InspectorTab::Profiler);
+            tabs
         }
 
         /// Human-readable label for the tab.
@@ -94,6 +100,8 @@ mod conditional {
                 InspectorTab::Styles => "Styles",
                 InspectorTab::Layout => "Layout",
                 InspectorTab::EventListeners => "Listeners",
+                #[cfg(feature = "flamegraph")]
+                InspectorTab::Profiler => "Profiler",
             }
         }
     }
