@@ -1572,6 +1572,14 @@ impl WgpuRenderer {
                 }
             });
 
+        #[cfg(feature = "flamegraph")]
+        crate::set_present_mode(match present_mode {
+            wgpu::PresentMode::Fifo => crate::PresentMode::Fifo,
+            wgpu::PresentMode::Mailbox => crate::PresentMode::Mailbox,
+            wgpu::PresentMode::Immediate => crate::PresentMode::Immediate,
+            _ => crate::PresentMode::Other,
+        });
+
         let surface_configuration = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             format,
@@ -2151,6 +2159,8 @@ impl WgpuRenderer {
                         pass.set_bind_group(1, &quads_bind_group, &[]);
                         pass.draw(0..4, quads_first_instance..quads_first_instance + count);
                         quads_first_instance += count;
+                        #[cfg(feature = "flamegraph")]
+                        crate::record_draw_call(crate::DrawCallKind::Quads, count);
                     }
 
                     PrimitiveBatch::MonochromeSprites {
@@ -2192,6 +2202,8 @@ impl WgpuRenderer {
                             mono_sprites_first_instance..mono_sprites_first_instance + count,
                         );
                         mono_sprites_first_instance += count;
+                        #[cfg(feature = "flamegraph")]
+                        crate::record_draw_call(crate::DrawCallKind::MonoSprites, count);
                     }
                     PrimitiveBatch::PolychromeSprites {
                         texture_id,
@@ -2231,6 +2243,8 @@ impl WgpuRenderer {
                             poly_sprites_first_instance..poly_sprites_first_instance + count,
                         );
                         poly_sprites_first_instance += count;
+                        #[cfg(feature = "flamegraph")]
+                        crate::record_draw_call(crate::DrawCallKind::PolySprites, count);
                     }
                     PrimitiveBatch::Shadows(shadows) => {
                         let count = shadows.len() as u32;
@@ -2239,6 +2253,8 @@ impl WgpuRenderer {
                         pass.set_bind_group(1, &shadows_bind_group, &[]);
                         pass.draw(0..4, shadows_first_instance..shadows_first_instance + count);
                         shadows_first_instance += count;
+                        #[cfg(feature = "flamegraph")]
+                        crate::record_draw_call(crate::DrawCallKind::Shadows, count);
                     }
                     PrimitiveBatch::BackdropFilters(backdrop_filters) => {
                         let count = backdrop_filters.len() as u32;
@@ -2301,6 +2317,8 @@ impl WgpuRenderer {
                             backdrop_filters_first_instance..backdrop_filters_first_instance + count,
                         );
                         backdrop_filters_first_instance += count;
+                        #[cfg(feature = "flamegraph")]
+                        crate::record_draw_call(crate::DrawCallKind::BackdropFilters, count);
                     }
                     PrimitiveBatch::FilterBoundary(index) => {
                         let boundary = scene.filter_boundaries[index];
@@ -2461,6 +2479,8 @@ impl WgpuRenderer {
                             underlines_first_instance..underlines_first_instance + count,
                         );
                         underlines_first_instance += count;
+                        #[cfg(feature = "flamegraph")]
+                        crate::record_draw_call(crate::DrawCallKind::Underlines, count);
                     }
                     PrimitiveBatch::Surfaces(surfaces) => {
                         log::debug!("Renderer: processing {} surface(s)", surfaces.len());
@@ -2580,6 +2600,8 @@ impl WgpuRenderer {
                                     pass.set_bind_group(0, &self.pipelines.globals_bind_group, &[]);
                                     pass.set_bind_group(1, &surface_bind_group, &[]);
                                     pass.draw(0..4, 0..1);
+                                    #[cfg(feature = "flamegraph")]
+                                    crate::record_draw_call(crate::DrawCallKind::Surfaces, 1);
 
                                     // CRITICAL: Keep view alive until after render pass ends
                                     // The bind_group holds a reference to it
@@ -2610,6 +2632,8 @@ impl WgpuRenderer {
                                 0..1,
                             );
                             paths_vertex_offset += vertex_count;
+                            #[cfg(feature = "flamegraph")]
+                            crate::record_draw_call(crate::DrawCallKind::Paths, paths.len() as u32);
                         }
                     }
                 }
