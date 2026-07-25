@@ -775,7 +775,11 @@ pub(crate) struct Frame {
     pub(crate) cursor_styles: Vec<CursorStyleRequest>,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) debug_bounds: FxHashMap<String, Bounds<Pixels>>,
-    #[cfg(any(feature = "inspector", debug_assertions))]
+    // Broadened beyond the plain inspector/debug_assertions gate below: this
+    // field backs `Window::build_inspector_element_id`, which flamegraph-only
+    // (release) builds also need, to attribute CPU spans in `element.rs`'s
+    // `Drawable::request_layout`/`prepaint`/`paint` to a source file:line.
+    #[cfg(any(feature = "inspector", debug_assertions, feature = "flamegraph"))]
     pub(crate) next_inspector_instance_ids: FxHashMap<Rc<crate::InspectorElementPath>, usize>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) inspector_hitboxes: FxHashMap<HitboxId, crate::InspectorElementId>,
@@ -830,7 +834,7 @@ impl Frame {
             #[cfg(any(test, feature = "test-support"))]
             debug_bounds: FxHashMap::default(),
 
-            #[cfg(any(feature = "inspector", debug_assertions))]
+            #[cfg(any(feature = "inspector", debug_assertions, feature = "flamegraph"))]
             next_inspector_instance_ids: FxHashMap::default(),
 
             #[cfg(any(feature = "inspector", debug_assertions))]
@@ -864,9 +868,11 @@ impl Frame {
         self.tab_stops.clear();
         self.focus = None;
 
+        #[cfg(any(feature = "inspector", debug_assertions, feature = "flamegraph"))]
+        self.next_inspector_instance_ids.clear();
+
         #[cfg(any(feature = "inspector", debug_assertions))]
         {
-            self.next_inspector_instance_ids.clear();
             self.inspector_hitboxes.clear();
             self.inspector_element_infos.clear();
             self.inspector_event_listeners.clear();
@@ -998,6 +1004,12 @@ pub struct Window {
     pub(crate) client_inset: Option<Pixels>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     inspector: Option<Entity<Inspector>>,
+    /// The flamegraph frame index opened by the most recent `draw()` call, if
+    /// a capture is active. Read (and cleared) by `present`/
+    /// `present_framebuffer_only`, both of which are `&self` methods, hence
+    /// the `Cell` rather than a plain field.
+    #[cfg(feature = "flamegraph")]
+    flamegraph_open_frame: Cell<Option<u64>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1433,6 +1445,8 @@ impl Window {
             image_cache_stack: Vec::new(),
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector: None,
+            #[cfg(feature = "flamegraph")]
+            flamegraph_open_frame: Cell::new(None),
         })
     }
 
@@ -2230,6 +2244,13 @@ impl Window {
         // This ensures that multiple test Apps have isolated arenas.
         let _arena_scope = ElementArenaScope::enter(&cx.element_arena);
 
+        #[cfg(feature = "flamegraph")]
+        let frame_index = crate::open_frame_cpu_side(self.handle.id.as_u64());
+        #[cfg(feature = "flamegraph")]
+        self.flamegraph_open_frame.set(frame_index);
+        #[cfg(feature = "flamegraph")]
+        let _draw_span = crate::enter_span(crate::SpanName::Static("Window::draw"), crate::SpanCategory::WindowFrame, None);
+
         self.invalidate_entities();
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
@@ -2357,20 +2378,44 @@ impl Window {
 
     #[profiling::function]
     fn present(&self) {
+        #[cfg(feature = "flamegraph")]
+        let _present_span =
+            crate::enter_span(crate::SpanName::Static("Window::present"), crate::SpanCategory::WindowFrame, None);
+
         self.platform_window.draw(&self.rendered_frame.scene);
         self.needs_present.set(false);
         profiling::finish_frame!();
+
+        // GPU spans for this frame are left open (attached asynchronously via
+        // `attach_gpu_spans` after query readback); only the CPU/background
+        // sides are finalized here.
+        #[cfg(feature = "flamegraph")]
+        crate::close_frame_cpu_side(self.flamegraph_open_frame.take());
     }
 
     /// Present only the cached framebuffer (fast path - no compositor)
     #[profiling::function]
     fn present_framebuffer_only(&self) {
+        #[cfg(feature = "flamegraph")]
+        let _present_span = crate::enter_span(
+            crate::SpanName::Static("Window::present_framebuffer_only"),
+            crate::SpanCategory::WindowFrame,
+            None,
+        );
+
         self.platform_window.present_framebuffer_only();
         self.needs_present.set(false);
         profiling::finish_frame!();
     }
 
     fn draw_roots(&mut self, cx: &mut App) {
+        #[cfg(feature = "flamegraph")]
+        let _draw_roots_span = crate::enter_span(
+            crate::SpanName::Static("Window::draw_roots"),
+            crate::SpanCategory::WindowFrame,
+            None,
+        );
+
         self.invalidator.set_phase(DrawPhase::Prepaint);
         self.tooltip_bounds.take();
 
@@ -5182,7 +5227,7 @@ impl Window {
         f(&mut None, self)
     }
 
-    #[cfg(any(feature = "inspector", debug_assertions))]
+    #[cfg(any(feature = "inspector", debug_assertions, feature = "flamegraph"))]
     pub(crate) fn build_inspector_element_id(
         &mut self,
         path: crate::InspectorElementPath,

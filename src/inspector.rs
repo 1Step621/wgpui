@@ -2,10 +2,10 @@
 #[derive(Debug, Eq, PartialEq, Hash, Clone)]
 pub struct InspectorElementId {
     /// Stable part of the ID.
-    #[cfg(any(feature = "inspector", debug_assertions))]
+    #[cfg(any(feature = "inspector", debug_assertions, feature = "flamegraph"))]
     pub path: std::rc::Rc<InspectorElementPath>,
     /// Disambiguates elements that have the same path.
-    #[cfg(any(feature = "inspector", debug_assertions))]
+    #[cfg(any(feature = "inspector", debug_assertions, feature = "flamegraph"))]
     pub instance_id: usize,
 }
 
@@ -15,10 +15,10 @@ impl Into<InspectorElementId> for &InspectorElementId {
     }
 }
 
-#[cfg(any(feature = "inspector", debug_assertions))]
+#[cfg(any(feature = "inspector", debug_assertions, feature = "flamegraph"))]
 pub use conditional::*;
 
-#[cfg(any(feature = "inspector", debug_assertions))]
+#[cfg(any(feature = "inspector", debug_assertions, feature = "flamegraph"))]
 mod conditional {
     use crate::{
         AnyElement, App, Bounds, Context, Empty, GlobalElementId, InspectorElementId,
@@ -602,7 +602,7 @@ mod conditional {
 }
 
 /// Provides definitions used by `#[derive_inspector_reflection]`.
-#[cfg(any(feature = "inspector", debug_assertions))]
+#[cfg(any(feature = "inspector", debug_assertions, feature = "flamegraph"))]
 pub mod inspector_reflection {
     use std::any::Any;
 

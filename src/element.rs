@@ -43,6 +43,8 @@ use std::{
     mem, panic,
     sync::Arc,
 };
+#[cfg(feature = "flamegraph")]
+use std::hash::{Hash, Hasher};
 
 /// Implemented by types that participate in laying out and painting the contents of a window.
 /// Elements form a tree and are laid out according to web-based layout rules, as implemented by Taffy.
@@ -181,7 +183,7 @@ pub trait ParentElement {
 #[doc(hidden)]
 pub struct Component<C: RenderOnce> {
     component: Option<C>,
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "flamegraph"))]
     source: &'static core::panic::Location<'static>,
 }
 
@@ -191,7 +193,7 @@ impl<C: RenderOnce> Component<C> {
     pub fn new(component: C) -> Self {
         Component {
             component: Some(component),
-            #[cfg(debug_assertions)]
+            #[cfg(any(debug_assertions, feature = "flamegraph"))]
             source: core::panic::Location::caller(),
         }
     }
@@ -206,10 +208,10 @@ impl<C: RenderOnce> Element for Component<C> {
     }
 
     fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "flamegraph"))]
         return Some(self.source);
 
-        #[cfg(not(debug_assertions))]
+        #[cfg(not(any(debug_assertions, feature = "flamegraph")))]
         return None;
     }
 
@@ -339,6 +341,40 @@ enum ElementDrawPhase<RequestLayoutState, PrepaintState> {
     Painted,
 }
 
+/// Builds element attribution for a flamegraph CPU span, reusing the
+/// `GlobalElementId`/`InspectorElementId` plumbing already threaded through
+/// `request_layout`/`prepaint`/`paint` for the inspector. Returns `None` when
+/// capture isn't active, per the zero-overhead rule: this does real work
+/// (hashing the element id) that call sites should skip unless a capture is
+/// actually recording.
+#[cfg(feature = "flamegraph")]
+fn flamegraph_element_attribution<E: Element>(
+    global_id: Option<&GlobalElementId>,
+    inspector_id: Option<&InspectorElementId>,
+) -> Option<crate::ElementAttribution> {
+    if !crate::capture_enabled() {
+        return None;
+    }
+
+    let global_id_hash = global_id
+        .map(|id| {
+            let mut hasher = seahash::SeaHasher::new();
+            id.hash(&mut hasher);
+            hasher.finish()
+        })
+        .unwrap_or(0);
+    let source_location = inspector_id.map(|id| {
+        let location = id.path.source_location;
+        (location.file(), location.line())
+    });
+
+    Some(crate::ElementAttribution {
+        type_name: type_name::<E>(),
+        global_id_hash,
+        source_location,
+    })
+}
+
 /// A wrapper around an implementer of [`Element`] that allows it to be drawn in a window.
 impl<E: Element> Drawable<E> {
     pub(crate) fn new(element: E) -> Self {
@@ -357,7 +393,7 @@ impl<E: Element> Drawable<E> {
                 });
 
                 let inspector_id;
-                #[cfg(any(feature = "inspector", debug_assertions))]
+                #[cfg(any(feature = "inspector", debug_assertions, feature = "flamegraph"))]
                 {
                     inspector_id = self.element.source_location().map(|source| {
                         let path = crate::InspectorElementPath {
@@ -367,10 +403,17 @@ impl<E: Element> Drawable<E> {
                         window.build_inspector_element_id(path)
                     });
                 }
-                #[cfg(not(any(feature = "inspector", debug_assertions)))]
+                #[cfg(not(any(feature = "inspector", debug_assertions, feature = "flamegraph")))]
                 {
                     inspector_id = None;
                 }
+
+                #[cfg(feature = "flamegraph")]
+                let _span = crate::enter_span(
+                    crate::SpanName::Static("Drawable::request_layout"),
+                    crate::SpanCategory::ElementRequestLayout,
+                    flamegraph_element_attribution::<E>(global_id.as_ref(), inspector_id.as_ref()),
+                );
 
                 let (layout_id, request_layout) = self.element.request_layout(
                     global_id.as_ref(),
@@ -417,6 +460,14 @@ impl<E: Element> Drawable<E> {
 
                 let bounds = window.layout_bounds(layout_id);
                 let node_id = window.next_frame.dispatch_tree.push_node();
+
+                #[cfg(feature = "flamegraph")]
+                let _span = crate::enter_span(
+                    crate::SpanName::Static("Drawable::prepaint"),
+                    crate::SpanCategory::ElementPrepaint,
+                    flamegraph_element_attribution::<E>(global_id.as_ref(), inspector_id.as_ref()),
+                );
+
                 let prepaint = self.element.prepaint(
                     global_id.as_ref(),
                     inspector_id.as_ref(),
@@ -465,6 +516,14 @@ impl<E: Element> Drawable<E> {
                 }
 
                 window.next_frame.dispatch_tree.set_active_node(node_id);
+
+                #[cfg(feature = "flamegraph")]
+                let _span = crate::enter_span(
+                    crate::SpanName::Static("Drawable::paint"),
+                    crate::SpanCategory::ElementPaint,
+                    flamegraph_element_attribution::<E>(global_id.as_ref(), inspector_id.as_ref()),
+                );
+
                 self.element.paint(
                     global_id.as_ref(),
                     inspector_id.as_ref(),
