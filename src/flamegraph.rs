@@ -87,6 +87,17 @@ pub struct ElementAttribution {
     pub source_location: Option<(&'static str, u32)>,
 }
 
+/// Hash a `GlobalElementId` for element attribution, shared by Phase 1's
+/// `ElementAttribution::global_id_hash` (`element.rs`) and Phase 5's UI-tree
+/// capture (`flamegraph_ui_capture.rs`), so both hash element identity the
+/// same way and their `global_id_hash` values are directly comparable/
+/// joinable across the two capture mechanisms.
+pub(crate) fn hash_global_element_id(id: &crate::GlobalElementId) -> u64 {
+    let mut hasher = seahash::SeaHasher::new();
+    id.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// A hashed, serde-friendly stand-in for `std::thread::ThreadId`, which does
 /// not implement `Serialize`/`Deserialize` itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
