@@ -2821,11 +2821,26 @@ impl WgpuRenderer {
         // recording, hand off from `DeepCaptureRecorder` to
         // `DeepCapturePendingReadback` now -- while `finish` still has a
         // chance to record any buffer-copy commands into `command_encoder`,
-        // before it's finished below.
+        // before it's finished below. `quads_buffer_ref`/etc. are the same
+        // guards already held (further up in this function, for the
+        // bind-group setup above) for the whole duration of `draw`, so this
+        // reuses them rather than re-locking.
         #[cfg(feature = "flamegraph")]
-        let deep_capture_pending = deep_capture_recorder
-            .take()
-            .map(|recorder| recorder.finish(&self.context.device));
+        let deep_capture_pending = deep_capture_recorder.take().map(|recorder| {
+            let buffers: [(crate::flamegraph::DeepCaptureBufferKind, &wgpu::Buffer); 7] = [
+                (crate::flamegraph::DeepCaptureBufferKind::Quads, &quads_buffer_ref),
+                (crate::flamegraph::DeepCaptureBufferKind::Shadows, &shadows_buffer_ref),
+                (crate::flamegraph::DeepCaptureBufferKind::Underlines, &underlines_buffer_ref),
+                (crate::flamegraph::DeepCaptureBufferKind::MonoSprites, &mono_sprites_buffer_ref),
+                (crate::flamegraph::DeepCaptureBufferKind::PolySprites, &poly_sprites_buffer_ref),
+                (
+                    crate::flamegraph::DeepCaptureBufferKind::BackdropFilters,
+                    &backdrop_filters_buffer_ref,
+                ),
+                (crate::flamegraph::DeepCaptureBufferKind::Paths, &paths_vertices_buffer_ref),
+            ];
+            recorder.finish(&self.context.device, &mut command_encoder, &buffers)
+        });
 
         log::debug!("Renderer::draw: submitting command buffer");
         self.context.queue.submit(Some(command_encoder.finish()));

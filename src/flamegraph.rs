@@ -2087,4 +2087,71 @@ mod tests {
             64 * 1024 * 1024 + 4 * 1024 * 1024 + 12 * 1024 * 1024 + 3 * 1920 * 1080 * 4
         );
     }
+
+    // Phase 4 (issue #60): the public arm/retrieve half of the deep-capture
+    // lifecycle. `WgpuRenderer::draw`'s actual recording/readback is covered
+    // in `flamegraph_gpu`'s test module (it needs a real `wgpu::Device`);
+    // this test covers everything reachable without one -- the request flag,
+    // the completed-capture mailbox, and `DeepCapture::buffer_contents`'s
+    // lookup helper. `DEEP_CAPTURE_REQUESTED`/`COMPLETED_DEEP_CAPTURE` are
+    // process-wide statics that no other test in this suite touches (nothing
+    // outside a real `WgpuRenderer::draw` call exercises them), so unlike
+    // `ACTIVE_CAPTURE` above there's no cross-test ownership concern here.
+    #[test]
+    fn deep_capture_request_and_retrieval_round_trip() {
+        assert!(!deep_capture_requested(), "should start unarmed");
+        assert!(!take_deep_capture_request(), "taking with nothing armed should report false");
+
+        request_deep_capture();
+        assert!(deep_capture_requested(), "should be armed immediately after requesting");
+        assert!(take_deep_capture_request(), "the first take after a request should report true");
+        assert!(
+            !take_deep_capture_request(),
+            "a second take with nothing newly requested should report false"
+        );
+        assert!(!deep_capture_requested(), "taking the request should clear the armed flag");
+
+        assert!(
+            take_completed_deep_capture().is_none(),
+            "nothing has completed yet, so retrieval should be empty"
+        );
+
+        let quads_bytes = vec![1u8, 2, 3, 4];
+        let capture = DeepCapture {
+            draw_calls: vec![DeepCaptureDrawCall {
+                sequence: 0,
+                kind: DrawCallKind::Quads,
+                pipeline_label: "quads",
+                pass_label: "main",
+                vertex_range: (0, 4),
+                instance_range: (0, 1),
+                bind_group_count: 2,
+                buffer_kind: Some(DeepCaptureBufferKind::Quads),
+                atlas_texture_id: None,
+            }],
+            buffer_contents: vec![DeepCaptureBufferContents {
+                kind: DeepCaptureBufferKind::Quads,
+                bytes: quads_bytes.clone(),
+            }],
+            resources_finalized: true,
+        };
+        complete_deep_capture(capture);
+
+        let taken = take_completed_deep_capture().expect("the capture published above should be retrievable");
+        assert_eq!(taken.draw_calls.len(), 1);
+        assert!(taken.resources_finalized);
+        assert_eq!(
+            taken.buffer_contents(DeepCaptureBufferKind::Quads).map(|contents| &contents.bytes),
+            Some(&quads_bytes)
+        );
+        assert!(
+            taken.buffer_contents(DeepCaptureBufferKind::Shadows).is_none(),
+            "a buffer kind that was never touched should not be present"
+        );
+
+        assert!(
+            take_completed_deep_capture().is_none(),
+            "taking the completed capture should clear the mailbox, so a second take is empty"
+        );
+    }
 }
