@@ -15,42 +15,52 @@ impl Into<InspectorElementId> for &InspectorElementId {
     }
 }
 
+/// `GlobalElementId` qualified by source location of element construction.
+///
+/// Split out of `mod conditional` below (unlike the rest of that module,
+/// which is inspector-UI-specific and depends on `App`/`Context` fields that
+/// only exist under the narrower `any(feature = "inspector",
+/// debug_assertions)` gate) because `element.rs`'s flamegraph CPU span
+/// attribution needs this type — and only this type — reachable under
+/// `feature = "flamegraph"` alone, without pulling in the inspector panel.
 #[cfg(any(feature = "inspector", debug_assertions, feature = "flamegraph"))]
-pub use conditional::*;
+#[derive(Debug, Eq, PartialEq, Hash)]
+pub struct InspectorElementPath {
+    /// The path to the nearest ancestor element that has an `ElementId`.
+    pub global_id: crate::GlobalElementId,
+    /// Source location where this element was constructed.
+    pub source_location: &'static std::panic::Location<'static>,
+}
 
 #[cfg(any(feature = "inspector", debug_assertions, feature = "flamegraph"))]
+impl Clone for InspectorElementPath {
+    fn clone(&self) -> Self {
+        Self {
+            global_id: self.global_id.clone(),
+            source_location: self.source_location,
+        }
+    }
+}
+
+#[cfg(any(feature = "inspector", debug_assertions, feature = "flamegraph"))]
+impl Into<InspectorElementPath> for &InspectorElementPath {
+    fn into(self) -> InspectorElementPath {
+        self.clone()
+    }
+}
+
+#[cfg(any(feature = "inspector", debug_assertions))]
+pub use conditional::*;
+
+#[cfg(any(feature = "inspector", debug_assertions))]
 mod conditional {
     use crate::{
         AnyElement, App, Bounds, Context, Empty, GlobalElementId, InspectorElementId,
-        IntoElement, Pixels, Render, SharedString, Window,
+        InspectorElementPath, IntoElement, Pixels, Render, SharedString, Window,
         px, rems,
     };
     use collections::FxHashMap;
     use std::any::{Any, TypeId};
-
-    /// `GlobalElementId` qualified by source location of element construction.
-    #[derive(Debug, Eq, PartialEq, Hash)]
-    pub struct InspectorElementPath {
-        /// The path to the nearest ancestor element that has an `ElementId`.
-        pub global_id: crate::GlobalElementId,
-        /// Source location where this element was constructed.
-        pub source_location: &'static std::panic::Location<'static>,
-    }
-
-    impl Clone for InspectorElementPath {
-        fn clone(&self) -> Self {
-            Self {
-                global_id: self.global_id.clone(),
-                source_location: self.source_location,
-            }
-        }
-    }
-
-    impl Into<InspectorElementPath> for &InspectorElementPath {
-        fn into(self) -> InspectorElementPath {
-            self.clone()
-        }
-    }
 
     // ── Inspector tabs ───────────────────────────────────────────────────────
 
@@ -602,7 +612,7 @@ mod conditional {
 }
 
 /// Provides definitions used by `#[derive_inspector_reflection]`.
-#[cfg(any(feature = "inspector", debug_assertions, feature = "flamegraph"))]
+#[cfg(any(feature = "inspector", debug_assertions))]
 pub mod inspector_reflection {
     use std::any::Any;
 

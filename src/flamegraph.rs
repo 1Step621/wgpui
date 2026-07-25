@@ -205,6 +205,11 @@ pub struct Capture {
     frames: VecDeque<FrameCapture>,
     /// Frame-count ring-buffer bound this capture was configured with.
     pub max_frames: usize,
+    // Always `false` on a `Capture` returned by `CaptureHandle::stop` today
+    // (this type only represents already-stopped sessions this round); kept
+    // as part of the locked-in data model since later phases may return a
+    // `Capture` view onto a still-running session.
+    #[allow(dead_code)]
     enabled: AtomicBool,
 }
 
