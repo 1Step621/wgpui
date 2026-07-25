@@ -679,7 +679,7 @@ pub(crate) fn record_element_style(global_id: Option<&GlobalElementId>, style: &
 mod tests {
     use super::*;
     use crate::{
-        self as gpui, Context, InteractiveElement, IntoElement, ParentElement, Render, Rgba, Styled,
+        self as gpui, Context, InteractiveElement, IntoElement, ParentElement, Render, Styled,
         TestAppContext, Window, div, rgb,
     };
 
@@ -735,7 +735,7 @@ mod tests {
             "expected at least root/child-a/child-b to have resolved styles, got {styled_nodes:?}"
         );
 
-        let expected_color: Hsla = Rgba::from(rgb(0xff0000)).into();
+        let expected_color: Hsla = rgb(0xff0000).into();
         let child_a = styled_nodes
             .iter()
             .find(|node| {
