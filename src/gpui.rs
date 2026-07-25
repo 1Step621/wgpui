@@ -20,6 +20,10 @@ pub mod default_colors;
 mod element;
 mod elements;
 mod executor;
+#[cfg(feature = "flamegraph")]
+mod flamegraph;
+#[cfg(feature = "flamegraph")]
+mod flamegraph_gpu;
 mod geometry;
 mod global;
 mod input;
@@ -30,7 +34,6 @@ mod keymap;
 mod path_builder;
 mod platform;
 pub mod prelude;
-mod profiler;
 mod queue;
 mod scene;
 mod shared_string;
@@ -91,7 +94,8 @@ pub use keymap::*;
 pub use path_builder::*;
 pub use platform::*;
 pub use platform::cross::render_context::WgpuOptions;
-pub use profiler::*;
+#[cfg(feature = "flamegraph")]
+pub use flamegraph::*;
 pub(crate) use queue::{PriorityQueueReceiver, PriorityQueueSender};
 pub use refineable::*;
 pub use scene::*;

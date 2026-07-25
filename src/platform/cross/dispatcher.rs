@@ -1,7 +1,4 @@
-use crate::{
-    GLOBAL_THREAD_TIMINGS, PlatformDispatcher, Priority, PriorityQueueSender, RealtimePriority,
-    RunnableVariant, THREAD_TIMINGS, ThreadTaskTimings,
-};
+use crate::{PlatformDispatcher, Priority, PriorityQueueSender, RealtimePriority, RunnableVariant};
 use priority_threadpool::ThreadPool;
 use std::thread::ThreadId;
 use winit::event_loop::EventLoopProxy;
@@ -37,27 +34,6 @@ impl Dispatcher {
 }
 
 impl PlatformDispatcher for Dispatcher {
-    fn get_all_timings(&self) -> Vec<crate::ThreadTaskTimings> {
-        let global_thread_timings = GLOBAL_THREAD_TIMINGS.lock();
-        ThreadTaskTimings::convert(&global_thread_timings)
-    }
-
-    fn get_current_thread_timings(&self) -> Vec<crate::TaskTiming> {
-        THREAD_TIMINGS.with(|timings| {
-            let timings = timings.lock();
-            let timings = &timings.timings;
-
-            let mut vec = Vec::with_capacity(timings.len());
-
-            let (s1, s2) = timings.as_slices();
-
-            vec.extend_from_slice(s1);
-            vec.extend_from_slice(s2);
-
-            vec
-        })
-    }
-
     fn is_main_thread(&self) -> bool {
         std::thread::current().id() == self.main_thread_id
     }

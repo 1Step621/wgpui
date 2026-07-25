@@ -102,6 +102,21 @@ impl WgpuContext {
             (adapter, required_features)
         };
 
+        // PIPELINE_STATISTICS_QUERY is best-effort on every platform (unlike
+        // TIMESTAMP_QUERY/TIMESTAMP_QUERY_INSIDE_ENCODERS above, which are
+        // already required outright on non-macOS): cross-backend wgpu 30
+        // support for it is thin, so it's runtime-checked rather than folded
+        // into `required_features` even on non-macOS.
+        #[cfg(feature = "flamegraph")]
+        let device_features = {
+            let pipeline_statistics_query = wgpu::Features::PIPELINE_STATISTICS_QUERY;
+            if adapter.features().contains(pipeline_statistics_query) {
+                device_features | pipeline_statistics_query
+            } else {
+                device_features
+            }
+        };
+
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: None,

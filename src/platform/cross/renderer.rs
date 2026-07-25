@@ -1498,6 +1498,14 @@ pub struct WgpuRenderer {
 
     // Layout version counter (incremented when compositor runs)
     layout_version: Arc<AtomicU64>,
+
+    // Timestamp-query manager for flamegraph GPU capture (issue #57). Lazily
+    // allocated only while a GPU-capturing session is active, so VRAM/setup
+    // cost is zero otherwise. `blit_surfaces_direct` is a `&self` method, so
+    // this needs shared-mutable access via `parking_lot::Mutex` rather than a
+    // plain field.
+    #[cfg(feature = "flamegraph")]
+    gpu_query_manager: parking_lot::Mutex<Option<crate::flamegraph_gpu::GpuQueryManager>>,
 }
 
 impl WgpuRenderer {
@@ -1665,7 +1673,23 @@ impl WgpuRenderer {
             group_views,
             surface_bounds_cache: Arc::new(Mutex::new(HashMap::new())),
             layout_version: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "flamegraph")]
+            gpu_query_manager: parking_lot::Mutex::new(None),
         })
+    }
+
+    /// Reserve a timestamp-write pair against the current flamegraph GPU
+    /// capture generation, if one is active and actively recording a frame.
+    /// Returns `None` (cheaply, no wgpu resource allocation) otherwise, e.g.
+    /// when no capture is running, or when `blit_surfaces_direct` runs
+    /// outside a `draw()`-initiated frame.
+    #[cfg(feature = "flamegraph")]
+    fn reserve_gpu_timestamps(
+        &self,
+        name: crate::SpanName,
+        pass_kind: crate::GpuPassKind,
+    ) -> Option<crate::flamegraph_gpu::ReservedTimestamps> {
+        self.gpu_query_manager.lock().as_mut()?.reserve_pair(name, pass_kind)
     }
 
     pub fn draw(&mut self, scene: &Scene) {
@@ -1677,6 +1701,39 @@ impl WgpuRenderer {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("main"),
                 });
+
+        // Flamegraph GPU capture (issue #57): lazily create/tear down the
+        // query manager to match whether a GPU-capturing session is active,
+        // poll any in-flight readback from earlier frames (non-blocking, safe
+        // on this thread — see flamegraph_gpu's module docs), then reserve
+        // this frame's generation and bracket the whole encoder with a
+        // GpuSubmitPresent span.
+        #[cfg(feature = "flamegraph")]
+        let flamegraph_submit_present = {
+            {
+                let mut guard = self.gpu_query_manager.lock();
+                crate::flamegraph_gpu::sync_with_active_capture(
+                    &mut guard,
+                    &self.context.device,
+                    &self.context.queue,
+                );
+                if let Some(manager) = guard.as_mut() {
+                    manager.poll_readback(&self.context.device);
+                    if let Some(frame_index) = crate::current_gpu_correlation_frame_index() {
+                        manager.begin_frame(frame_index);
+                    }
+                }
+            }
+
+            let reserved = self.reserve_gpu_timestamps(
+                crate::SpanName::Static("GpuSubmitPresent"),
+                crate::GpuPassKind::SubmitPresent,
+            );
+            if let Some(reserved) = &reserved {
+                command_encoder.write_timestamp(reserved.query_set(), reserved.begin_index());
+            }
+            reserved
+        };
 
         self.atlas.before_frame(&mut command_encoder);
         log::trace!("Renderer::draw: atlas.before_frame complete");
@@ -2044,6 +2101,10 @@ impl WgpuRenderer {
             });
 
         {
+            #[cfg(feature = "flamegraph")]
+            let flamegraph_main_pass =
+                self.reserve_gpu_timestamps(crate::SpanName::Static("main"), crate::GpuPassKind::Main);
+
             // Render to swapchain directly for now (TODO: render to framebuffer, then blit)
             let mut pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main"),
@@ -2059,6 +2120,9 @@ impl WgpuRenderer {
                     depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
+                #[cfg(feature = "flamegraph")]
+                timestamp_writes: flamegraph_main_pass.as_ref().map(|reserved| reserved.writes()),
+                #[cfg(not(feature = "flamegraph"))]
                 timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
@@ -2200,6 +2264,11 @@ impl WgpuRenderer {
                         }
 
                         // Begin new render pass with Load to preserve existing content
+                        #[cfg(feature = "flamegraph")]
+                        let flamegraph_main_resumed_pass = self.reserve_gpu_timestamps(
+                            crate::SpanName::Static("main_resumed"),
+                            crate::GpuPassKind::MainResumed,
+                        );
                         pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some("main_resumed"),
                             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2214,6 +2283,9 @@ impl WgpuRenderer {
                                 depth_slice: None,
                             })],
                             depth_stencil_attachment: None,
+                            #[cfg(feature = "flamegraph")]
+                            timestamp_writes: flamegraph_main_resumed_pass.as_ref().map(|reserved| reserved.writes()),
+                            #[cfg(not(feature = "flamegraph"))]
                             timestamp_writes: None,
                             occlusion_query_set: None,
                             multiview_mask: None,
@@ -2242,6 +2314,11 @@ impl WgpuRenderer {
                             } else {
                                 drop(pass);
 
+                                #[cfg(feature = "flamegraph")]
+                                let flamegraph_filter_group_pass = self.reserve_gpu_timestamps(
+                                    crate::SpanName::Static("filter_group"),
+                                    crate::GpuPassKind::FilterGroup,
+                                );
                                 pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                                     label: Some("filter_group"),
                                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2254,6 +2331,9 @@ impl WgpuRenderer {
                                         depth_slice: None,
                                     })],
                                     depth_stencil_attachment: None,
+                                    #[cfg(feature = "flamegraph")]
+                                    timestamp_writes: flamegraph_filter_group_pass.as_ref().map(|reserved| reserved.writes()),
+                                    #[cfg(not(feature = "flamegraph"))]
                                     timestamp_writes: None,
                                     occlusion_query_set: None,
                                     multiview_mask: None,
@@ -2283,6 +2363,11 @@ impl WgpuRenderer {
                                 _ => &surface_view,
                             };
 
+                            #[cfg(feature = "flamegraph")]
+                            let flamegraph_filter_group_resumed_pass = self.reserve_gpu_timestamps(
+                                crate::SpanName::Static("filter_group_resumed"),
+                                crate::GpuPassKind::FilterGroupResumed,
+                            );
                             pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                                 label: Some("filter_group_resumed"),
                                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2295,6 +2380,9 @@ impl WgpuRenderer {
                                     depth_slice: None,
                                 })],
                                 depth_stencil_attachment: None,
+                                #[cfg(feature = "flamegraph")]
+                                timestamp_writes: flamegraph_filter_group_resumed_pass.as_ref().map(|reserved| reserved.writes()),
+                                #[cfg(not(feature = "flamegraph"))]
                                 timestamp_writes: None,
                                 occlusion_query_set: None,
                                 multiview_mask: None,
@@ -2530,10 +2618,37 @@ impl WgpuRenderer {
 
         // TODO: Blit persistent framebuffer to swapchain (needs proper pipeline)
 
+        // Close out the GpuSubmitPresent bracket and record the resolve +
+        // resolve-to-staging copy for this frame's generation, before the
+        // encoder is finished (resolve_query_set must be recorded on the same
+        // encoder that wrote the timestamps).
+        #[cfg(feature = "flamegraph")]
+        if let Some(reserved) = &flamegraph_submit_present {
+            command_encoder.write_timestamp(reserved.query_set(), reserved.end_index());
+        }
+        #[cfg(feature = "flamegraph")]
+        {
+            let mut guard = self.gpu_query_manager.lock();
+            if let Some(manager) = guard.as_mut() {
+                manager.finish_frame(&mut command_encoder);
+            }
+        }
+
         log::debug!("Renderer::draw: submitting command buffer");
         self.context.queue.submit(Some(command_encoder.finish()));
         log::debug!("Renderer::draw: presenting surface");
         self.context.queue.present(surface_texture);
+
+        // Start the async readback now that the resolve/copy commands above
+        // have actually been submitted to the queue.
+        #[cfg(feature = "flamegraph")]
+        {
+            let mut guard = self.gpu_query_manager.lock();
+            if let Some(manager) = guard.as_mut() {
+                manager.begin_readback();
+            }
+        }
+
         log::debug!("Renderer::draw: frame complete");
     }
 
@@ -2627,6 +2742,19 @@ impl WgpuRenderer {
             .create_view(&wgpu::TextureViewDescriptor::default());
 
         {
+            // Only gets a timestamp span when a WgpuRenderer::draw-initiated
+            // frame is still in its `Recording` state (see
+            // `GpuQueryManager::reserve_pair` and `reserve_gpu_timestamps`'s
+            // doc comment) — blit_surfaces_direct can also run outside any
+            // open frame (the no-compositor fast path bypasses `draw()`
+            // entirely), in which case this is `None` and the pass simply
+            // isn't captured this round.
+            #[cfg(feature = "flamegraph")]
+            let flamegraph_fast_blit_pass = self.reserve_gpu_timestamps(
+                crate::SpanName::Static("fast_surface_blit_pass"),
+                crate::GpuPassKind::FastSurfaceBlit,
+            );
+
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("fast_surface_blit_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2639,6 +2767,9 @@ impl WgpuRenderer {
                     depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
+                #[cfg(feature = "flamegraph")]
+                timestamp_writes: flamegraph_fast_blit_pass.as_ref().map(|reserved| reserved.writes()),
+                #[cfg(not(feature = "flamegraph"))]
                 timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,

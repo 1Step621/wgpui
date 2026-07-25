@@ -27,6 +27,7 @@ test-support = [
 ]
 inspector = ["gpui_macros/inspector"]
 leak-detection = ["backtrace"]
+flamegraph = ["dep:bincode"]
 
 [lib]
 name = "gpui"
@@ -49,6 +50,7 @@ anyhow = "1.0.86"
 async-task = "4.7"
 arboard = "3.6.1"
 backtrace = { version = "0.3", optional = true }
+bincode = { version = "2", features = ["serde"], optional = true }
 bytemuck = { version = "1.24", features = ["derive"] }
 circular-buffer = "1.0"
 collections = { package = "gpui_collections", version = "0.2.2" }

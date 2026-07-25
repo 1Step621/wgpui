@@ -267,14 +267,6 @@ impl Clone for TestDispatcher {
 }
 
 impl PlatformDispatcher for TestDispatcher {
-    fn get_all_timings(&self) -> Vec<crate::ThreadTaskTimings> {
-        Vec::new()
-    }
-
-    fn get_current_thread_timings(&self) -> Vec<crate::TaskTiming> {
-        Vec::new()
-    }
-
     fn is_main_thread(&self) -> bool {
         self.state.lock().is_main_thread
     }
