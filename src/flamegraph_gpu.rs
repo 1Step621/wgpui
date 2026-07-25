@@ -445,3 +445,98 @@ pub(crate) fn sync_with_active_capture(
         _ => {}
     }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 4: on-demand GPU deep capture (issue #60).
+//
+// `DeepCaptureRecorder`/`DeepCapturePendingReadback` deliberately do not
+// reuse `GpuQueryManager`'s triple-buffered generation array: a deep capture
+// is single-shot and torn down the moment its readback completes (see
+// `flamegraph.rs`'s Phase 4 section doc comment), so there is nothing to
+// triple-buffer -- at most one `DeepCapturePendingReadback` exists at a time,
+// held in `WgpuRenderer::deep_capture`. The *shape* of the readback state
+// machine (record during the frame -> copy into a staging buffer before
+// `encoder.finish()` -> `map_async` after submit -> poll non-blockingly on
+// the render thread every frame until ready -> harvest) is intentionally the
+// same pattern `QueryGeneration` above uses, for the same reason documented
+// in this file's module docs: this device may only safely be polled from the
+// render thread that submits to it.
+//
+// This stage (first commit of Phase 4) wires the arm/fire/teardown lifecycle
+// end-to-end with an intentionally empty command stream and no resource
+// readback -- `WgpuRenderer::draw` doesn't call `record_draw_call` yet, so
+// `finish` always sees zero touched buffers. Real per-draw-call recording and
+// real buffer readback land in the two commits that follow, each replacing
+// one of the two stub bodies below without changing this type's public
+// shape.
+
+/// Accumulates one triggered frame's command stream while `WgpuRenderer::draw`
+/// is recording it. Created fresh by `WgpuRenderer::draw` when
+/// `flamegraph::take_deep_capture_request()` returns true, consumed by
+/// `finish` once the frame's `PrimitiveBatch` loop completes.
+pub(crate) struct DeepCaptureRecorder {
+    draw_calls: Vec<flamegraph::DeepCaptureDrawCall>,
+}
+
+impl DeepCaptureRecorder {
+    pub(crate) fn new() -> Self {
+        Self {
+            draw_calls: Vec::new(),
+        }
+    }
+
+    /// Finish recording and hand off to the readback phase. Must be called
+    /// after the frame's render-pass loop has ended (so `draw_calls` is
+    /// complete) and before `encoder.finish()` (once resource readback lands,
+    /// this will need to record buffer-copy commands into `encoder`).
+    pub(crate) fn finish(self, device: &wgpu::Device) -> DeepCapturePendingReadback {
+        // Stub: no wgpu resources to copy yet, since `draw_calls` never holds
+        // a `buffer_kind` this round. `device` is accepted now so the later
+        // commit that starts creating staging buffers doesn't need to change
+        // this method's call site in `WgpuRenderer::draw`.
+        let _ = device;
+        DeepCapturePendingReadback {
+            draw_calls: self.draw_calls,
+            resources_finalized: true,
+        }
+    }
+}
+
+/// A deep capture's command stream, mid-readback. Held in
+/// `WgpuRenderer::deep_capture` from the frame it was recorded until
+/// `poll` reports the readback complete, at which point `WgpuRenderer::draw`
+/// drops it -- freeing any staging buffers it holds -- and publishes the
+/// result via `flamegraph::complete_deep_capture`.
+pub(crate) struct DeepCapturePendingReadback {
+    draw_calls: Vec<flamegraph::DeepCaptureDrawCall>,
+    resources_finalized: bool,
+}
+
+impl DeepCapturePendingReadback {
+    /// Start any async readback maps. Must be called once, after the encoder
+    /// `finish` recorded copy commands into (once resource readback lands)
+    /// has actually been submitted to the queue -- mirrors
+    /// `GpuQueryManager::begin_readback`'s same ordering requirement.
+    pub(crate) fn begin_readback(&mut self) {
+        // Stub: nothing to map yet.
+    }
+
+    /// Non-blocking poll (mirrors `GpuQueryManager::poll_readback`'s
+    /// same-thread, non-blocking pattern documented at the top of this
+    /// file). Returns the finished [`flamegraph::DeepCapture`] once every
+    /// touched buffer's map has resolved (successfully or not); the caller
+    /// is expected to drop `self` immediately afterward, satisfying "no
+    /// persistent overhead, no persistent buffers" once a capture is done.
+    pub(crate) fn poll(&mut self, device: &wgpu::Device) -> Option<flamegraph::DeepCapture> {
+        // Stub: nothing pending, so this is always immediately "ready" -- the
+        // very next `WgpuRenderer::draw` call after `begin_readback` reaps
+        // it. Once real buffer readback lands, this gates on `map_async`
+        // completion the same way `QueryGeneration::try_harvest` does.
+        let _ = device;
+        Some(flamegraph::DeepCapture {
+            draw_calls: std::mem::take(&mut self.draw_calls),
+            buffer_contents: Vec::new(),
+            resources_finalized: self.resources_finalized,
+        })
+    }
+}

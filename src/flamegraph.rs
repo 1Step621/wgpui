@@ -265,16 +265,26 @@ impl DrawCallCounters {
     }
 }
 
-/// Which `PrimitiveBatch` kind a [`record_draw_call`] call is tallying.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DrawCallKind {
+/// Which `PrimitiveBatch` kind a [`record_draw_call`] call is tallying. `pub`
+/// (not `pub(crate)`) since Phase 4's [`DeepCaptureDrawCall::kind`] field also
+/// uses this type and is itself part of the public `flamegraph` API surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DrawCallKind {
+    /// `PrimitiveBatch::Quads`.
     Quads,
+    /// `PrimitiveBatch::Shadows`.
     Shadows,
+    /// `PrimitiveBatch::MonochromeSprites`.
     MonoSprites,
+    /// `PrimitiveBatch::PolychromeSprites`.
     PolySprites,
+    /// `PrimitiveBatch::Paths`.
     Paths,
+    /// `PrimitiveBatch::Underlines`.
     Underlines,
+    /// `PrimitiveBatch::BackdropFilters`.
     BackdropFilters,
+    /// `PrimitiveBatch::Surfaces`.
     Surfaces,
 }
 
@@ -1500,6 +1510,210 @@ fn frame_capture_memory_usage(frame: &FrameCapture) -> u64 {
         * (core::mem::size_of::<CpuSpan>() as u64);
     let gpu_span_bytes = (frame.gpu_spans.len() as u64) * (core::mem::size_of::<GpuSpan>() as u64);
     core::mem::size_of::<FrameCapture>() as u64 + cpu_span_bytes + gpu_span_bytes
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: on-demand GPU deep capture (issue #60).
+//
+// Everything above this point is the phase 1-3 always-on-capable path: cheap
+// enough (a handful of relaxed atomic loads plus, while a session is
+// recording, some bookkeeping) to leave instrumented in a shipping build.
+// `DeepCapture` is deliberately not part of that path. Reading back full
+// buffer contents is orders of magnitude more expensive than the timestamp
+// pairs `flamegraph_gpu`'s `GpuQueryManager` resolves every frame, so this
+// models a completely separate, single-shot mode: armed explicitly with
+// `request_deep_capture()`, fires once on the very next `WgpuRenderer::draw()`
+// call, and is torn down (its wgpu staging buffers dropped) the moment
+// readback completes. There is no persistent state here beyond one
+// `AtomicBool` (armed?) and one `Mutex<Option<DeepCapture>>` (last completed
+// result) -- the expensive state (staging buffers, in-flight command stream)
+// lives entirely in `flamegraph_gpu::DeepCaptureRecorder` /
+// `DeepCapturePendingReadback`, scoped to `WgpuRenderer` and only allocated
+// while a capture is actually in flight.
+//
+// Resource contents are read back once per touched fixed buffer for the
+// whole captured frame, not once per draw call boundary as a literal reading
+// of "resource contents at time of use" might suggest. This is intentional:
+// every fixed buffer in `WgpuContext` (`quads_buffer`, `shadows_buffer`, ...)
+// is written exactly once per frame, with the *entire* frame's data for that
+// primitive kind, before any draw call reads from it (see
+// `WgpuRenderer::draw`'s `ensure_buffer_size`/`write_buffer` calls, which all
+// happen before the render-pass loop). So a buffer's contents are already
+// identical at every draw call boundary that reads it within one frame --
+// reading it back per call would mean N redundant `map_async` round trips of
+// the same bytes for N draw calls sharing that buffer, for zero additional
+// information. Recording each draw call's `vertex_range`/`instance_range`
+// alongside the once-per-buffer snapshot is exactly as informative (a viewer
+// slices the snapshot using those ranges) at a fraction of the readback cost.
+//
+// Same "no natural path to the data" constraint phases 1-3 kept hitting
+// applies here too: `WgpuContext`'s fixed buffers are `pub(super)` to
+// `platform::cross`, invisible to this module and to `flamegraph_gpu.rs`
+// (neither lives inside that module). Rather than widening that visibility,
+// the buffer-copy commands are recorded from `WgpuRenderer::draw` itself
+// (which already holds live `&wgpu::Buffer` references for its own bind-group
+// setup), and only the resulting `wgpu::Buffer` staging handles/state machine
+// live in `flamegraph_gpu.rs`.
+
+/// Which of `WgpuContext`'s fixed-size resource buffers (`src/platform/cross/
+/// render_context.rs`) fed a [`DeepCaptureDrawCall`]. `Surfaces` batches build
+/// a fresh per-surface uniform buffer on every call rather than reading one of
+/// these shared buffers, so `DeepCaptureDrawCall::buffer_kind` is `None` for
+/// them -- there is deliberately no `Surfaces` variant here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DeepCaptureBufferKind {
+    /// `WgpuContext::quads_buffer`.
+    Quads,
+    /// `WgpuContext::shadows_buffer`.
+    Shadows,
+    /// `WgpuContext::underlines_buffer`.
+    Underlines,
+    /// `WgpuContext::mono_sprites_buffer`.
+    MonoSprites,
+    /// `WgpuContext::poly_sprites_buffer`.
+    PolySprites,
+    /// `WgpuContext::backdrop_filters_buffer`.
+    BackdropFilters,
+    /// `WgpuContext::paths_vertices_buffer`.
+    Paths,
+}
+
+/// One entry in a [`DeepCapture`]'s command stream: full identifying detail
+/// for a single `RenderPass::draw` call recorded during the one triggered
+/// frame, in submission order. Walks the same `PrimitiveBatch` match arms in
+/// `WgpuRenderer::draw` that phase 2's `record_draw_call` already tallies
+/// counts from (see `DrawCallCounters`) -- this is the same call sites,
+/// recording identifying detail instead of just a running total.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeepCaptureDrawCall {
+    /// Position in the command stream, 0-based, in submission order.
+    pub sequence: u32,
+    /// Which `PrimitiveBatch` kind this call issued.
+    pub kind: DrawCallKind,
+    /// The `wgpu::RenderPipeline` label bound for this call (see
+    /// `WgpuPipelines` in `renderer.rs`, e.g. `"quads"`, `"mono_sprites"`).
+    /// Doubles as shader identity per the issue's ask: each `DrawCallKind`
+    /// maps 1:1 to exactly one pipeline/shader module in `WgpuRenderer::draw`,
+    /// so the pipeline label already uniquely identifies the shader.
+    pub pipeline_label: &'static str,
+    /// The render pass this call was recorded into (`"main"`,
+    /// `"main_resumed"`, `"filter_group"`, or `"filter_group_resumed"` --
+    /// see `GpuPassKind`, which this mirrors).
+    pub pass_label: &'static str,
+    /// Vertex range passed to `RenderPass::draw` (start, end).
+    pub vertex_range: (u32, u32),
+    /// Instance range passed to `RenderPass::draw` (start, end).
+    pub instance_range: (u32, u32),
+    /// Number of bind groups set for this call (2-4 depending on kind).
+    pub bind_group_count: u32,
+    /// Which fixed resource buffer (if any) this call's instance/vertex data
+    /// came from; see [`DeepCaptureBufferKind`]'s doc comment for why
+    /// `Surfaces` calls are always `None` here.
+    pub buffer_kind: Option<DeepCaptureBufferKind>,
+    /// `(AtlasTextureKind as u64) << 32 | AtlasTextureId::index`, for sprite
+    /// calls (`MonoSprites`/`PolySprites`); `None` for every other kind.
+    pub atlas_texture_id: Option<u64>,
+}
+
+/// One fixed buffer's full contents at the time of the triggered frame, part
+/// of a [`DeepCapture`]. Read back once per buffer touched by that frame's
+/// command stream -- see the module-level comment above this section for why
+/// once-per-buffer (not once-per-draw-call) is both sufficient and far
+/// cheaper.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeepCaptureBufferContents {
+    /// Which buffer this is.
+    pub kind: DeepCaptureBufferKind,
+    /// Raw bytes copied back from the GPU buffer, from offset 0 through the
+    /// buffer's full `wgpu::Buffer::size()` (which may include unwritten
+    /// tail bytes past what this frame actually wrote -- a viewer should
+    /// slice using the `vertex_range`/`instance_range` recorded on the
+    /// [`DeepCaptureDrawCall`]s that reference this buffer, not assume the
+    /// whole slice is meaningful).
+    pub bytes: Vec<u8>,
+}
+
+/// One on-demand, single-frame "deep capture" (Phase 4 of the profiling
+/// epic, issue #60): the full command stream and fixed-buffer resource
+/// contents for exactly one triggered `WgpuRenderer::draw()` call. See the
+/// module-level comment above this section for the full design rationale and
+/// how this differs from phase 1's always-on [`Capture`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct DeepCapture {
+    /// Every `RenderPass::draw` call issued during the captured frame, in
+    /// submission order.
+    pub draw_calls: Vec<DeepCaptureDrawCall>,
+    /// Full contents of each fixed buffer touched by at least one entry in
+    /// `draw_calls`, one entry per distinct [`DeepCaptureBufferKind`] seen.
+    pub buffer_contents: Vec<DeepCaptureBufferContents>,
+    /// Whether every buffer readback that was attempted actually completed
+    /// successfully. `true` for an empty `draw_calls`/`buffer_contents` (there
+    /// was nothing to read back). `false` if any individual buffer's
+    /// `map_async` reported an error -- that buffer is simply missing from
+    /// `buffer_contents` rather than the whole capture being discarded, so a
+    /// partial result is still usable.
+    pub resources_finalized: bool,
+}
+
+impl DeepCapture {
+    /// The buffer contents recorded for `kind`, if that buffer was touched by
+    /// this capture's command stream and its readback completed.
+    pub fn buffer_contents(&self, kind: DeepCaptureBufferKind) -> Option<&DeepCaptureBufferContents> {
+        self.buffer_contents.iter().find(|contents| contents.kind == kind)
+    }
+}
+
+/// Whether a deep capture has been armed (via [`request_deep_capture`]) but
+/// not yet consumed by a `WgpuRenderer::draw()` call.
+static DEEP_CAPTURE_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// The most recently completed deep capture, if any and if it has not
+/// already been taken by [`take_completed_deep_capture`].
+static COMPLETED_DEEP_CAPTURE: parking_lot::Mutex<Option<DeepCapture>> = parking_lot::Mutex::new(None);
+
+/// Arm a one-shot deep GPU capture: full command stream plus fixed-buffer
+/// resource contents for the very next `WgpuRenderer::draw()` call. Distinct
+/// from [`start_capture`]'s always-on session -- see this module's Phase 4
+/// section doc comment for why full resource readback needs its own,
+/// far-more-expensive, non-persistent path. Independent of whether a phase
+/// 1-3 capture session is currently running: a deep capture can be requested
+/// with or without one active.
+///
+/// Calling this while a deep capture is already armed or actively being read
+/// back is a no-op; the in-flight one is left to finish. Check
+/// [`deep_capture_requested`]/[`take_completed_deep_capture`] if that
+/// distinction matters to the caller.
+pub fn request_deep_capture() {
+    DEEP_CAPTURE_REQUESTED.store(true, Ordering::Release);
+}
+
+/// Whether a deep capture has been requested but not yet started recording.
+/// Does not reflect a capture that has started recording but not finished
+/// readback -- there is no public "in progress" signal this round, only
+/// "requested" and "the last completed result" (see
+/// [`take_completed_deep_capture`]).
+pub fn deep_capture_requested() -> bool {
+    DEEP_CAPTURE_REQUESTED.load(Ordering::Acquire)
+}
+
+/// Consume the pending request, if any, so at most one `WgpuRenderer::draw()`
+/// call starts recording per `request_deep_capture()` call.
+pub(crate) fn take_deep_capture_request() -> bool {
+    DEEP_CAPTURE_REQUESTED.swap(false, Ordering::AcqRel)
+}
+
+/// Publish a finished deep capture, overwriting whatever the previous one
+/// left behind if it was never collected. Called by
+/// `flamegraph_gpu::DeepCapturePendingReadback::poll` once every touched
+/// buffer's readback has resolved (successfully or not).
+pub(crate) fn complete_deep_capture(capture: DeepCapture) {
+    *COMPLETED_DEEP_CAPTURE.lock() = Some(capture);
+}
+
+/// Take the most recently completed deep capture, if any, clearing it so a
+/// second call returns `None` until another capture finishes.
+pub fn take_completed_deep_capture() -> Option<DeepCapture> {
+    COMPLETED_DEEP_CAPTURE.lock().take()
 }
 
 #[cfg(test)]

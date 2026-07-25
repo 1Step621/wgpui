@@ -1506,6 +1506,15 @@ pub struct WgpuRenderer {
     // plain field.
     #[cfg(feature = "flamegraph")]
     gpu_query_manager: parking_lot::Mutex<Option<crate::flamegraph_gpu::GpuQueryManager>>,
+
+    // On-demand GPU deep capture (issue #60). `None` except for the brief
+    // window between a `flamegraph::request_deep_capture()` call firing on a
+    // `draw()` and that capture's resource readback completing a few frames
+    // later -- see `flamegraph_gpu`'s Phase 4 section doc comment for why
+    // this is a completely separate, non-persistent path from
+    // `gpu_query_manager` above rather than sharing its machinery.
+    #[cfg(feature = "flamegraph")]
+    deep_capture: parking_lot::Mutex<Option<crate::flamegraph_gpu::DeepCapturePendingReadback>>,
 }
 
 impl WgpuRenderer {
@@ -1683,6 +1692,8 @@ impl WgpuRenderer {
             layout_version: Arc::new(AtomicU64::new(0)),
             #[cfg(feature = "flamegraph")]
             gpu_query_manager: parking_lot::Mutex::new(None),
+            #[cfg(feature = "flamegraph")]
+            deep_capture: parking_lot::Mutex::new(None),
         })
     }
 
@@ -1741,6 +1752,28 @@ impl WgpuRenderer {
                 command_encoder.write_timestamp(reserved.query_set(), reserved.begin_index());
             }
             reserved
+        };
+
+        // On-demand GPU deep capture (issue #60): harvest any previous deep
+        // capture whose readback has completed (non-blocking, same
+        // render-thread poll pattern as the query manager above), then arm a
+        // new recorder for *this* frame if one was requested and none is
+        // currently in flight. See `flamegraph_gpu`'s Phase 4 section doc
+        // comment for the full lifecycle this participates in.
+        #[cfg(feature = "flamegraph")]
+        let mut deep_capture_recorder: Option<crate::flamegraph_gpu::DeepCaptureRecorder> = {
+            let mut guard = self.deep_capture.lock();
+            if let Some(pending) = guard.as_mut()
+                && let Some(capture) = pending.poll(&self.context.device)
+            {
+                crate::flamegraph::complete_deep_capture(capture);
+                *guard = None;
+            }
+            if guard.is_none() && crate::flamegraph::take_deep_capture_request() {
+                Some(crate::flamegraph_gpu::DeepCaptureRecorder::new())
+            } else {
+                None
+            }
         };
 
         self.atlas.before_frame(&mut command_encoder);
@@ -2658,6 +2691,16 @@ impl WgpuRenderer {
             }
         }
 
+        // On-demand GPU deep capture (issue #60): if this frame was armed for
+        // recording, hand off from `DeepCaptureRecorder` to
+        // `DeepCapturePendingReadback` now -- while `finish` still has a
+        // chance to record any buffer-copy commands into `command_encoder`,
+        // before it's finished below.
+        #[cfg(feature = "flamegraph")]
+        let deep_capture_pending = deep_capture_recorder
+            .take()
+            .map(|recorder| recorder.finish(&self.context.device));
+
         log::debug!("Renderer::draw: submitting command buffer");
         self.context.queue.submit(Some(command_encoder.finish()));
         log::debug!("Renderer::draw: presenting surface");
@@ -2671,6 +2714,19 @@ impl WgpuRenderer {
             if let Some(manager) = guard.as_mut() {
                 manager.begin_readback();
             }
+        }
+
+        // Start this frame's deep-capture readback (if one was armed) now
+        // that its buffer-copy commands, if any, have actually been
+        // submitted, and hand it off to `self.deep_capture` so future
+        // `draw()` calls poll it to completion. Overwrites (rather than
+        // stacking on top of) any prior in-flight deep capture, but that
+        // can't happen in practice: the arm step above only creates a new
+        // recorder when `self.deep_capture` is `None`.
+        #[cfg(feature = "flamegraph")]
+        if let Some(mut pending) = deep_capture_pending {
+            pending.begin_readback();
+            *self.deep_capture.lock() = Some(pending);
         }
 
         log::debug!("Renderer::draw: frame complete");
