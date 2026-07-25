@@ -1,4 +1,4 @@
-use crate::{App, PlatformDispatcher, RunnableMeta, RunnableVariant, TaskTiming, profiler};
+use crate::{App, PlatformDispatcher, RunnableMeta, RunnableVariant};
 use async_task::Runnable;
 use futures::channel::mpsc;
 use parking_lot::{Condvar, Mutex};
@@ -182,6 +182,50 @@ type AnyLocalFuture<R> = Pin<Box<dyn 'static + Future<Output = R>>>;
 
 type AnyFuture<R> = Pin<Box<dyn 'static + Send + Future<Output = R>>>;
 
+/// Wraps a background task's future with a `BackgroundTask` flamegraph span
+/// bracketing each individual `poll()` call. `AnyFuture<R>` is a boxed, pinned
+/// trait object and is therefore always `Unpin`, so no structural pinning is
+/// needed to poll the wrapped future.
+#[cfg(feature = "flamegraph")]
+struct InstrumentedFuture<R> {
+    inner: AnyFuture<R>,
+    location: &'static Location<'static>,
+}
+
+#[cfg(feature = "flamegraph")]
+impl<R> Future for InstrumentedFuture<R> {
+    type Output = R;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let _span = crate::enter_span(
+            crate::SpanName::Static("BackgroundTask"),
+            crate::SpanCategory::BackgroundTask,
+            Some(crate::ElementAttribution {
+                type_name: "BackgroundTask",
+                global_id_hash: 0,
+                source_location: Some((self.location.file(), self.location.line())),
+            }),
+        );
+        self.inner.as_mut().poll(cx)
+    }
+}
+
+#[cfg(feature = "flamegraph")]
+fn instrument_background_future<R: Send + 'static>(
+    future: AnyFuture<R>,
+    location: &'static Location<'static>,
+) -> AnyFuture<R> {
+    Box::pin(InstrumentedFuture { inner: future, location })
+}
+
+#[cfg(not(feature = "flamegraph"))]
+fn instrument_background_future<R: Send + 'static>(
+    future: AnyFuture<R>,
+    _location: &'static Location<'static>,
+) -> AnyFuture<R> {
+    future
+}
+
 /// BackgroundExecutor lets you run things on background threads.
 /// In production this is a thread pool with no ordering guarantees.
 /// In tests this is simulated by running tasks one by one in a deterministic
@@ -293,28 +337,24 @@ impl BackgroundExecutor {
         priority: Priority,
     ) -> Task<R> {
         let dispatcher = self.dispatcher.clone();
+        let location = core::panic::Location::caller();
+        // Wrapping the future itself (rather than the `Runnable::run()` call site)
+        // instruments background task CPU time uniformly across every dispatch
+        // path: the realtime dedicated-thread loop below, the default-priority
+        // path (whose `runnable.run()` call happens inside the external
+        // `priority-threadpool` crate, which we cannot instrument directly), and
+        // main-thread-dispatched runnables drained in `platform.rs`. Each
+        // `Runnable::run()` performs exactly one `poll()`, so bracketing every
+        // poll call is equivalent to timing every `run()` call.
+        let future = instrument_background_future(future, location);
         let (runnable, task) = if let Priority::Realtime(realtime) = priority {
-            let location = core::panic::Location::caller();
-            let (mut tx, rx) = flume::bounded::<Runnable<RunnableMeta>>(1);
+            let (tx, rx) = flume::bounded::<Runnable<RunnableMeta>>(1);
 
             dispatcher.spawn_realtime(
                 realtime,
                 Box::new(move || {
                     while let Ok(runnable) = rx.recv() {
-                        let start = Instant::now();
-                        let location = runnable.metadata().location;
-                        let mut timing = TaskTiming {
-                            location,
-                            start,
-                            end: None,
-                        };
-                        profiler::add_task_timing(timing);
-
                         runnable.run();
-
-                        let end = Instant::now();
-                        timing.end = Some(end);
-                        profiler::add_task_timing(timing);
                     }
                 }),
             );
@@ -328,7 +368,6 @@ impl BackgroundExecutor {
                     },
                 )
         } else {
-            let location = core::panic::Location::caller();
             async_task::Builder::new()
                 .metadata(RunnableMeta { location })
                 .spawn(
