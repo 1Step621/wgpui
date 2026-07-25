@@ -391,10 +391,9 @@ impl Capture {
             let mean_ms = (total_duration_ns as f64 / frame_count as f64) / 1.0e6;
             let max_ms = max_duration_ns as f64 / 1.0e6;
 
-            let fps = if frame_count >= 2 {
-                // SAFETY of the unwraps: `frame_count >= 2` guarantees both ends exist.
-                let first = self.frames.front().expect("frame_count >= 2");
-                let last = self.frames.back().expect("frame_count >= 2");
+            let fps = if let (Some(first), Some(last)) = (self.frames.front(), self.frames.back())
+                && frame_count >= 2
+            {
                 let span_ns = last.frame_end_ns.saturating_sub(first.frame_start_ns);
                 if span_ns > 0 {
                     ((frame_count - 1) as f64) / (span_ns as f64 / 1.0e9)
@@ -1605,9 +1604,10 @@ mod tests {
         assert_eq!(summary.events.input_events_dispatched, MeanMax { mean: 2.0, max: 3 });
         assert_eq!(summary.full_draw_frame_count, 3);
         assert_eq!(summary.fast_path_frame_count, 2);
-        // Exercised for coverage; not asserted precisely since it depends on
-        // wall-clock timing between the frames recorded above.
-        let _ = summary.fps;
+        // Not asserted against a precise value since it depends on wall-clock
+        // timing between the frames recorded above, but it should always be
+        // finite and non-negative.
+        assert!(summary.fps.is_finite() && summary.fps >= 0.0, "fps was {}", summary.fps);
 
         let mut buffer = Vec::new();
         capture.export_trace(&mut buffer).expect("export_trace should succeed");
