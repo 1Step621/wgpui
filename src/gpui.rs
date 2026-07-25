@@ -22,6 +22,8 @@ mod elements;
 mod executor;
 #[cfg(feature = "flamegraph")]
 mod flamegraph;
+#[cfg(feature = "flamegraph")]
+mod flamegraph_gpu;
 mod geometry;
 mod global;
 mod input;

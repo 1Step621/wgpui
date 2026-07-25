@@ -398,6 +398,18 @@ pub(crate) fn active_capture_wants_gpu() -> bool {
         .unwrap_or(false)
 }
 
+/// The most recently opened CPU-side frame index, used by `flamegraph_gpu` to
+/// tag a `GpuQueryManager` generation with the frame it belongs to. See the
+/// doc comment on `CaptureState::last_opened_frame_index` for why this is
+/// safe to read this way instead of threading a frame index through
+/// `PlatformWindow::draw`.
+pub(crate) fn current_gpu_correlation_frame_index() -> Option<u64> {
+    ACTIVE_CAPTURE.lock().as_ref().and_then(|state| {
+        let index = state.last_opened_frame_index.load(Ordering::Acquire);
+        (index != u64::MAX).then_some(index)
+    })
+}
+
 /// Attach resolved GPU spans to the frame they belong to, if that frame is
 /// still held by the active capture's ring buffer (it may have been evicted
 /// already, given GPU readback latency of 1-2 frames).
@@ -449,6 +461,17 @@ struct CaptureState {
     max_frames: usize,
     capture_gpu: bool,
     next_frame_index: AtomicU64,
+    /// The most recently opened frame's index, or `u64::MAX` if none has been
+    /// opened yet. `flamegraph_gpu`'s `GpuQueryManager` reads this (via
+    /// `current_gpu_correlation_frame_index`) to tag its own timestamp-query
+    /// generation with the CPU-side frame it belongs to, rather than needing
+    /// a frame index threaded through the `PlatformWindow::draw` trait. This
+    /// relies on GPUI's single-foreground-thread draw model (AGENTS.md: "All
+    /// use of entities and UI rendering occurs on a single foreground
+    /// thread."): `Window::draw` opens a frame and, still on that thread,
+    /// synchronously drives rendering down into `WgpuRenderer::draw` before
+    /// any other frame can be opened.
+    last_opened_frame_index: AtomicU64,
     open_frames: parking_lot::Mutex<HashMap<u64, OpenFrame>>,
     finished_frames: parking_lot::Mutex<VecDeque<FrameCapture>>,
     /// Background-thread spans drained but not yet claimed by a frame window.
@@ -463,6 +486,7 @@ impl CaptureState {
             max_frames: options.max_frames.max(1),
             capture_gpu: options.capture_gpu,
             next_frame_index: AtomicU64::new(0),
+            last_opened_frame_index: AtomicU64::new(u64::MAX),
             open_frames: parking_lot::Mutex::new(HashMap::new()),
             finished_frames: parking_lot::Mutex::new(VecDeque::new()),
             pending_background_spans: parking_lot::Mutex::new(Vec::new()),
@@ -475,6 +499,7 @@ impl CaptureState {
 
     fn open_frame(&self, window_id: u64) -> u64 {
         let frame_index = self.next_frame_index.fetch_add(1, Ordering::Relaxed);
+        self.last_opened_frame_index.store(frame_index, Ordering::Release);
         self.open_frames.lock().insert(
             frame_index,
             OpenFrame {
@@ -662,6 +687,13 @@ impl Drop for SpanGuard {
 
 fn active_capture_anchor() -> Option<Instant> {
     ACTIVE_CAPTURE.lock().as_ref().map(|state| state.anchor)
+}
+
+/// The active capture's CPU clock anchor, in the same `Instant` used to
+/// compute `CpuSpan::start_ns`. `flamegraph_gpu` uses this during calibration
+/// so `GpuSpan::start_ns` lands on the same timeline as CPU spans.
+pub(crate) fn capture_anchor() -> Option<Instant> {
+    active_capture_anchor()
 }
 
 /// Open a new CPU span. Returns a [`SpanGuard`] whose `Drop` closes the span.
