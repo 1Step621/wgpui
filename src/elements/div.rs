@@ -1889,6 +1889,14 @@ impl Interactivity {
 
                 let style = self.compute_style_internal(hitbox, element_state.as_mut(), window, cx);
 
+                // Phase 5 (issue #61): record this element's final, hover/
+                // focus/drag-inclusive resolved style for an in-progress
+                // UI-tree capture, if one is armed and this element has a
+                // stable id to join it onto. A no-op when no capture is
+                // recording -- see `flamegraph_ui_capture::record_element_style`.
+                #[cfg(feature = "flamegraph")]
+                crate::record_element_style(global_id, &style);
+
                 #[cfg(any(feature = "test-support", test))]
                 if let Some(debug_selector) = &self.debug_selector {
                     window

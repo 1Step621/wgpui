@@ -43,8 +43,6 @@ use std::{
     mem, panic,
     sync::Arc,
 };
-#[cfg(feature = "flamegraph")]
-use std::hash::{Hash, Hasher};
 
 /// Implemented by types that participate in laying out and painting the contents of a window.
 /// Elements form a tree and are laid out according to web-based layout rules, as implemented by Taffy.
@@ -356,13 +354,7 @@ fn flamegraph_element_attribution<E: Element>(
         return None;
     }
 
-    let global_id_hash = global_id
-        .map(|id| {
-            let mut hasher = seahash::SeaHasher::new();
-            id.hash(&mut hasher);
-            hasher.finish()
-        })
-        .unwrap_or(0);
+    let global_id_hash = global_id.map(crate::hash_global_element_id).unwrap_or(0);
     let source_location = inspector_id.map(|id| {
         let location = id.path.source_location;
         (location.file(), location.line())
@@ -467,6 +459,14 @@ impl<E: Element> Drawable<E> {
                     crate::SpanCategory::ElementPrepaint,
                     flamegraph_element_attribution::<E>(global_id.as_ref(), inspector_id.as_ref()),
                 );
+                // Phase 5 (issue #61): record this element's tree-structure entry
+                // (type, id hash, depth, resolved layout bounds) for an
+                // in-progress UI-tree capture, if one is armed. A no-op guard
+                // when no capture is recording -- see
+                // `flamegraph_ui_capture::record_element_prepaint`'s doc comment.
+                #[cfg(feature = "flamegraph")]
+                let _ui_tree_capture_guard =
+                    crate::record_element_prepaint::<E>(global_id.as_ref(), bounds);
 
                 let prepaint = self.element.prepaint(
                     global_id.as_ref(),

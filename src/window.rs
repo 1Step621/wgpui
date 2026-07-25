@@ -2305,7 +2305,19 @@ impl Window {
                 self.rendered_frame.input_handlers.push(Some(input_handler));
             }
         }
+        // Phase 5 (issue #61): consume an armed UI-tree capture request and
+        // start recording, but only on the path that is actually about to
+        // draw -- a skipped draw has no elements to record, so the request
+        // is left armed for a future frame instead of being silently
+        // consumed here. See `flamegraph_ui_capture::request_ui_tree_capture`.
+        #[cfg(feature = "flamegraph")]
+        let mut ui_tree_capture_guard = None;
         if !cx.mode.skip_drawing() {
+            #[cfg(feature = "flamegraph")]
+            {
+                ui_tree_capture_guard = crate::maybe_begin_capture(self.handle.id.as_u64());
+            }
+
             self.draw_roots(cx);
 
             #[cfg(any(feature = "inspector", debug_assertions))]
@@ -2340,6 +2352,16 @@ impl Window {
         self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
         self.next_frame.finish(&mut self.rendered_frame);
+
+        // Phase 5 (issue #61): `next_frame.scene` is now sorted/finished for
+        // this draw -- the exact "paint primitive list handed to the
+        // renderer" the capture wants. Deep-copy it now, before the swap
+        // below hands it to `present`/the renderer and the next frame
+        // overwrites it.
+        #[cfg(feature = "flamegraph")]
+        if let Some(guard) = ui_tree_capture_guard.take() {
+            crate::finish_capture(guard, &self.next_frame.scene, self.scale_factor());
+        }
 
         self.invalidator.set_phase(DrawPhase::Focus);
         let previous_focus_path = self.rendered_frame.focus_path();
