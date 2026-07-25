@@ -26,6 +26,8 @@ mod flamegraph;
 mod flamegraph_gpu;
 #[cfg(feature = "flamegraph")]
 mod flamegraph_ui_capture;
+#[cfg(feature = "flamegraph")]
+mod flamegraph_replay;
 mod geometry;
 mod global;
 mod input;
@@ -100,6 +102,8 @@ pub use platform::cross::render_context::WgpuOptions;
 pub use flamegraph::*;
 #[cfg(feature = "flamegraph")]
 pub use flamegraph_ui_capture::*;
+#[cfg(feature = "flamegraph")]
+pub use flamegraph_replay::*;
 pub(crate) use queue::{PriorityQueueReceiver, PriorityQueueSender};
 pub use refineable::*;
 pub use scene::*;
