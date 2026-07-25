@@ -55,9 +55,8 @@ pub use conditional::*;
 #[cfg(any(feature = "inspector", debug_assertions))]
 mod conditional {
     use crate::{
-        AnyElement, App, Bounds, Context, Empty, GlobalElementId, InspectorElementId,
-        InspectorElementPath, IntoElement, Pixels, Render, SharedString, Window,
-        px, rems,
+        AnyElement, App, Bounds, Context, Empty, GlobalElementId, InspectorElementId, IntoElement,
+        Pixels, Render, SharedString, Window, px, rems,
     };
     use collections::FxHashMap;
     use std::any::{Any, TypeId};
