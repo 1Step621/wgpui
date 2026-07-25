@@ -136,13 +136,27 @@ impl WgpuContext {
             mapped_at_creation: false,
         });
 
+        // Phase 4 of the profiling epic (issue #60/#71) reads these seven
+        // fixed buffers back via `copy_buffer_to_buffer` during a triggered
+        // GPU deep capture (see `DeepCaptureBufferKind`), which requires
+        // `COPY_SRC` on the source buffer or wgpu's validator rejects the
+        // encoder outright -- not a soft failure, a hard panic on the first
+        // frame a capture is armed. Add it only when the capture code that
+        // actually needs it is compiled in, so a non-`flamegraph` build's
+        // buffers are byte-for-byte the same as before this fix.
+        #[cfg(feature = "flamegraph")]
+        let deep_capture_readback = wgpu::BufferUsages::COPY_SRC;
+        #[cfg(not(feature = "flamegraph"))]
+        let deep_capture_readback = wgpu::BufferUsages::empty();
+
         let quads_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Quads Buffer"),
             // TODO(mdeand): Determine appropriate size
             size: 8 * 1024 * 1024, // 1 MB buffer for quads, for now. (:
             usage: wgpu::BufferUsages::VERTEX
                 | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::STORAGE,
+                | wgpu::BufferUsages::STORAGE
+                | deep_capture_readback,
             mapped_at_creation: false,
         });
 
@@ -152,7 +166,8 @@ impl WgpuContext {
             size: 8 * 1024 * 1024,
             usage: wgpu::BufferUsages::VERTEX
                 | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::STORAGE,
+                | wgpu::BufferUsages::STORAGE
+                | deep_capture_readback,
             mapped_at_creation: false,
         });
 
@@ -161,7 +176,8 @@ impl WgpuContext {
             size: 8 * 1024 * 1024,
             usage: wgpu::BufferUsages::VERTEX
                 | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::STORAGE,
+                | wgpu::BufferUsages::STORAGE
+                | deep_capture_readback,
             mapped_at_creation: false,
         });
 
@@ -170,7 +186,8 @@ impl WgpuContext {
             size: 8 * 1024 * 1024,
             usage: wgpu::BufferUsages::VERTEX
                 | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::STORAGE,
+                | wgpu::BufferUsages::STORAGE
+                | deep_capture_readback,
             mapped_at_creation: false,
         });
 
@@ -179,7 +196,8 @@ impl WgpuContext {
             size: 8 * 1024 * 1024,
             usage: wgpu::BufferUsages::VERTEX
                 | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::STORAGE,
+                | wgpu::BufferUsages::STORAGE
+                | deep_capture_readback,
             mapped_at_creation: false,
         });
 
@@ -188,14 +206,15 @@ impl WgpuContext {
             size: 8 * 1024 * 1024,
             usage: wgpu::BufferUsages::VERTEX
                 | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::STORAGE,
+                | wgpu::BufferUsages::STORAGE
+                | deep_capture_readback,
             mapped_at_creation: false,
         });
 
         let paths_vertices_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Path Vertices Buffer"),
             size: 8 * 1024 * 1024, // 8 MB – ~174 k vertices @ 48 bytes each
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | deep_capture_readback,
             mapped_at_creation: false,
         });
 
@@ -307,20 +326,91 @@ pub(super) fn ensure_buffer_size(
 
 #[cfg(all(test, feature = "flamegraph"))]
 mod tests {
-    use super::texel_size;
+    use super::{WgpuContext, WgpuOptions, texel_size};
 
     // `texture_memory_bytes`/atlas/surface-registry memory accounting all
     // ultimately reduce to `texel_size`, and that's the one piece testable
     // without a real `wgpu::Device` (`wgpu::TextureFormat` is a plain enum,
-    // no adapter/device required) -- this crate has no headless-GPU test
-    // fixture, so the buffer/texture-size accessors that need a live device
-    // (`WgpuContext::fixed_buffer_memory_usage`, `WgpuAtlas::memory_usage`,
-    // `SurfaceRegistry::memory_usage`) aren't covered by an automated test.
+    // no adapter/device required).
     #[test]
     fn texel_size_matches_known_format_sizes() {
         assert_eq!(texel_size(wgpu::TextureFormat::R8Unorm), 1);
         assert_eq!(texel_size(wgpu::TextureFormat::Rgba8Unorm), 4);
         assert_eq!(texel_size(wgpu::TextureFormat::Bgra8UnormSrgb), 4);
         assert_eq!(texel_size(wgpu::TextureFormat::Rgba16Float), 8);
+    }
+
+    // Regression test for a real crash: phase 4's own `finish_and_poll_...`
+    // test in `flamegraph_gpu.rs` proved the *readback logic* works, but it
+    // built its own throwaway source buffer with `COPY_SRC` set explicitly --
+    // it never exercised these seven *actual* fixed buffers this file
+    // creates, so it couldn't have caught (and didn't catch) that they were
+    // missing `COPY_SRC` until this fix. That gap let a `copy_buffer_to_buffer`
+    // from any of them hard-panic the whole app the first time a deep capture
+    // ran, in any real (non-test) binary. This test goes through the real
+    // `WgpuContext::new` construction path -- the actual bug location -- and
+    // uses a push/pop error scope (rather than relying on `wgpu`'s default
+    // uncaptured-error handler, which is what panicked in the field) so a
+    // regression here fails the assertion cleanly instead of aborting the
+    // test process.
+    #[test]
+    fn fixed_buffers_created_with_flamegraph_feature_support_copy_buffer_to_buffer_readback() {
+        let Ok(context) = WgpuContext::new(&WgpuOptions::default()) else {
+            eprintln!(
+                "skipping fixed_buffers_created_with_flamegraph_feature_support_copy_buffer_to_buffer_readback: no wgpu adapter available in this environment"
+            );
+            return;
+        };
+
+        let buffers: [(&str, &std::sync::Mutex<wgpu::Buffer>); 6] = [
+            ("quads_buffer", &context.quads_buffer),
+            ("shadows_buffer", &context.shadows_buffer),
+            ("underlines_buffer", &context.underlines_buffer),
+            ("mono_sprites_buffer", &context.mono_sprites_buffer),
+            ("poly_sprites_buffer", &context.poly_sprites_buffer),
+            ("backdrop_filters_buffer", &context.backdrop_filters_buffer),
+        ];
+
+        for (label, buffer) in buffers {
+            assert_copy_buffer_to_buffer_read_accepted(&context, label, buffer);
+        }
+
+        // `paths_vertices_buffer` uses `STORAGE | COPY_DST` (no `VERTEX`) as its
+        // base usage, so it's checked separately rather than folded into the
+        // array above (which assumes the six `VERTEX`-based buffers' uniform
+        // shape) -- still the same `deep_capture_readback` flag, same bug class.
+        assert_copy_buffer_to_buffer_read_accepted(
+            &context,
+            "paths_vertices_buffer",
+            &context.paths_vertices_buffer,
+        );
+    }
+
+    fn assert_copy_buffer_to_buffer_read_accepted(
+        context: &WgpuContext,
+        label: &str,
+        buffer: &std::sync::Mutex<wgpu::Buffer>,
+    ) {
+        let error_scope = context.device.push_error_scope(wgpu::ErrorFilter::Validation);
+
+        let source = buffer.lock().expect("fixed buffer mutex should not be poisoned");
+        let staging = context.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("regression_test_staging_buffer"),
+            size: source.size(),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = context
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.copy_buffer_to_buffer(&source, 0, &staging, 0, source.size());
+        drop(source);
+        context.queue.submit(Some(encoder.finish()));
+
+        let error = pollster::block_on(error_scope.pop());
+        assert!(
+            error.is_none(),
+            "{label} should accept a copy_buffer_to_buffer read (COPY_SRC), got: {error:?}"
+        );
     }
 }
