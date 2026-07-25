@@ -372,7 +372,7 @@ pub fn placeholder_checkerboard_rgba(width: u32, height: u32, cell: u32) -> Vec<
     const DARK: [u8; 4] = [120, 120, 120, 255];
     for y in 0..height {
         for x in 0..width {
-            let checker = ((x / cell) + (y / cell)) % 2 == 0;
+            let checker = ((x / cell) + (y / cell)).is_multiple_of(2);
             pixels.extend_from_slice(if checker { &LIGHT } else { &DARK });
         }
     }
