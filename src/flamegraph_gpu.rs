@@ -28,7 +28,10 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use crate::flamegraph::{self, GpuClockCalibration, GpuPassKind, GpuSpan, SpanName};
+use crate::flamegraph::{
+    self, DeepCaptureBufferKind, DeepCaptureDrawCall, DrawCallKind, GpuClockCalibration, GpuPassKind, GpuSpan,
+    SpanName,
+};
 
 /// Timestamp-pair budget per frame: main/main_resumed/up to 4 nested filter
 /// groups + resumes/fast_surface_blit, with headroom, plus the whole-encoder
@@ -475,14 +478,57 @@ pub(crate) fn sync_with_active_capture(
 /// `flamegraph::take_deep_capture_request()` returns true, consumed by
 /// `finish` once the frame's `PrimitiveBatch` loop completes.
 pub(crate) struct DeepCaptureRecorder {
-    draw_calls: Vec<flamegraph::DeepCaptureDrawCall>,
+    draw_calls: Vec<DeepCaptureDrawCall>,
+    /// Distinct `DeepCaptureBufferKind`s seen across `draw_calls` so far, in
+    /// first-seen order. Small (at most 7 possible kinds) so a linear-scan
+    /// `contains` check on every `record_draw_call` is cheaper than a
+    /// `HashSet` and avoids pulling in a hasher for something this size.
+    touched_buffers: Vec<DeepCaptureBufferKind>,
 }
 
 impl DeepCaptureRecorder {
     pub(crate) fn new() -> Self {
         Self {
             draw_calls: Vec::new(),
+            touched_buffers: Vec::new(),
         }
+    }
+
+    /// Record one `RenderPass::draw` call's full identifying detail. Called
+    /// from every `PrimitiveBatch` match arm in `WgpuRenderer::draw` that
+    /// phase 2's `record_draw_call` (a different, counter-only function of
+    /// the same name in `flamegraph.rs`) already instruments -- same call
+    /// sites, recording detail instead of just a running tally.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_draw_call(
+        &mut self,
+        kind: DrawCallKind,
+        pipeline_label: &'static str,
+        pass_label: &'static str,
+        vertex_range: std::ops::Range<u32>,
+        instance_range: std::ops::Range<u32>,
+        bind_group_count: u32,
+        buffer_kind: Option<DeepCaptureBufferKind>,
+        atlas_texture_id: Option<u64>,
+    ) {
+        if let Some(buffer_kind) = buffer_kind
+            && !self.touched_buffers.contains(&buffer_kind)
+        {
+            self.touched_buffers.push(buffer_kind);
+        }
+
+        let sequence = self.draw_calls.len() as u32;
+        self.draw_calls.push(DeepCaptureDrawCall {
+            sequence,
+            kind,
+            pipeline_label,
+            pass_label,
+            vertex_range: (vertex_range.start, vertex_range.end),
+            instance_range: (instance_range.start, instance_range.end),
+            bind_group_count,
+            buffer_kind,
+            atlas_texture_id,
+        });
     }
 
     /// Finish recording and hand off to the readback phase. Must be called
@@ -490,11 +536,13 @@ impl DeepCaptureRecorder {
     /// complete) and before `encoder.finish()` (once resource readback lands,
     /// this will need to record buffer-copy commands into `encoder`).
     pub(crate) fn finish(self, device: &wgpu::Device) -> DeepCapturePendingReadback {
-        // Stub: no wgpu resources to copy yet, since `draw_calls` never holds
-        // a `buffer_kind` this round. `device` is accepted now so the later
-        // commit that starts creating staging buffers doesn't need to change
-        // this method's call site in `WgpuRenderer::draw`.
+        // Stub: resource readback lands in the next commit. `device` is
+        // accepted now so that commit doesn't need to change this method's
+        // call site in `WgpuRenderer::draw`. `touched_buffers` is already
+        // tracked above so the real `finish` only needs to add the
+        // buffer-copy/staging logic, not any new bookkeeping.
         let _ = device;
+        let _ = &self.touched_buffers;
         DeepCapturePendingReadback {
             draw_calls: self.draw_calls,
             resources_finalized: true,
