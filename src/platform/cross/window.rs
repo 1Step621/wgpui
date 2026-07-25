@@ -452,6 +452,14 @@ impl PlatformWindow for CrossWindow {
         self.0.sprite_atlas.clone()
     }
 
+    #[cfg(feature = "flamegraph")]
+    fn gpu_memory_snapshot(&self) -> Option<crate::GpuMemorySnapshot> {
+        self.0
+            .renderer
+            .get()
+            .map(|renderer| renderer.borrow().gpu_memory_snapshot())
+    }
+
     fn gpu_specs(&self) -> Option<crate::GpuSpecs> {
         // TODO(mdeand): Retrieve GPU specs from the graphics context.
         None

@@ -413,6 +413,61 @@ pub(crate) struct LineLayoutIndex {
     wrapped_lines_index: usize,
 }
 
+/// Approximate heap bytes held by one [`CacheKey`]: the cached text plus its
+/// font runs. Ignores allocator overhead/`HashMap` bucket cost -- a rough
+/// "how much is this cache holding" estimate, not an exact accounting.
+#[cfg(feature = "flamegraph")]
+fn cache_key_memory_usage(key: &CacheKey) -> u64 {
+    core::mem::size_of::<CacheKey>() as u64
+        + (key.text.len() as u64)
+        + (key.runs.len() as u64) * (core::mem::size_of::<FontRun>() as u64)
+}
+
+/// Approximate heap bytes held by one [`LineLayout`]: its shaped runs and
+/// their glyphs.
+#[cfg(feature = "flamegraph")]
+fn line_layout_memory_usage(layout: &LineLayout) -> u64 {
+    let runs_bytes: u64 = layout
+        .runs
+        .iter()
+        .map(|run| {
+            core::mem::size_of::<ShapedRun>() as u64
+                + (run.glyphs.len() as u64) * (core::mem::size_of::<ShapedGlyph>() as u64)
+        })
+        .sum();
+    core::mem::size_of::<LineLayout>() as u64 + runs_bytes
+}
+
+/// Approximate heap bytes held by one [`WrappedLineLayout`]: its own wrap
+/// boundaries plus the unwrapped `LineLayout` it wraps.
+#[cfg(feature = "flamegraph")]
+fn wrapped_line_layout_memory_usage(layout: &WrappedLineLayout) -> u64 {
+    core::mem::size_of::<WrappedLineLayout>() as u64
+        + line_layout_memory_usage(&layout.unwrapped_layout)
+        + (layout.wrap_boundaries.len() as u64) * (core::mem::size_of::<WrapBoundary>() as u64)
+}
+
+/// Approximate heap bytes held by one [`FrameCache`] (either the current or
+/// previous frame's half of a [`LineLayoutCache`]).
+#[cfg(feature = "flamegraph")]
+fn frame_cache_memory_usage(frame: &FrameCache) -> u64 {
+    let lines_bytes: u64 = frame
+        .lines
+        .iter()
+        .map(|(key, layout)| cache_key_memory_usage(key) + line_layout_memory_usage(layout))
+        .sum();
+    let wrapped_bytes: u64 = frame
+        .wrapped_lines
+        .iter()
+        .map(|(key, layout)| cache_key_memory_usage(key) + wrapped_line_layout_memory_usage(layout))
+        .sum();
+    // `used_lines`/`used_wrapped_lines` hold `Arc` clones of keys already
+    // counted above; only the pointer-sized `Vec` slot itself is additional.
+    let index_bytes = ((frame.used_lines.len() + frame.used_wrapped_lines.len()) as u64)
+        * (core::mem::size_of::<Arc<CacheKey>>() as u64);
+    lines_bytes + wrapped_bytes + index_bytes
+}
+
 impl LineLayoutCache {
     pub fn new(platform_text_system: Arc<dyn PlatformTextSystem>) -> Self {
         Self {
@@ -467,6 +522,18 @@ impl LineLayoutCache {
         curr_frame.wrapped_lines.clear();
         curr_frame.used_lines.clear();
         curr_frame.used_wrapped_lines.clear();
+    }
+
+    /// Approximate heap bytes retained by this cache right now, across both
+    /// the current and previous frame's entries (the cache keeps one frame
+    /// of history so unchanged lines survive a redraw without being
+    /// re-shaped; both halves are live memory). Part of `MemorySnapshot`'s
+    /// `text_system.shaped_line_cache_bytes` field (Phase 3 of the profiling
+    /// epic, issue #59). This walks every cached entry rather than tracking a
+    /// running total, since it's only called on demand, not per-frame.
+    #[cfg(feature = "flamegraph")]
+    pub(crate) fn memory_usage(&self) -> u64 {
+        frame_cache_memory_usage(&self.previous_frame.lock()) + frame_cache_memory_usage(&self.current_frame.read())
     }
 
     pub fn layout_wrapped_line<Text>(

@@ -229,6 +229,59 @@ impl WgpuContext {
     }
 }
 
+impl WgpuContext {
+    /// Sum of every fixed-size buffer's `wgpu::Buffer::size()` (Phase 3 of
+    /// the profiling epic, issue #59). A poisoned mutex (meaning some other
+    /// thread already panicked while holding it) is treated as contributing
+    /// zero rather than panicking here too -- a memory query should never
+    /// itself be the thing that brings down an already-degraded process.
+    #[cfg(feature = "flamegraph")]
+    pub(crate) fn fixed_buffer_memory_usage(&self) -> u64 {
+        self.globals_buffer.size()
+            + self.color_adjustments_buffer.size()
+            + buffer_size_or_zero(&self.quads_buffer)
+            + buffer_size_or_zero(&self.shadows_buffer)
+            + buffer_size_or_zero(&self.backdrop_filters_buffer)
+            + buffer_size_or_zero(&self.underlines_buffer)
+            + buffer_size_or_zero(&self.mono_sprites_buffer)
+            + buffer_size_or_zero(&self.poly_sprites_buffer)
+            + buffer_size_or_zero(&self.paths_vertices_buffer)
+    }
+}
+
+#[cfg(feature = "flamegraph")]
+fn buffer_size_or_zero(buffer: &Mutex<wgpu::Buffer>) -> u64 {
+    buffer.lock().map(|guard| guard.size()).unwrap_or(0)
+}
+
+/// Bytes per texel for `format`, for GPU memory accounting (Phase 3 of the
+/// profiling epic, issue #59). Falls back to 4 (the size of every format
+/// WGPUI actually creates textures with) for the handful of combined
+/// depth/stencil formats where `block_copy_size` needs an aspect to answer
+/// -- none of WGPUI's own textures use those formats, so this only matters
+/// for correctness-in-principle, not any real texture this crate creates.
+#[cfg(feature = "flamegraph")]
+pub(super) fn texel_size(format: wgpu::TextureFormat) -> u64 {
+    format.block_copy_size(None).unwrap_or(4) as u64
+}
+
+/// Total bytes backing a texture: every mip level's `width * height *
+/// texel_size`, times array/depth layers. WGPUI only ever creates
+/// single-mip, single-layer 2D textures today, so this is normally just
+/// `width * height * texel_size`; the general form costs nothing extra to
+/// write and stays correct if that ever changes.
+#[cfg(feature = "flamegraph")]
+pub(super) fn texture_memory_bytes(texture: &wgpu::Texture) -> u64 {
+    let bytes_per_texel = texel_size(texture.format());
+    let mut total = 0u64;
+    for mip in 0..texture.mip_level_count() {
+        let width = (texture.width() >> mip).max(1) as u64;
+        let height = (texture.height() >> mip).max(1) as u64;
+        total += width * height * bytes_per_texel;
+    }
+    total * (texture.depth_or_array_layers() as u64)
+}
+
 /// Ensures a buffer is large enough to hold the required size.
 /// If the buffer is too small, it will be recreated with the new size.
 pub(super) fn ensure_buffer_size(
@@ -249,5 +302,25 @@ pub(super) fn ensure_buffer_size(
             usage,
             mapped_at_creation: false,
         });
+    }
+}
+
+#[cfg(all(test, feature = "flamegraph"))]
+mod tests {
+    use super::texel_size;
+
+    // `texture_memory_bytes`/atlas/surface-registry memory accounting all
+    // ultimately reduce to `texel_size`, and that's the one piece testable
+    // without a real `wgpu::Device` (`wgpu::TextureFormat` is a plain enum,
+    // no adapter/device required) -- this crate has no headless-GPU test
+    // fixture, so the buffer/texture-size accessors that need a live device
+    // (`WgpuContext::fixed_buffer_memory_usage`, `WgpuAtlas::memory_usage`,
+    // `SurfaceRegistry::memory_usage`) aren't covered by an automated test.
+    #[test]
+    fn texel_size_matches_known_format_sizes() {
+        assert_eq!(texel_size(wgpu::TextureFormat::R8Unorm), 1);
+        assert_eq!(texel_size(wgpu::TextureFormat::Rgba8Unorm), 4);
+        assert_eq!(texel_size(wgpu::TextureFormat::Bgra8UnormSrgb), 4);
+        assert_eq!(texel_size(wgpu::TextureFormat::Rgba16Float), 8);
     }
 }

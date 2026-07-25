@@ -4,6 +4,8 @@ use crate::{
     ParentElement, Pixels, RenderImage, Resource, Style, StyleRefinement, Styled, Task, Window,
     hash,
 };
+#[cfg(feature = "flamegraph")]
+use crate::WeakEntity;
 
 use futures::{FutureExt, future::Shared};
 use refineable::Refineable;
@@ -224,6 +226,40 @@ impl<T: ImageCache> ImageCacheProvider for Entity<T> {
     }
 }
 
+/// Global registry of every `RetainAllImageCache` that has ever been
+/// created, weak so registration never keeps a cache alive past its last
+/// strong reference. Phase 3 of the profiling epic (issue #59): summing
+/// image cache memory needs to reach every cache instance scattered across
+/// however many windows/elements created one, and none of those creation
+/// call sites have a natural path to "the current `MemorySnapshot`" -- the
+/// same "no natural path to the object that needs the data" constraint
+/// phase 1/2 solved with a thread-local accumulator and a weak recorder
+/// list (see `flamegraph.rs`'s `GLOBAL_THREAD_RECORDERS`); this is that same
+/// shape of fix applied here. Only the built-in `RetainAllImageCache` is
+/// registered -- a custom `ImageCache` implementation has no comparable
+/// registration hook, so it stays outside this profiler's visibility (see
+/// `MemorySnapshot::image_cache_bytes`'s doc comment).
+#[cfg(feature = "flamegraph")]
+static RETAINED_IMAGE_CACHE_REGISTRY: parking_lot::Mutex<Vec<WeakEntity<RetainAllImageCache>>> =
+    parking_lot::Mutex::new(Vec::new());
+
+/// Sum of every registered [`RetainAllImageCache`]'s current image bytes,
+/// for [`crate::MemorySnapshot::image_cache_bytes`]. Opportunistically prunes
+/// entries whose cache has since been dropped.
+#[cfg(feature = "flamegraph")]
+pub(crate) fn total_retained_image_cache_memory_usage(cx: &App) -> u64 {
+    let mut registry = RETAINED_IMAGE_CACHE_REGISTRY.lock();
+    let mut total_bytes = 0u64;
+    registry.retain(|weak_cache| match weak_cache.upgrade() {
+        Some(cache) => {
+            total_bytes += cache.read(cx).memory_usage();
+            true
+        }
+        None => false,
+    });
+    total_bytes
+}
+
 /// An implementation of ImageCache, that uses an LRU caching strategy to unload images when the cache is full
 pub struct RetainAllImageCache(HashMap<u64, ImageCacheItem>);
 
@@ -240,6 +276,8 @@ impl RetainAllImageCache {
     #[inline]
     pub fn new(cx: &mut App) -> Entity<Self> {
         let e = cx.new(|_cx| RetainAllImageCache(HashMap::new()));
+        #[cfg(feature = "flamegraph")]
+        RETAINED_IMAGE_CACHE_REGISTRY.lock().push(e.downgrade());
         cx.observe_release(&e, |image_cache, cx| {
             for (_, mut item) in std::mem::replace(&mut image_cache.0, HashMap::new()) {
                 if let Some(Ok(image)) = item.get() {
@@ -312,6 +350,24 @@ impl RetainAllImageCache {
     /// Returns true if the cache is empty.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// Total raw pixel bytes across every successfully-loaded image currently
+    /// held by this cache (sums every frame of an animated image). Images
+    /// still loading, or that failed to load, contribute nothing. Part of
+    /// Phase 3 of the profiling epic (issue #59); see
+    /// `total_retained_image_cache_memory_usage`.
+    #[cfg(feature = "flamegraph")]
+    fn memory_usage(&self) -> u64 {
+        self.0
+            .values()
+            .filter_map(|item| match item {
+                ImageCacheItem::Loaded(Ok(image)) => Some(image),
+                _ => None,
+            })
+            .flat_map(|image| (0..image.frame_count()).filter_map(|frame_index| image.as_bytes(frame_index)))
+            .map(|bytes| bytes.len() as u64)
+            .sum()
     }
 }
 

@@ -287,6 +287,23 @@ impl SurfaceRegistry {
             .collect()
     }
 
+    /// Sum of every registered surface's three triple-buffered textures
+    /// (Phase 3 of the profiling epic, issue #59). A poisoned lock (some
+    /// other thread already panicked while holding it) is treated as
+    /// contributing zero rather than panicking here too.
+    #[cfg(feature = "flamegraph")]
+    pub(crate) fn memory_usage(&self) -> u64 {
+        let surfaces = match self.surfaces.lock() {
+            Ok(surfaces) => surfaces,
+            Err(_) => return 0,
+        };
+        surfaces
+            .values()
+            .flat_map(|triple_buffer| triple_buffer.textures.iter())
+            .map(super::render_context::texture_memory_bytes)
+            .sum()
+    }
+
     fn create_triple_buffer(
         device: &wgpu::Device,
         width: u32,

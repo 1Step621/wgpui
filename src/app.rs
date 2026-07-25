@@ -1649,6 +1649,19 @@ impl App {
         &self.text_system
     }
 
+    /// Total reserved capacity of the per-frame element arena
+    /// (`Window::draw`'s `ElementArenaScope`), in bytes. This is `Arena`'s
+    /// total chunk capacity, not live bytes in use: the arena is a bump
+    /// allocator cleared once per frame, so "capacity" (the high-water mark
+    /// of chunks it grew to) is the number worth reporting, matching how
+    /// `Arena::capacity` is already used for its `log::trace!` growth
+    /// message. Used by `Window::memory_snapshot` (Phase 3 of the profiling
+    /// epic, issue #59).
+    #[cfg(feature = "flamegraph")]
+    pub(crate) fn element_arena_capacity_bytes(&self) -> u64 {
+        self.element_arena.borrow().capacity() as u64
+    }
+
     /// Check whether a global of the given type has been assigned.
     pub fn has_global<G: Global>(&self) -> bool {
         self.globals_by_type.contains_key(&TypeId::of::<G>())

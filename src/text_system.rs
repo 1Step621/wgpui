@@ -334,6 +334,14 @@ impl TextSystem {
         self.platform_text_system
             .rasterize_glyph(params, raster_bounds)
     }
+
+    /// Bytes held by this (process-wide, shared across every window)
+    /// text system's rasterized-glyph cache. Part of Phase 3 of the
+    /// profiling epic (issue #59); see `WindowTextSystem::memory_snapshot`.
+    #[cfg(feature = "flamegraph")]
+    pub(crate) fn glyph_cache_memory_usage(&self) -> u64 {
+        self.platform_text_system.glyph_cache_memory_usage()
+    }
 }
 
 /// The GPUI text layout subsystem.
@@ -354,6 +362,18 @@ impl WindowTextSystem {
 
     pub(crate) fn layout_index(&self) -> LineLayoutIndex {
         self.line_layout_cache.layout_index()
+    }
+
+    /// This window's text system cache sizes (Phase 3 of the profiling epic,
+    /// issue #59): the shaped-line cache is per-window, while the glyph
+    /// cache is shared crate-wide and reached through `Deref<Target =
+    /// TextSystem>`. See `Window::memory_snapshot`.
+    #[cfg(feature = "flamegraph")]
+    pub(crate) fn memory_snapshot(&self) -> crate::TextSystemMemory {
+        crate::TextSystemMemory {
+            glyph_cache_bytes: self.glyph_cache_memory_usage(),
+            shaped_line_cache_bytes: self.line_layout_cache.memory_usage(),
+        }
     }
 
     pub(crate) fn reuse_layouts(&self, index: Range<LineLayoutIndex>) {
