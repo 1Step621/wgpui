@@ -149,7 +149,7 @@ pub fn tick_frame() {
         ));
         // Worst max first: that is what a stall looks like.
         let mut rows = timers;
-        rows.sort_by(|a, b| b.1.max_ns.cmp(&a.1.max_ns));
+        rows.sort_by_key(|(_, a)| std::cmp::Reverse(a.max_ns));
         for (name, a) in rows {
             if a.count == 0 {
                 continue;
