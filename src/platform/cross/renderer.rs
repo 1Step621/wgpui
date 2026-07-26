@@ -2641,11 +2641,20 @@ impl WgpuRenderer {
                         log::debug!("Renderer: processing {} surface(s)", surfaces.len());
                         for surface in surfaces {
                             if let crate::SurfaceContent::Wgpu(surface_id) = &surface.content {
-                                // Atomically swap ready ↔ display buffers with GPU sync
+                                // Swap ready → display ONLY if the external renderer produced
+                                // a new frame since we last composited this surface. This paint
+                                // path runs every GPUI frame whether or not the producer rendered
+                                // anything (the viewport re-arms request_animation_frame each
+                                // frame), so an unconditional swap here would rotate `display` to
+                                // a stale buffer whenever the producer skipped a frame — engine
+                                // lock contention or a pending resize — and the canvas strobes.
+                                // The gate holds the current display buffer until a real frame is
+                                // ready. The fast-blit path (Path B) is already gated via
+                                // redraw_pending, so it keeps using the unconditional swap.
                                 let _swapped = self
                                     .context
                                     .surface_registry
-                                    .swap_ready_display(&self.context.device, *surface_id);
+                                    .swap_ready_display_if_new(*surface_id);
 
                                 if let Some(view) =
                                     self.context.surface_registry.front_view(*surface_id)
