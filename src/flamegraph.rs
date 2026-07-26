@@ -212,6 +212,32 @@ pub struct FrameCapture {
     pub frame_start_ns: u64,
     /// Frame end, in nanoseconds relative to the capture's anchor.
     pub frame_end_ns: u64,
+    /// CPU wall-clock instant `queue.submit()` returned for this frame's GPU
+    /// work, anchor-relative. This is a **CPU-side observation of when the
+    /// CPU asked the GPU to run something** -- not when the GPU actually
+    /// started running it (that's `gpu_spans`' calibrated `start_ns`, a value
+    /// *inferred* from a GPU-clock timestamp via the session's one-time
+    /// calibration, not directly observed on the CPU timeline) and not when
+    /// drawing finished on the CPU (`frame_end_ns`, which happens before
+    /// submission is even asked for). Plotting this alongside the calibrated
+    /// GPU span start is what surfaces GPU queue backlog: a growing gap here
+    /// means the GPU is falling behind CPU-side submission, not that
+    /// individual passes are slow. `None` until a submission has been
+    /// correlated to this frame (or if this frame never requested GPU
+    /// capture at all).
+    pub cpu_gpu_submit_ns: Option<u64>,
+    /// CPU wall-clock instant the render thread's non-blocking poll first
+    /// observed this frame's GPU readback as complete, anchor-relative. This
+    /// is when the **CPU found out** the GPU had fenced/finished -- not when
+    /// the GPU actually finished (that's the end of `gpu_spans`' calibrated
+    /// timeline) and not a blocking wait's completion (readback is polled
+    /// non-blockingly, so this always lags true GPU completion by however
+    /// long it took the render thread to next call `poll_readback`, on the
+    /// order of 1-2 frames by design -- see `GpuSpan`'s doc comment). The gap
+    /// between the calibrated GPU end time and this value is CPU-side
+    /// readback/polling latency, distinct from GPU execution time itself.
+    /// `None` until observed.
+    pub cpu_gpu_fence_observed_ns: Option<u64>,
     /// Aggregate "how much work" counters for this frame (Phase 2, issue
     /// #58), gathered alongside the timing spans above. See
     /// [`FrameCounters`].
@@ -484,6 +510,7 @@ impl Capture {
             draw_calls,
             atlas,
             events,
+            gpu_timeline: gpu_timeline_summary(&self.frames),
             present_mode: current_present_mode(),
             full_draw_frame_count: self.full_draw_frame_count,
             fast_path_frame_count: self.fast_path_frame_count,
@@ -683,13 +710,41 @@ pub(crate) fn current_gpu_correlation_frame_index() -> Option<u64> {
     })
 }
 
+/// CPU wall-clock "now," anchor-relative in the same nanosecond timeline as
+/// every other timestamp in a `Capture` (`frame_start_ns`, `frame_end_ns`,
+/// and -- after calibration -- `GpuSpan::start_ns`). `flamegraph_gpu` uses
+/// this to stamp `queue.submit()`/readback-observed instants so they're
+/// directly comparable to calibrated GPU timestamps on one shared timeline,
+/// the same way `current_gpu_correlation_frame_index` lets it tag spans by
+/// frame without a parameter threaded through `PlatformWindow::draw`. `None`
+/// when no capture is active.
+pub(crate) fn anchor_relative_now_ns() -> Option<u64> {
+    ACTIVE_CAPTURE.lock().as_ref().map(|state| state.now_ns())
+}
+
 /// Attach resolved GPU spans to the frame they belong to, if that frame is
 /// still held by the active capture's ring buffer (it may have been evicted
-/// already, given GPU readback latency of 1-2 frames).
-pub(crate) fn attach_gpu_spans(frame_index: u64, spans: Vec<GpuSpan>, truncated: bool) {
+/// already, given GPU readback latency of 1-2 frames). `submit_cpu_ns` is the
+/// CPU-observed instant `queue.submit()` returned for this frame's GPU work;
+/// `fence_observed_cpu_ns` is the CPU-observed instant the render thread's
+/// non-blocking poll first saw that work as complete. Both are `None` if
+/// unavailable (e.g. this generation was reset before submission), and both
+/// are CPU-side *observations*, not the GPU's own execution timing --
+/// see the doc comments on `FrameCapture`'s matching fields for why that
+/// distinction matters and how it differs from `gpu_spans`' calibrated
+/// (inferred, not directly observed) start/end times.
+pub(crate) fn attach_gpu_spans(
+    frame_index: u64,
+    spans: Vec<GpuSpan>,
+    truncated: bool,
+    submit_cpu_ns: Option<u64>,
+    fence_observed_cpu_ns: Option<u64>,
+) {
     if let Some(state) = ACTIVE_CAPTURE.lock().as_ref() {
         let mut finished = state.finished_frames.lock();
         if let Some(frame) = finished.iter_mut().find(|frame| frame.frame_index == frame_index) {
+            frame.cpu_gpu_submit_ns = submit_cpu_ns;
+            frame.cpu_gpu_fence_observed_ns = fence_observed_cpu_ns;
             frame.gpu_spans = spans;
             frame.gpu_spans_finalized = true;
             frame.gpu_spans_truncated = truncated;
@@ -817,6 +872,8 @@ impl CaptureState {
             gpu_spans_truncated: false,
             frame_start_ns: open_frame.frame_start_ns,
             frame_end_ns,
+            cpu_gpu_submit_ns: None,
+            cpu_gpu_fence_observed_ns: None,
             counters: take_frame_counters(),
         };
 
@@ -1272,6 +1329,73 @@ pub struct EventSummary {
     pub entities_invalidated: MeanMax,
 }
 
+/// Mean/max CPU-to-GPU timeline correlation over a window of frames -- when
+/// the CPU asked the GPU to run a frame's work vs. when the GPU actually
+/// started (backlog), and when the GPU actually finished vs. when the CPU
+/// found out (readback/polling latency). See `FrameCapture::cpu_gpu_submit_ns`
+/// and `cpu_gpu_fence_observed_ns`'s doc comments for the underlying
+/// distinction this reports on: a CPU-side *observation* of submit/fence,
+/// not the GPU's own (calibrated, inferred) execution timing, which is what
+/// `gpu_spans` already gives you.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct GpuTimelineSummary {
+    /// Mean/max nanoseconds from `cpu_gpu_submit_ns` (CPU asked the GPU to
+    /// run this frame) to the calibrated start of the frame's first GPU
+    /// span (GPU actually began running it). A growing value here means the
+    /// GPU queue is backlogged relative to CPU submission -- not that
+    /// individual passes got slower.
+    pub submit_to_gpu_start: MeanMax,
+    /// Mean/max nanoseconds from the calibrated end of a frame's last GPU
+    /// span (GPU actually finished) to `cpu_gpu_fence_observed_ns` (CPU found
+    /// out). This is readback/polling latency, not GPU execution time --
+    /// expect it to sit around 1-2 frame durations by design (see
+    /// `FrameCapture::gpu_spans_finalized`'s doc comment).
+    pub gpu_end_to_fence_observed: MeanMax,
+    /// How many frames in the window had everything needed for the two
+    /// stats above: both CPU-observed instants present, and `gpu_spans`
+    /// finalized and non-empty. GPU data lags CPU data by design (calibration
+    /// only runs once GPU capture is requested, and readback itself lags
+    /// 1-2 frames), so this is very often smaller than `frame_count`.
+    pub samples: usize,
+}
+
+fn gpu_timeline_summary(frames: &VecDeque<FrameCapture>) -> GpuTimelineSummary {
+    let mut submit_to_start = Vec::new();
+    let mut end_to_observed = Vec::new();
+
+    for frame in frames {
+        if !frame.gpu_spans_finalized || frame.gpu_spans.is_empty() {
+            continue;
+        }
+        let Some(submit_ns) = frame.cpu_gpu_submit_ns else {
+            continue;
+        };
+        let Some(observed_ns) = frame.cpu_gpu_fence_observed_ns else {
+            continue;
+        };
+
+        let gpu_start_ns = frame.gpu_spans.iter().map(|span| span.start_ns).min();
+        let gpu_end_ns = frame
+            .gpu_spans
+            .iter()
+            .map(|span| span.start_ns.saturating_add(span.duration_ns as u64))
+            .max();
+        let (Some(gpu_start_ns), Some(gpu_end_ns)) = (gpu_start_ns, gpu_end_ns) else {
+            continue;
+        };
+
+        submit_to_start.push(gpu_start_ns.saturating_sub(submit_ns).min(u32::MAX as u64) as u32);
+        end_to_observed.push(observed_ns.saturating_sub(gpu_end_ns).min(u32::MAX as u64) as u32);
+    }
+
+    let samples = submit_to_start.len();
+    GpuTimelineSummary {
+        submit_to_gpu_start: mean_max(submit_to_start.into_iter()),
+        gpu_end_to_fence_observed: mean_max(end_to_observed.into_iter()),
+        samples,
+    }
+}
+
 /// Aggregated statistics over the frames currently held in a [`Capture`]'s
 /// ring buffer, from [`Capture::counter_summary`]. Replaces what the
 /// reverted `render_stats` module reported via a periodic stderr dump with a
@@ -1297,6 +1421,8 @@ pub struct CounterSummary {
     pub atlas: AtlasSummary,
     /// Input/notification statistics.
     pub events: EventSummary,
+    /// CPU-observed GPU submit/fence timeline correlation statistics.
+    pub gpu_timeline: GpuTimelineSummary,
     /// The renderer's current present mode.
     pub present_mode: PresentMode,
     /// See `Capture::full_draw_frame_count`'s doc comment: these two are
@@ -1364,7 +1490,20 @@ impl std::fmt::Display for CounterSummary {
             self.events.notify_calls.max,
             self.events.entities_invalidated.mean,
             self.events.entities_invalidated.max,
-        )
+        )?;
+        if self.gpu_timeline.samples > 0 {
+            writeln!(
+                f,
+                "--- gpu timeline ({} samples): submit->gpu-start {:.3}/{:.3}ms  gpu-end->cpu-observed {:.3}/{:.3}ms ---",
+                self.gpu_timeline.samples,
+                self.gpu_timeline.submit_to_gpu_start.mean / 1.0e6,
+                self.gpu_timeline.submit_to_gpu_start.max as f64 / 1.0e6,
+                self.gpu_timeline.gpu_end_to_fence_observed.mean / 1.0e6,
+                self.gpu_timeline.gpu_end_to_fence_observed.max as f64 / 1.0e6,
+            )
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -1804,6 +1943,8 @@ mod tests {
         gpu_spans_truncated: bool,
         frame_start_ns: u64,
         frame_end_ns: u64,
+        cpu_gpu_submit_ns: Option<u64>,
+        cpu_gpu_fence_observed_ns: Option<u64>,
         // `FrameCounters` derives `Deserialize` directly (plain numeric
         // data, no `&'static str` fields), so it's reused as-is here rather
         // than needing its own decoded mirror type.
@@ -1889,6 +2030,8 @@ mod tests {
             gpu_spans_truncated: frame.gpu_spans_truncated,
             frame_start_ns: frame.frame_start_ns,
             frame_end_ns: frame.frame_end_ns,
+            cpu_gpu_submit_ns: frame.cpu_gpu_submit_ns,
+            cpu_gpu_fence_observed_ns: frame.cpu_gpu_fence_observed_ns,
             counters: frame.counters,
         }
     }
