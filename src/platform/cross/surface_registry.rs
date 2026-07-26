@@ -29,6 +29,15 @@ struct TripleBuffer {
     // Redraw coalescing: prevents flooding compositor with thousands of requests/sec
     redraw_pending: std::sync::atomic::AtomicBool,
 
+    // Monotonic count of producer swaps (rendering → ready): one increment per
+    // frame the external renderer presents.
+    frame_generation: AtomicU64,
+    // The `frame_generation` value the compositor last swapped into `display`.
+    // The compositor swaps `ready → display` only when these differ, so a paint
+    // with no newly produced frame holds the current display buffer instead of
+    // rotating to a stale one.
+    last_composited_generation: AtomicU64,
+
     width: u32,
     height: u32,
     format: wgpu::TextureFormat,
@@ -118,6 +127,10 @@ impl SurfaceRegistry {
                     Err(updated) => current = updated,
                 }
             }
+
+            // A newly rendered frame now sits in `ready`; advance the generation
+            // so the compositor swaps it to `display` exactly once.
+            tb.frame_generation.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -139,6 +152,10 @@ impl SurfaceRegistry {
                     Err(updated) => current = updated,
                 }
             }
+
+            // A newly rendered frame now sits in `ready`; advance the generation
+            // so the compositor swaps it to `display` exactly once.
+            tb.frame_generation.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -328,6 +345,72 @@ impl SurfaceRegistry {
             .sum()
     }
 
+    /// Swap `ready → display` only if the external renderer has presented a new
+    /// frame since the last successful compositor swap. Returns `true` if a swap
+    /// occurred; when it returns `false`, the caller should keep compositing the
+    /// current `display` buffer (via [`front_view`](Self::front_view)) unchanged.
+    ///
+    /// This is the gated counterpart to [`swap_ready_display`](Self::swap_ready_display).
+    /// The GPUI paint path composites a surface every frame regardless of whether
+    /// the producer rendered anything, so an *ungated* swap there rotates `display`
+    /// to a stale buffer whenever the producer skipped a frame (engine-lock
+    /// contention, a pending resize, …), making the canvas strobe. Gating on the
+    /// producer generation keeps `display` steady until a genuinely new frame is
+    /// ready.
+    ///
+    /// Runs entirely under the surfaces mutex, so the generation compare, the
+    /// buffer swap, and the generation store are atomic with respect to the
+    /// producer's `swap_rendering_ready*`.
+    pub fn swap_ready_display_if_new(&self, id: SurfaceId) -> bool {
+        if let Some(tb) = self.surfaces.lock().unwrap().get(&id) {
+            let current_gen = tb.frame_generation.load(Ordering::Acquire);
+            let last = tb.last_composited_generation.load(Ordering::Acquire);
+            if !Self::should_composite_swap(current_gen, last) {
+                return false;
+            }
+
+            // Atomic swap: ready ↔ display
+            let mut current = tb.state.load(Ordering::Acquire);
+            loop {
+                let (rendering, ready, display) = TripleBuffer::unpack_state(current);
+                let next = TripleBuffer::pack_state(rendering, display, ready);
+                match tb
+                    .state
+                    .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                {
+                    Ok(_) => break,
+                    Err(updated) => current = updated,
+                }
+            }
+
+            tb.last_composited_generation
+                .store(current_gen, Ordering::Release);
+            return true;
+        }
+        false
+    }
+
+    /// The current producer-swap generation for a surface (increments once per
+    /// presented frame). Returns `None` if the surface is not registered.
+    pub fn frame_generation(&self, id: SurfaceId) -> Option<u64> {
+        self.surfaces
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|tb| tb.frame_generation.load(Ordering::Acquire))
+    }
+
+    /// Pure decision function used by [`swap_ready_display_if_new`](Self::swap_ready_display_if_new):
+    /// the compositor should swap `ready → display` iff the producer has advanced
+    /// the generation since the compositor last presented. Both start at `0`, so
+    /// the first compositor paint before any frame is produced is a no-op (keeps
+    /// the initial buffer). Split out so the gating logic is unit-testable without
+    /// a GPU device.
+    #[inline]
+    pub fn should_composite_swap(current_generation: u64, last_composited: u64) -> bool {
+        current_generation != last_composited
+    }
+
     fn create_triple_buffer(
         device: &wgpu::Device,
         width: u32,
@@ -386,6 +469,8 @@ impl SurfaceRegistry {
             state: AtomicU8::new(TripleBuffer::pack_state(0, 1, 2)),
             submission_indices: Mutex::new([None, None, None]),
             redraw_pending: std::sync::atomic::AtomicBool::new(false),
+            frame_generation: AtomicU64::new(0),
+            last_composited_generation: AtomicU64::new(0),
             width: w,
             height: h,
             format,
@@ -403,7 +488,7 @@ pub(crate) struct SurfaceTextureSnapshot {
 }
 
 #[cfg(all(test, feature = "flamegraph"))]
-mod tests {
+mod flamegraph_tests {
     use super::SurfaceRegistry;
 
     /// Creates a headless (surface-less) `wgpu::Device`/`Queue`, the same
@@ -502,5 +587,149 @@ mod tests {
             error.is_none(),
             "surface front texture should accept a copy_texture_to_buffer read (COPY_SRC), got: {error:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SurfaceRegistry, TripleBuffer};
+
+    // Minimal, GPU-free model of the three-buffer roles. We track which "frame"
+    // (a monotonically increasing id) currently lives in each physical buffer,
+    // so we can assert what the compositor would actually display after a
+    // sequence of producer/consumer swaps — the real textures are irrelevant to
+    // the swap/gating logic under test.
+    struct Model {
+        state: u8,
+        /// Frame id stored in each physical buffer (0 = never rendered).
+        contents: [u32; 3],
+        /// Producer generation (count of rendering→ready swaps).
+        generation: u64,
+        /// Generation the compositor last swapped into display.
+        last_composited: u64,
+    }
+
+    impl Model {
+        fn new() -> Self {
+            Self {
+                state: TripleBuffer::pack_state(0, 1, 2),
+                contents: [0; 3],
+                generation: 0,
+                last_composited: 0,
+            }
+        }
+
+        /// External renderer draws `frame` into the rendering buffer, then swaps
+        /// rendering ↔ ready (mirrors `swap_rendering_ready*`).
+        fn produce(&mut self, frame: u32) {
+            let (rendering, ready, display) = TripleBuffer::unpack_state(self.state);
+            self.contents[rendering as usize] = frame;
+            self.state = TripleBuffer::pack_state(ready, rendering, display);
+            self.generation += 1;
+        }
+
+        /// Old, ungated compositor: always swaps ready ↔ display.
+        fn composite_ungated(&mut self) {
+            let (rendering, ready, display) = TripleBuffer::unpack_state(self.state);
+            self.state = TripleBuffer::pack_state(rendering, display, ready);
+        }
+
+        /// New, gated compositor: swaps only when a new frame was produced
+        /// (mirrors `swap_ready_display_if_new`).
+        fn composite_gated(&mut self) {
+            if !SurfaceRegistry::should_composite_swap(self.generation, self.last_composited) {
+                return;
+            }
+            let (rendering, ready, display) = TripleBuffer::unpack_state(self.state);
+            self.state = TripleBuffer::pack_state(rendering, display, ready);
+            self.last_composited = self.generation;
+        }
+
+        /// The frame the compositor would currently display.
+        fn displayed_frame(&self) -> u32 {
+            let (_, _, display) = TripleBuffer::unpack_state(self.state);
+            self.contents[display as usize]
+        }
+    }
+
+    #[test]
+    fn should_composite_swap_only_on_new_generation() {
+        assert!(!SurfaceRegistry::should_composite_swap(0, 0));
+        assert!(!SurfaceRegistry::should_composite_swap(5, 5));
+        assert!(SurfaceRegistry::should_composite_swap(1, 0));
+        assert!(SurfaceRegistry::should_composite_swap(6, 5));
+    }
+
+    #[test]
+    fn indices_stay_a_permutation_across_swaps() {
+        // Any sequence of transpositions must keep the three roles distinct,
+        // otherwise `pack_state`'s debug asserts would fire and buffers alias.
+        let mut m = Model::new();
+        for frame in 1..=20u32 {
+            m.produce(frame);
+            m.composite_gated();
+            let (r, ready, d) = TripleBuffer::unpack_state(m.state);
+            assert!(r != ready && ready != d && d != r, "roles collided: {:?}", (r, ready, d));
+        }
+    }
+
+    #[test]
+    fn ungated_compositor_regresses_to_stale_frame() {
+        // Reproduces the bug: one produced frame, then the compositor paints
+        // twice (as the GPUI path does every frame). The second, unpaired swap
+        // rotates `display` to a buffer holding an older frame.
+        let mut m = Model::new();
+        m.produce(1);
+        m.composite_ungated();
+        assert_eq!(m.displayed_frame(), 1, "first composite shows the new frame");
+
+        m.composite_ungated(); // unpaired paint, no new frame produced
+        assert_ne!(
+            m.displayed_frame(),
+            1,
+            "BUG: unpaired ungated swap regressed display off the latest frame"
+        );
+    }
+
+    #[test]
+    fn gated_compositor_holds_latest_frame_on_unpaired_paints() {
+        // The fix: without a new produced frame, repeated compositor paints keep
+        // showing the latest frame instead of strobing to a stale buffer.
+        let mut m = Model::new();
+        m.produce(1);
+        m.composite_gated();
+        assert_eq!(m.displayed_frame(), 1);
+
+        for _ in 0..10 {
+            m.composite_gated(); // unpaired paints (viewport skipped a frame)
+            assert_eq!(
+                m.displayed_frame(),
+                1,
+                "gated compositor must hold the last frame with no new production"
+            );
+        }
+    }
+
+    #[test]
+    fn gated_compositor_tracks_new_frames() {
+        // Normal 1:1 pairing advances the displayed frame each time.
+        let mut m = Model::new();
+        for frame in 1..=8u32 {
+            m.produce(frame);
+            m.composite_gated();
+            assert_eq!(m.displayed_frame(), frame);
+        }
+    }
+
+    #[test]
+    fn gated_compositor_shows_latest_when_producer_outruns_compositor() {
+        // Producer renders several frames before one composite; the compositor
+        // should jump straight to the newest completed frame, never a stale one.
+        let mut m = Model::new();
+        m.produce(1);
+        m.produce(2);
+        m.produce(3);
+        m.composite_gated();
+        assert_eq!(m.displayed_frame(), 3);
     }
 }
