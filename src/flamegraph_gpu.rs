@@ -472,7 +472,7 @@ pub(crate) fn sync_with_active_capture(
 }
 
 // ---------------------------------------------------------------------------
-// Phase 4: on-demand GPU deep capture (issue #60).
+// Phase 4/4b: on-demand GPU deep capture (issues #60, #71, #72).
 //
 // `DeepCaptureRecorder`/`DeepCapturePendingReadback` deliberately do not
 // reuse `GpuQueryManager`'s triple-buffered generation array: a deep capture
@@ -487,13 +487,27 @@ pub(crate) fn sync_with_active_capture(
 // in this file's module docs: this device may only safely be polled from the
 // render thread that submits to it.
 //
-// Resource readback covers `WgpuContext`'s fixed buffers only (quads,
-// shadows, underlines, mono/poly sprites, backdrop filters, paths vertices)
-// -- not the atlas or surface textures the issue also mentions. See
-// `flamegraph.rs`'s Phase 4 section doc comment for why buffers are read
-// back once per touched kind rather than once per draw call, and this
-// module's final Phase 4 doc note (bottom of file) for why texture readback
-// specifically was scoped out of this round.
+// Resource readback covers `WgpuContext`'s fixed buffers (quads, shadows,
+// underlines, mono/poly sprites, backdrop filters, paths vertices) *and*,
+// since issue #72, atlas texture pages and composited surface textures --
+// the exact same state machine extended with a second staging list
+// (`DeepCaptureTextureStagingBuffer`) rather than a second parallel
+// mechanism. Only textures actually referenced by this frame's command
+// stream are read back (mirroring `touched_buffers`' "once per touched
+// resource, not the whole live set" approach) -- `touched_atlas_textures`
+// dedups `DeepCaptureDrawCall::atlas_texture_id` values and
+// `touched_surfaces` dedups its `surface_id` field, both as they're recorded
+// in `record_draw_call`, the same way `touched_buffers` already dedups
+// `buffer_kind`.
+//
+// Texture readback needs one thing buffer readback never had to handle: row
+// alignment. `copy_texture_to_buffer` requires each row of the destination
+// buffer padded to `wgpu::COPY_BYTES_PER_ROW_ALIGNMENT` (256 bytes), so
+// `DeepCaptureTextureStagingBuffer` tracks both the padded (GPU-side) and
+// unpadded (real) row length, and `DeepCapturePendingReadback::poll` strips
+// the padding back out row-by-row when harvesting -- the same unpadding
+// `flamegraph_replay.rs`'s GPU replay already does for its own render-target
+// readback.
 
 /// Accumulates one triggered frame's command stream while `WgpuRenderer::draw`
 /// is recording it. Created fresh by `WgpuRenderer::draw` when
@@ -506,6 +520,14 @@ pub(crate) struct DeepCaptureRecorder {
     /// `contains` check on every `record_draw_call` is cheaper than a
     /// `HashSet` and avoids pulling in a hasher for something this size.
     touched_buffers: Vec<DeepCaptureBufferKind>,
+    /// Distinct encoded atlas texture ids (same `(AtlasTextureKind as u64)
+    /// << 32 | AtlasTextureId::index` encoding as
+    /// `DeepCaptureDrawCall::atlas_texture_id`) seen across `draw_calls` so
+    /// far, in first-seen order (issue #72).
+    touched_atlas_textures: Vec<u64>,
+    /// Distinct `SurfaceId`s seen across `draw_calls`' `surface_id` field so
+    /// far, in first-seen order (issue #72).
+    touched_surfaces: Vec<crate::platform::cross::surface_registry::SurfaceId>,
 }
 
 impl DeepCaptureRecorder {
@@ -513,6 +535,8 @@ impl DeepCaptureRecorder {
         Self {
             draw_calls: Vec::new(),
             touched_buffers: Vec::new(),
+            touched_atlas_textures: Vec::new(),
+            touched_surfaces: Vec::new(),
         }
     }
 
@@ -532,11 +556,23 @@ impl DeepCaptureRecorder {
         bind_group_count: u32,
         buffer_kind: Option<DeepCaptureBufferKind>,
         atlas_texture_id: Option<u64>,
+        surface_id: Option<u64>,
     ) {
         if let Some(buffer_kind) = buffer_kind
             && !self.touched_buffers.contains(&buffer_kind)
         {
             self.touched_buffers.push(buffer_kind);
+        }
+        if let Some(atlas_texture_id) = atlas_texture_id
+            && !self.touched_atlas_textures.contains(&atlas_texture_id)
+        {
+            self.touched_atlas_textures.push(atlas_texture_id);
+        }
+        if let Some(surface_id) = surface_id {
+            let surface_id = crate::platform::cross::surface_registry::SurfaceId(surface_id);
+            if !self.touched_surfaces.contains(&surface_id) {
+                self.touched_surfaces.push(surface_id);
+            }
         }
 
         let sequence = self.draw_calls.len() as u32;
@@ -550,18 +586,22 @@ impl DeepCaptureRecorder {
             bind_group_count,
             buffer_kind,
             atlas_texture_id,
+            surface_id,
         });
     }
 
     /// Finish recording and hand off to the readback phase: for every
     /// distinct buffer kind touched by this frame's command stream, look it
     /// up in `buffers`, allocate a same-sized `MAP_READ` staging buffer, and
-    /// record a `copy_buffer_to_buffer` from the live buffer into it. Must be
+    /// record a `copy_buffer_to_buffer` from the live buffer into it; same
+    /// idea for every touched atlas texture (via `atlas`) and surface (via
+    /// `surface_registry`), using `copy_texture_to_buffer` with
+    /// `wgpu::COPY_BYTES_PER_ROW_ALIGNMENT`-padded rows instead. Must be
     /// called after the frame's render-pass loop has ended (so `draw_calls`
-    /// is complete, and the live buffers are no longer borrowed by an active
-    /// `RenderPass`) and before `encoder.finish()` (the copy commands have to
-    /// land in the same encoder submission as the draws they're snapshotting
-    /// after).
+    /// is complete, and the live buffers/textures are no longer borrowed by
+    /// an active `RenderPass`) and before `encoder.finish()` (the copy
+    /// commands have to land in the same encoder submission as the draws
+    /// they're snapshotting after).
     ///
     /// `buffers` is expected to list every `DeepCaptureBufferKind` `WgpuContext`
     /// actually has a fixed buffer for (see that type's variants); a touched
@@ -569,12 +609,17 @@ impl DeepCaptureRecorder {
     /// since `finish` has no way to distinguish "programmer error" from "this
     /// buffer kind doesn't apply to the current renderer configuration" --
     /// either way, dropping one buffer's contents from an otherwise-useful
-    /// capture is better than losing the whole thing.
+    /// capture is better than losing the whole thing. A touched atlas
+    /// texture/surface that no longer resolves to a live texture (evicted
+    /// between the draw call and this call, or an unrecognized encoded id)
+    /// is skipped the same way.
     pub(crate) fn finish(
         self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         buffers: &[(DeepCaptureBufferKind, &wgpu::Buffer)],
+        atlas: &crate::platform::cross::atlas::WgpuAtlas,
+        surface_registry: &crate::platform::cross::surface_registry::SurfaceRegistry,
     ) -> DeepCapturePendingReadback {
         let mut staging = Vec::with_capacity(self.touched_buffers.len());
         for kind in &self.touched_buffers {
@@ -600,12 +645,132 @@ impl DeepCaptureRecorder {
             });
         }
 
+        let mut texture_staging = Vec::with_capacity(self.touched_atlas_textures.len() + self.touched_surfaces.len());
+        for &encoded in &self.touched_atlas_textures {
+            let Some(texture_id) = decode_atlas_texture_id(encoded) else {
+                continue;
+            };
+            let Some(snapshot) = atlas.texture_snapshot(texture_id) else {
+                continue;
+            };
+            if let Some(staged) = stage_texture_readback(
+                device,
+                encoder,
+                flamegraph::DeepCaptureTextureId::Atlas(encoded),
+                &snapshot.texture,
+                snapshot.width,
+                snapshot.height,
+                snapshot.bytes_per_pixel,
+            ) {
+                texture_staging.push(staged);
+            }
+        }
+        for &surface_id in &self.touched_surfaces {
+            let Some(snapshot) = surface_registry.front_texture_snapshot(surface_id) else {
+                continue;
+            };
+            if let Some(staged) = stage_texture_readback(
+                device,
+                encoder,
+                flamegraph::DeepCaptureTextureId::Surface(surface_id.0),
+                &snapshot.texture,
+                snapshot.width,
+                snapshot.height,
+                snapshot.bytes_per_pixel,
+            ) {
+                texture_staging.push(staged);
+            }
+        }
+
         DeepCapturePendingReadback {
             draw_calls: self.draw_calls,
             staging,
+            texture_staging,
             state: PendingReadbackState::AwaitingSubmit,
         }
     }
+}
+
+/// Decodes an encoded atlas texture id (`(AtlasTextureKind as u64) << 32 |
+/// AtlasTextureId::index`, the same encoding `WgpuRenderer::draw` writes
+/// into `DeepCaptureDrawCall::atlas_texture_id`) back into an
+/// `AtlasTextureId`. Returns `None` for a kind tag outside the two
+/// `AtlasTextureKind` variants currently exist (`0` = `Monochrome`, `1` =
+/// `Polychrome`) rather than panicking, since a malformed id should degrade
+/// to "skip this texture," not bring down the capture.
+fn decode_atlas_texture_id(encoded: u64) -> Option<crate::AtlasTextureId> {
+    let kind = match encoded >> 32 {
+        0 => crate::AtlasTextureKind::Monochrome,
+        1 => crate::AtlasTextureKind::Polychrome,
+        _ => return None,
+    };
+    let index = (encoded & 0xFFFF_FFFF) as u32;
+    Some(crate::AtlasTextureId { index, kind })
+}
+
+/// Records one texture's `copy_texture_to_buffer` (row-alignment-padded per
+/// [`wgpu::COPY_BYTES_PER_ROW_ALIGNMENT`]) into `encoder` and returns the
+/// resulting staging entry, or `None` if `width`/`height` is degenerate
+/// (nothing meaningful to read back). Shared by both the atlas and surface
+/// readback loops in [`DeepCaptureRecorder::finish`] -- identical mechanics,
+/// only the source `wgpu::Texture` and resulting [`flamegraph::DeepCaptureTextureId`]
+/// differ.
+fn stage_texture_readback(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    id: flamegraph::DeepCaptureTextureId,
+    texture: &wgpu::Texture,
+    width: u32,
+    height: u32,
+    bytes_per_pixel: u32,
+) -> Option<DeepCaptureTextureStagingBuffer> {
+    if width == 0 || height == 0 || bytes_per_pixel == 0 {
+        return None;
+    }
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let unpadded_bytes_per_row = width * bytes_per_pixel;
+    let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(align) * align;
+    let size = (padded_bytes_per_row as u64) * (height as u64);
+
+    let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("flamegraph_deep_capture_texture_staging_buffer"),
+        size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &staging_buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded_bytes_per_row),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+
+    Some(DeepCaptureTextureStagingBuffer {
+        id,
+        width,
+        height,
+        bytes_per_pixel,
+        unpadded_bytes_per_row,
+        padded_bytes_per_row,
+        size,
+        buffer: staging_buffer,
+        map_state: Arc::new(AtomicU8::new(MAP_STATE_PENDING)),
+    })
 }
 
 /// One touched buffer's readback: the live buffer's kind (for tagging the
@@ -614,6 +779,23 @@ impl DeepCaptureRecorder {
 /// lengths), the staging buffer itself, and the async map's completion state.
 struct DeepCaptureStagingBuffer {
     kind: DeepCaptureBufferKind,
+    size: u64,
+    buffer: wgpu::Buffer,
+    map_state: Arc<AtomicU8>,
+}
+
+/// One touched atlas texture/surface's readback -- the texture-content
+/// counterpart to [`DeepCaptureStagingBuffer`]. Unlike a fixed buffer, the
+/// staging buffer's rows are padded to `wgpu::COPY_BYTES_PER_ROW_ALIGNMENT`
+/// (`padded_bytes_per_row`), which `DeepCapturePendingReadback::poll` strips
+/// back out to `unpadded_bytes_per_row` per row when harvesting.
+struct DeepCaptureTextureStagingBuffer {
+    id: flamegraph::DeepCaptureTextureId,
+    width: u32,
+    height: u32,
+    bytes_per_pixel: u32,
+    unpadded_bytes_per_row: u32,
+    padded_bytes_per_row: u32,
     size: u64,
     buffer: wgpu::Buffer,
     map_state: Arc<AtomicU8>,
@@ -642,6 +824,7 @@ enum PendingReadbackState {
 pub(crate) struct DeepCapturePendingReadback {
     draw_calls: Vec<DeepCaptureDrawCall>,
     staging: Vec<DeepCaptureStagingBuffer>,
+    texture_staging: Vec<DeepCaptureTextureStagingBuffer>,
     state: PendingReadbackState,
 }
 
@@ -664,16 +847,26 @@ impl DeepCapturePendingReadback {
                 );
             });
         }
+        for staging in &self.texture_staging {
+            let map_state = staging.map_state.clone();
+            staging.buffer.slice(0..staging.size).map_async(wgpu::MapMode::Read, move |result| {
+                map_state.store(
+                    if result.is_ok() { MAP_STATE_OK } else { MAP_STATE_ERR },
+                    Ordering::Release,
+                );
+            });
+        }
         self.state = PendingReadbackState::MapPending;
     }
 
     /// Non-blocking poll (mirrors `GpuQueryManager::poll_readback`'s
     /// same-thread, non-blocking pattern documented at the top of this
     /// file). Returns the finished [`flamegraph::DeepCapture`] once every
-    /// touched buffer's map has resolved -- successfully or not, so a single
-    /// failed map can't leave this capture stuck pending forever; the caller
-    /// is expected to drop `self` immediately afterward, satisfying "no
-    /// persistent overhead, no persistent buffers" once a capture is done.
+    /// touched buffer's *and* touched texture's map has resolved --
+    /// successfully or not, so a single failed map can't leave this capture
+    /// stuck pending forever; the caller is expected to drop `self`
+    /// immediately afterward, satisfying "no persistent overhead, no
+    /// persistent buffers" once a capture is done.
     pub(crate) fn poll(&mut self, device: &wgpu::Device) -> Option<flamegraph::DeepCapture> {
         if self.state != PendingReadbackState::MapPending {
             return None;
@@ -682,7 +875,11 @@ impl DeepCapturePendingReadback {
         let all_resolved = self
             .staging
             .iter()
-            .all(|staging| staging.map_state.load(Ordering::Acquire) != MAP_STATE_PENDING);
+            .all(|staging| staging.map_state.load(Ordering::Acquire) != MAP_STATE_PENDING)
+            && self
+                .texture_staging
+                .iter()
+                .all(|staging| staging.map_state.load(Ordering::Acquire) != MAP_STATE_PENDING);
         if !all_resolved {
             return None;
         }
@@ -707,38 +904,48 @@ impl DeepCapturePendingReadback {
             staging.buffer.unmap();
         }
 
+        let mut texture_contents = Vec::with_capacity(self.texture_staging.len());
+        for staging in &self.texture_staging {
+            if staging.map_state.load(Ordering::Acquire) != MAP_STATE_OK {
+                resources_finalized = false;
+                continue;
+            }
+            let slice = staging.buffer.slice(0..staging.size);
+            match slice.get_mapped_range() {
+                Ok(view) => {
+                    // Strip `wgpu::COPY_BYTES_PER_ROW_ALIGNMENT` row padding
+                    // back out -- the same per-row unpadding
+                    // `flamegraph_replay.rs`'s GPU replay already does for
+                    // its own render-target readback.
+                    let mut bytes = Vec::with_capacity(
+                        (staging.unpadded_bytes_per_row as usize) * (staging.height as usize),
+                    );
+                    for row in 0..staging.height as usize {
+                        let start = row * staging.padded_bytes_per_row as usize;
+                        let end = start + staging.unpadded_bytes_per_row as usize;
+                        bytes.extend_from_slice(&view[start..end]);
+                    }
+                    texture_contents.push(flamegraph::DeepCaptureTextureContents {
+                        id: staging.id,
+                        width: staging.width,
+                        height: staging.height,
+                        bytes_per_pixel: staging.bytes_per_pixel,
+                        bytes,
+                    });
+                }
+                Err(_) => resources_finalized = false,
+            }
+            staging.buffer.unmap();
+        }
+
         Some(flamegraph::DeepCapture {
             draw_calls: std::mem::take(&mut self.draw_calls),
             buffer_contents,
+            texture_contents,
             resources_finalized,
         })
     }
 }
-
-// Deferred this round: texture content readback (atlas mono/poly textures,
-// surface textures). The issue's "resource contents" bullet covers both
-// buffers and textures; this implementation covers buffers only.
-//
-// Reasoning for the cut: every fixed buffer above is one `wgpu::Buffer` of a
-// known, stable usage flag set, so one `copy_buffer_to_buffer` + one staging
-// buffer per kind (7 total, worst case) is all `DeepCaptureRecorder::finish`
-// needs. Textures are a meaningfully different shape of problem --
-// `copy_texture_to_buffer` requires `bytes_per_row` padded to
-// `COPY_BYTES_PER_ROW_ALIGNMENT` (256), the atlas has a dynamic, growable
-// number of monochrome/polychrome texture pages (`WgpuAtlasStorage`, not a
-// single fixed handle), and surface textures vary in count/size/format per
-// registered `SurfaceId` (`SurfaceRegistry`). Getting that right (padding
-// math, iterating a dynamic page/surface list, one staging buffer and
-// `map_async` per texture rather than per fixed field) is a distinctly
-// larger and riskier chunk of work than the buffer case, on top of an
-// already GPU-readback-heavy phase. Per this phase's own risk guidance, a
-// smaller correct slice now (full command stream + pipeline/shader identity
-// + fixed-buffer contents) was chosen over forcing texture readback into the
-// same session. `DeepCaptureDrawCall::atlas_texture_id` still identifies
-// *which* atlas texture a sprite call bound, even though this round can't
-// read that texture's pixels back -- a future pass can add
-// `DeepCaptureTextureContents` alongside `DeepCaptureBufferContents` without
-// needing to change anything landed here.
 
 #[cfg(test)]
 mod tests {
@@ -763,6 +970,7 @@ mod tests {
             2,
             Some(DeepCaptureBufferKind::Quads),
             None,
+            None,
         );
         recorder.record_draw_call(
             DrawCallKind::MonoSprites,
@@ -773,6 +981,7 @@ mod tests {
             4,
             Some(DeepCaptureBufferKind::MonoSprites),
             Some(42),
+            None,
         );
         // A second `Quads` call: exercises that `touched_buffers` dedups
         // rather than recording `DeepCaptureBufferKind::Quads` twice.
@@ -784,6 +993,7 @@ mod tests {
             15..20,
             2,
             Some(DeepCaptureBufferKind::Quads),
+            None,
             None,
         );
 
@@ -821,7 +1031,7 @@ mod tests {
     #[test]
     fn record_draw_call_with_no_buffer_kind_does_not_touch_anything() {
         let mut recorder = DeepCaptureRecorder::new();
-        recorder.record_draw_call(DrawCallKind::Surfaces, "surfaces", "main", 0..4, 0..1, 2, None, None);
+        recorder.record_draw_call(DrawCallKind::Surfaces, "surfaces", "main", 0..4, 0..1, 2, None, None, None);
         assert_eq!(recorder.draw_calls.len(), 1);
         assert!(
             recorder.touched_buffers.is_empty(),
@@ -872,21 +1082,72 @@ mod tests {
         .ok()
     }
 
-    /// End-to-end readback test: records a command stream referencing a
-    /// single fake "quads" buffer, runs it through `finish` (stages + copies)
-    /// and `begin_readback`/`poll` (maps + harvests), and asserts the
-    /// harvested `DeepCapture`'s buffer contents match what was written --
-    /// the concrete "resource contents at time of use" claim from the issue,
-    /// covering the fixed-buffer slice of it this phase implements.
+    /// Creates a full headless `WgpuContext` (unlike `create_headless_device`
+    /// above, which only builds a bare device/queue) -- needed by
+    /// `finish_and_poll_read_back_real_buffer_and_texture_contents`, which
+    /// exercises `DeepCaptureRecorder::finish`'s texture readback (issue #72)
+    /// against a real `WgpuAtlas`/`SurfaceRegistry`, both of which need to
+    /// share the exact device the recorded copy commands and staging
+    /// buffers are created against. Returns `None` (skip, don't fail) under
+    /// the same no-adapter circumstances every other GPU test in this crate
+    /// already handles this way.
+    fn create_headless_context() -> Option<Arc<crate::platform::cross::render_context::WgpuContext>> {
+        crate::platform::cross::render_context::WgpuContext::new(
+            &crate::platform::cross::render_context::WgpuOptions::default(),
+        )
+        .ok()
+        .map(Arc::new)
+    }
+
+    /// Extracts a `width x height` sub-rectangle at `(x, y)` out of a
+    /// tightly packed, `full_width`-wide image with `bytes_per_pixel` bytes
+    /// per pixel. Used by the atlas half of
+    /// `finish_and_poll_read_back_real_buffer_and_texture_contents` to check
+    /// just the uploaded tile's own bytes within the full atlas page
+    /// readback, since the rest of that page's bytes are unspecified.
+    fn extract_sub_rectangle(
+        bytes: &[u8],
+        full_width: u32,
+        bytes_per_pixel: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    ) -> Vec<u8> {
+        let mut extracted = Vec::with_capacity((width * bytes_per_pixel * height) as usize);
+        for row in 0..height {
+            let row_start = (((y + row) * full_width + x) * bytes_per_pixel) as usize;
+            let row_end = row_start + (width * bytes_per_pixel) as usize;
+            extracted.extend_from_slice(&bytes[row_start..row_end]);
+        }
+        extracted
+    }
+
+    /// End-to-end readback test covering all three resource kinds
+    /// `DeepCaptureRecorder::finish` stages: a fixed buffer (Phase 4, issues
+    /// #60/#71), one atlas texture page, and one composited surface (Phase
+    /// 4b, issue #72). Allocates a real polychrome atlas tile through the
+    /// same public `PlatformAtlas::get_or_insert_with` entrypoint production
+    /// image rendering uses, and a real surface through
+    /// `SurfaceRegistry::create`, uploads known bytes into each, records
+    /// draw calls/touches referencing them, drives `finish` -> submit ->
+    /// `begin_readback` -> `poll` to completion against a real headless
+    /// device, and asserts the harvested `DeepCapture`'s buffer *and*
+    /// texture contents match what was written -- the concrete "resource
+    /// contents at time of use" claim from both issues, now covering
+    /// textures alongside the fixed-buffer case Phase 4 already had.
     #[test]
-    fn finish_and_poll_read_back_real_buffer_contents() {
-        let Some((device, queue)) = create_headless_device() else {
+    fn finish_and_poll_read_back_real_buffer_and_texture_contents() {
+        let Some(context) = create_headless_context() else {
             eprintln!(
-                "skipping finish_and_poll_read_back_real_buffer_contents: no wgpu adapter available in this environment"
+                "skipping finish_and_poll_read_back_real_buffer_and_texture_contents: no wgpu adapter available in this environment"
             );
             return;
         };
+        let device = &context.device;
+        let queue = &context.queue;
 
+        // --- Fixed buffer ---
         let source_bytes: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
         let source_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("test_quads_buffer"),
@@ -896,6 +1157,81 @@ mod tests {
         });
         queue.write_buffer(&source_buffer, 0, &source_bytes);
 
+        // --- Atlas texture: allocate a real polychrome tile the same way
+        // production image rendering does, through the public
+        // `PlatformAtlas` trait, so this exercises the exact same
+        // allocate/upload path a live app would (rather than reaching into
+        // `WgpuAtlas`'s private allocation internals). ---
+        let atlas = crate::platform::cross::atlas::WgpuAtlas::new(context.clone());
+        let tile_width = 4u32;
+        let tile_height = 4u32;
+        let tile_bytes: Vec<u8> = (0..(tile_width * tile_height * 4) as u16).map(|value| value as u8).collect();
+        let key = crate::AtlasKey::Image(crate::RenderImageParams {
+            image_id: crate::ImageId(1),
+            frame_index: 0,
+        });
+        let tile = {
+            use crate::PlatformAtlas;
+            let tile_bytes = tile_bytes.clone();
+            atlas
+                .get_or_insert_with(&key, &mut || {
+                    Ok(Some((
+                        crate::Size {
+                            width: crate::DevicePixels(tile_width as i32),
+                            height: crate::DevicePixels(tile_height as i32),
+                        },
+                        std::borrow::Cow::Owned(tile_bytes.clone()),
+                    )))
+                })
+                .expect("building the tile should not error")
+                .expect("the build closure returned Some, so a tile should be allocated")
+        };
+        let encoded_atlas_id = ((tile.texture_id.kind as u64) << 32) | tile.texture_id.index as u64;
+
+        // --- Surface texture: create a real surface and seed known content
+        // into its current front (display) texture via a render pass clear
+        // -- surface textures are only ever rendered into in production
+        // (`RENDER_ATTACHMENT`, deliberately not `COPY_DST`; see
+        // `create_triple_buffer`'s `deep_capture_readback` comment for why
+        // only `COPY_SRC` was added), so this mirrors the real write path
+        // rather than motivating a second, test-only usage flag. Pure
+        // opaque red (`1.0`/`0.0`/`0.0`/`1.0`) converts to Rgba8Unorm's
+        // exact endpoint byte values (`0`/`255`) regardless of the
+        // backend's rounding behavior for intermediate values, so the
+        // byte-exact assertion below is safe.
+        let surface_width = 6u32;
+        let surface_height = 3u32;
+        let surface_format = wgpu::TextureFormat::Rgba8Unorm;
+        let surface_id = context.surface_registry.create(device, surface_width, surface_height, surface_format);
+        let surface_bytes: Vec<u8> = std::iter::repeat_n([255u8, 0, 0, 255], (surface_width * surface_height) as usize)
+            .flatten()
+            .collect();
+        let front_view = context
+            .surface_registry
+            .front_view(surface_id)
+            .expect("a surface just created should have a front view");
+        let mut seed_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            seed_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("test_seed_surface_content"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &front_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+        queue.submit(Some(seed_encoder.finish()));
+
+        // --- Record and finish ---
         let mut recorder = DeepCaptureRecorder::new();
         recorder.record_draw_call(
             DrawCallKind::Quads,
@@ -906,28 +1242,90 @@ mod tests {
             2,
             Some(DeepCaptureBufferKind::Quads),
             None,
+            None,
+        );
+        recorder.record_draw_call(
+            DrawCallKind::PolySprites,
+            "poly_sprites",
+            "main",
+            0..4,
+            0..1,
+            3,
+            None,
+            Some(encoded_atlas_id),
+            None,
+        );
+        recorder.record_draw_call(
+            DrawCallKind::Surfaces,
+            "surfaces",
+            "main",
+            0..4,
+            0..1,
+            2,
+            None,
+            None,
+            Some(surface_id.0),
         );
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        let mut pending = recorder.finish(&device, &mut encoder, &[(DeepCaptureBufferKind::Quads, &source_buffer)]);
+        let mut pending = recorder.finish(
+            device,
+            &mut encoder,
+            &[(DeepCaptureBufferKind::Quads, &source_buffer)],
+            &atlas,
+            &context.surface_registry,
+        );
         queue.submit(Some(encoder.finish()));
         pending.begin_readback();
 
         let capture = loop {
             let _ = device.poll(wgpu::PollType::wait_indefinitely());
-            if let Some(capture) = pending.poll(&device) {
+            if let Some(capture) = pending.poll(device) {
                 break capture;
             }
         };
 
-        assert_eq!(capture.draw_calls.len(), 1);
-        assert!(capture.resources_finalized, "the one touched buffer's readback should have succeeded");
-        let contents = capture
+        assert_eq!(capture.draw_calls.len(), 3);
+        assert!(
+            capture.resources_finalized,
+            "every touched buffer/texture's readback should have succeeded"
+        );
+
+        let buffer_contents = capture
             .buffer_contents(DeepCaptureBufferKind::Quads)
             .expect("Quads buffer should have been read back");
         assert_eq!(
-            contents.bytes, source_bytes,
+            buffer_contents.bytes, source_bytes,
             "readback bytes should match exactly what was written to the source buffer"
+        );
+
+        let atlas_contents = capture
+            .texture_contents(flamegraph::DeepCaptureTextureId::Atlas(encoded_atlas_id))
+            .expect("the touched atlas texture should have been read back");
+        assert_eq!(atlas_contents.bytes_per_pixel, 4, "polychrome atlas pages are Rgba8Unorm");
+        let extracted_tile_bytes = extract_sub_rectangle(
+            &atlas_contents.bytes,
+            atlas_contents.width,
+            atlas_contents.bytes_per_pixel,
+            tile.bounds.origin.x.0 as u32,
+            tile.bounds.origin.y.0 as u32,
+            tile.bounds.size.width.0 as u32,
+            tile.bounds.size.height.0 as u32,
+        );
+        assert_eq!(
+            extracted_tile_bytes, tile_bytes,
+            "the uploaded tile's bytes should be present at its own bounds within the full readback page"
+        );
+
+        let surface_contents = capture
+            .texture_contents(flamegraph::DeepCaptureTextureId::Surface(surface_id.0))
+            .expect("the touched surface should have been read back");
+        assert_eq!(surface_contents.width, surface_width);
+        assert_eq!(surface_contents.height, surface_height);
+        assert_eq!(surface_contents.bytes_per_pixel, 4);
+        assert_eq!(
+            surface_contents.bytes, surface_bytes,
+            "readback bytes should match exactly what was written to the surface's front texture"
         );
     }
 

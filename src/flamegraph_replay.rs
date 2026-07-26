@@ -53,17 +53,35 @@
 //! sampler (the content being blurred) that Phase 4 never captures at all --
 //! see that function's doc comment for how it degrades just that one input.
 //!
-//! `MonoSprites`/`PolySprites` (atlas-textured) and `Surfaces` (embedded
-//! surface content) have no real texture bytes to replay at all -- Phase 4's
-//! atlas/surface texture readback was deferred to issue #72 and still
-//! doesn't exist. [`DeepCaptureReplay::resource_status`] reports
-//! [`DrawCallResourceStatus::TextureContentUnavailable`] for those draw
-//! calls, and [`render_deep_capture_step`] degrades gracefully by returning
-//! a generated checkerboard placeholder image
-//! ([`placeholder_checkerboard_rgba`]) instead of erroring, so a viewer can
-//! still show *something* at that step rather than getting stuck.
+//! `MonoSprites`/`PolySprites` (atlas-textured) now replay with real atlas
+//! texture content too, once Phase 4b (issue #72) landed atlas/surface
+//! texture readback (`DeepCapture::texture_contents`,
+//! `DeepCaptureTextureContents`): `render_mono_sprites_step`/
+//! `render_poly_sprites_step` follow the same buffer-backed recipe for their
+//! own instance buffer (`@group(3)`/`@group(2)` respectively), plus a real
+//! `@group(2)`/`@group(1)` atlas texture + sampler built from the captured
+//! bytes (`create_atlas_texture_bind_group`) instead of a placeholder.
+//! `MonoSprites` also needs a `ColorAdjustments` uniform Phase 4 never
+//! captures; `create_color_adjustments_bind_group`'s doc comment explains
+//! why an all-zero default is a safe, documented simplification there.
+//!
+//! `Surfaces` still degrades to a generated checkerboard placeholder
+//! ([`placeholder_checkerboard_rgba`]) via [`render_deep_capture_step`]
+//! even though its texture *content* is now capturable -- [`DeepCaptureDrawCall`]
+//! has no per-call geometry (a `Surfaces` draw call's `SurfaceParams`:
+//! `bounds`/`content_mask`) to position/mask a replayed quad with, and that
+//! is a distinct gap from texture-content readback itself, out of scope for
+//! issue #72 as filed. [`DeepCaptureReplay::resource_status`] reports
+//! [`DrawCallResourceStatus::TextureContentUnavailable`] for every
+//! `Surfaces` draw call unconditionally for this same reason, regardless of
+//! whether that specific surface's bytes were actually captured -- "nothing
+//! to replay faithfully" remains true either way until that follow-up
+//! geometry capture exists.
 
-use crate::flamegraph::{DeepCapture, DeepCaptureBufferKind, DeepCaptureDrawCall, DrawCallKind};
+use crate::flamegraph::{
+    DeepCapture, DeepCaptureBufferKind, DeepCaptureDrawCall, DeepCaptureTextureContents, DeepCaptureTextureId,
+    DrawCallKind,
+};
 use crate::flamegraph_ui_capture::{SceneSnapshot, UiElementNode, UiTreeCapture};
 
 // ---------------------------------------------------------------------------
@@ -172,19 +190,23 @@ impl UiTreeReplay {
 /// depends on are actually available to replay against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrawCallResourceStatus {
-    /// The fixed buffer this draw call reads was touched by the capture and
+    /// Every resource this draw call needs was touched by the capture and
     /// its readback completed -- [`render_deep_capture_step`] can use real
-    /// captured bytes for it (though it may still not have a wired-up
-    /// pipeline this round, see [`ReplayError::UnsupportedDrawCallKind`]).
+    /// captured bytes for it. For `MonoSprites`/`PolySprites` this means
+    /// both the instance buffer *and* the atlas texture it references;
+    /// `Surfaces` can never report this (see [`Self::TextureContentUnavailable`]).
     Available,
     /// This draw call references a fixed buffer
     /// ([`DeepCaptureDrawCall::buffer_kind`]) that the capture touched but
     /// whose readback did not complete (`DeepCapture::resources_finalized`
     /// was false, or this specific buffer's map failed).
     BufferReadbackMissing,
-    /// This draw call reads atlas/surface texture content
-    /// (`MonoSprites`/`PolySprites`/`Surfaces`), which Phase 4 never reads
-    /// back (deferred to issue #72). There is nothing to replay faithfully;
+    /// Either this is a `Surfaces` draw call (which always reports this --
+    /// see this module's doc comment for why even a captured surface
+    /// texture isn't enough to replay one faithfully), or it's a
+    /// `MonoSprites`/`PolySprites` call whose referenced atlas texture
+    /// wasn't captured (no `atlas_texture_id`, or that texture's readback
+    /// didn't complete). Either way there is nothing to replay faithfully;
     /// [`render_deep_capture_step`] substitutes a placeholder.
     TextureContentUnavailable,
     /// This draw call has no associated fixed-buffer resource at all (should
@@ -284,9 +306,29 @@ impl DeepCaptureReplay {
         };
 
         match call.kind {
-            DrawCallKind::MonoSprites | DrawCallKind::PolySprites | DrawCallKind::Surfaces => {
-                DrawCallResourceStatus::TextureContentUnavailable
+            DrawCallKind::MonoSprites | DrawCallKind::PolySprites => {
+                let texture_available = call
+                    .atlas_texture_id
+                    .is_some_and(|id| self.capture.texture_contents(DeepCaptureTextureId::Atlas(id)).is_some());
+                if !texture_available {
+                    return DrawCallResourceStatus::TextureContentUnavailable;
+                }
+                match call.buffer_kind {
+                    Some(kind) => {
+                        if self.capture.buffer_contents(kind).is_some() {
+                            DrawCallResourceStatus::Available
+                        } else {
+                            DrawCallResourceStatus::BufferReadbackMissing
+                        }
+                    }
+                    None => DrawCallResourceStatus::NoResource,
+                }
             }
+            // Always unavailable regardless of whether this specific
+            // surface's texture bytes were captured -- see this module's
+            // doc comment for why texture content alone isn't enough to
+            // replay a `Surfaces` call faithfully.
+            DrawCallKind::Surfaces => DrawCallResourceStatus::TextureContentUnavailable,
             _ => match call.buffer_kind {
                 Some(kind) => {
                     if self.capture.buffer_contents(kind).is_some() {
@@ -402,10 +444,12 @@ const REPLAY_TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unor
 /// pipeline fresh on every call rather than caching it across steps.
 ///
 /// See this module's doc comment for exactly which [`DrawCallKind`]s have a
-/// real pipeline wired up this round (every buffer-backed kind: `Quads`,
-/// `Shadows`, `Underlines`, `BackdropFilters`, `Paths`) versus which degrade
-/// to a placeholder (`MonoSprites`/`PolySprites`/`Surfaces`, via
-/// [`placeholder_checkerboard_rgba`]).
+/// real pipeline wired up this round (every buffer-backed kind -- `Quads`,
+/// `Shadows`, `Underlines`, `BackdropFilters`, `Paths` -- plus
+/// `MonoSprites`/`PolySprites` when their referenced atlas texture was
+/// captured) versus which degrade to a placeholder (`Surfaces` always;
+/// `MonoSprites`/`PolySprites` when their atlas texture wasn't captured),
+/// via [`placeholder_checkerboard_rgba`].
 pub fn render_deep_capture_step(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -423,41 +467,102 @@ pub fn render_deep_capture_step(
         .get(step)
         .ok_or(ReplayError::StepOutOfRange(step))?;
 
-    if matches!(call.kind, DrawCallKind::MonoSprites | DrawCallKind::PolySprites | DrawCallKind::Surfaces) {
-        return Ok(ReplayRenderOutput {
-            width: viewport_width,
-            height: viewport_height,
-            rgba8: placeholder_checkerboard_rgba(viewport_width, viewport_height, 16),
-            texture_unavailable: true,
-        });
-    }
-
-    let buffer_kind = call.buffer_kind.ok_or(ReplayError::UnsupportedDrawCallKind(call.kind))?;
-    let contents = replay
-        .capture()
-        .buffer_contents(buffer_kind)
-        .ok_or(ReplayError::MissingBufferContents(buffer_kind))?;
-
     match call.kind {
-        DrawCallKind::Quads => render_quads_step(device, queue, &contents.bytes, call, viewport_width, viewport_height),
-        DrawCallKind::Shadows => {
-            render_shadows_step(device, queue, &contents.bytes, call, viewport_width, viewport_height)
+        DrawCallKind::MonoSprites | DrawCallKind::PolySprites => {
+            let texture_contents = call
+                .atlas_texture_id
+                .and_then(|id| replay.capture().texture_contents(DeepCaptureTextureId::Atlas(id)));
+            let Some(texture_contents) = texture_contents else {
+                return Ok(placeholder_output(viewport_width, viewport_height));
+            };
+            let buffer_kind = call.buffer_kind.ok_or(ReplayError::UnsupportedDrawCallKind(call.kind))?;
+            let instance_contents = replay
+                .capture()
+                .buffer_contents(buffer_kind)
+                .ok_or(ReplayError::MissingBufferContents(buffer_kind))?;
+            match call.kind {
+                DrawCallKind::MonoSprites => render_mono_sprites_step(
+                    device,
+                    queue,
+                    &instance_contents.bytes,
+                    texture_contents,
+                    call,
+                    viewport_width,
+                    viewport_height,
+                ),
+                DrawCallKind::PolySprites => render_poly_sprites_step(
+                    device,
+                    queue,
+                    &instance_contents.bytes,
+                    texture_contents,
+                    call,
+                    viewport_width,
+                    viewport_height,
+                ),
+                // Unreachable in practice (this arm only matches
+                // MonoSprites/PolySprites), kept as a real error rather than
+                // `unreachable!()` for the same reason every other
+                // "shouldn't happen" arm in this module is.
+                _ => Err(ReplayError::UnsupportedDrawCallKind(call.kind)),
+            }
         }
-        DrawCallKind::Underlines => {
-            render_underlines_step(device, queue, &contents.bytes, call, viewport_width, viewport_height)
+        DrawCallKind::Surfaces => {
+            // No per-draw-call geometry (`SurfaceParams`: `bounds`/
+            // `content_mask`) is captured anywhere in `DeepCapture` -- issue
+            // #72 completed texture *content* readback, but faithfully
+            // positioning and clip-masking a `Surfaces` quad needs that
+            // geometry too, a distinct, still-open gap (see this module's
+            // doc comment). Even when this call's surface texture bytes are
+            // available, there is nothing to draw them *at* yet, so this
+            // still degrades to the placeholder unconditionally.
+            Ok(placeholder_output(viewport_width, viewport_height))
         }
-        DrawCallKind::BackdropFilters => {
-            render_backdrop_filters_step(device, queue, &contents.bytes, call, viewport_width, viewport_height)
+        DrawCallKind::Quads
+        | DrawCallKind::Shadows
+        | DrawCallKind::Underlines
+        | DrawCallKind::BackdropFilters
+        | DrawCallKind::Paths => {
+            let buffer_kind = call.buffer_kind.ok_or(ReplayError::UnsupportedDrawCallKind(call.kind))?;
+            let contents = replay
+                .capture()
+                .buffer_contents(buffer_kind)
+                .ok_or(ReplayError::MissingBufferContents(buffer_kind))?;
+
+            match call.kind {
+                DrawCallKind::Quads => {
+                    render_quads_step(device, queue, &contents.bytes, call, viewport_width, viewport_height)
+                }
+                DrawCallKind::Shadows => {
+                    render_shadows_step(device, queue, &contents.bytes, call, viewport_width, viewport_height)
+                }
+                DrawCallKind::Underlines => {
+                    render_underlines_step(device, queue, &contents.bytes, call, viewport_width, viewport_height)
+                }
+                DrawCallKind::BackdropFilters => {
+                    render_backdrop_filters_step(device, queue, &contents.bytes, call, viewport_width, viewport_height)
+                }
+                DrawCallKind::Paths => {
+                    render_paths_step(device, queue, &contents.bytes, call, viewport_width, viewport_height)
+                }
+                // Unreachable in practice (this arm only matches the five
+                // buffer-backed kinds listed above it), same non-panicking
+                // rationale as every other such arm in this module.
+                _ => Err(ReplayError::UnsupportedDrawCallKind(call.kind)),
+            }
         }
-        DrawCallKind::Paths => render_paths_step(device, queue, &contents.bytes, call, viewport_width, viewport_height),
-        DrawCallKind::MonoSprites | DrawCallKind::PolySprites | DrawCallKind::Surfaces => {
-            // Unreachable in practice (handled by the early return above),
-            // but kept as a real error arm rather than `unreachable!()` so
-            // this match stays exhaustive and honest without panicking if
-            // that early return's condition ever drifts out of sync with
-            // this one.
-            Err(ReplayError::UnsupportedDrawCallKind(call.kind))
-        }
+    }
+}
+
+/// Builds the generated checkerboard placeholder [`ReplayRenderOutput`]
+/// [`render_deep_capture_step`] substitutes whenever a draw call's real
+/// texture content isn't available (or, for `Surfaces`, never can be
+/// faithfully positioned regardless -- see this module's doc comment).
+fn placeholder_output(viewport_width: u32, viewport_height: u32) -> ReplayRenderOutput {
+    ReplayRenderOutput {
+        width: viewport_width,
+        height: viewport_height,
+        rgba8: placeholder_checkerboard_rgba(viewport_width, viewport_height, 16),
+        texture_unavailable: true,
     }
 }
 
@@ -1218,6 +1323,364 @@ fn render_paths_step(
     )
 }
 
+/// Matches `renderer.rs`'s private `ColorAdjustments` struct layout exactly
+/// (`vec4<f32>` gamma ratios + `f32` grayscale contrast + 12 bytes of
+/// padding, giving the 32-byte, 16-byte-aligned stride WGSL's uniform-buffer
+/// layout rules require for a struct whose largest member is `vec4<f32>`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ReplayColorAdjustments {
+    gamma_ratios: [f32; 4],
+    grayscale_enhanced_contrast: f32,
+    _padding: [f32; 3],
+}
+
+/// Builds `mono_sprites.wgsl`'s `@group(1)` `ColorAdjustments` uniform bind
+/// group with an all-zero value. Phase 4/4b never captures this uniform (it
+/// isn't one of `WgpuContext`'s per-primitive fixed buffers, just a single
+/// small global one -- `WgpuContext::color_adjustments_buffer`), so replay
+/// has no real captured value to re-upload here, unlike every other bind
+/// group this module builds. An all-zero value is not an arbitrary
+/// placeholder, though: working through `mono_sprites.wgsl`'s own math,
+/// `light_on_dark_contrast` returns `0` when `grayscale_enhanced_contrast`
+/// is `0` (its `enhancedContrast` multiplier), which makes `enhance_contrast`
+/// an identity (`sample * 1 / (sample * 0 + 1) == sample`), and
+/// `apply_alpha_correction` with an all-zero `gamma_ratios` reduces to
+/// `a + a * (1 - a) * 0 == a`. So this doesn't reproduce production's
+/// contrast/gamma correction, but it also doesn't corrupt the replayed
+/// glyph's color -- the raw atlas sample comes through unmodified.
+fn create_color_adjustments_bind_group(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> (wgpu::BindGroupLayout, wgpu::BindGroup) {
+    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("flamegraph_replay_color_adjustments_bind_group_layout"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+
+    let adjustments = ReplayColorAdjustments {
+        gamma_ratios: [0.0; 4],
+        grayscale_enhanced_contrast: 0.0,
+        _padding: [0.0; 3],
+    };
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("flamegraph_replay_color_adjustments_buffer"),
+        size: core::mem::size_of::<ReplayColorAdjustments>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&buffer, 0, bytemuck::bytes_of(&adjustments));
+
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("flamegraph_replay_color_adjustments_bind_group"),
+        layout: &bind_group_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: buffer.as_entire_binding(),
+        }],
+    });
+
+    (bind_group_layout, bind_group)
+}
+
+/// Builds a `texture_2d<f32>` + `sampler` bind group (matching
+/// `sprites_bind_group_layout` in `renderer.rs`: a `VERTEX_FRAGMENT`-visible
+/// filterable texture at binding 0, a `FRAGMENT`-visible filtering sampler
+/// at binding 1) from a real captured [`DeepCaptureTextureContents`] -- the
+/// atlas-texture counterpart to [`create_storage_bind_group`]'s "re-upload
+/// captured bytes verbatim" recipe. `bytes_per_pixel` picks the pixel
+/// format: `1` is the atlas's monochrome pages (`R8Unorm`), anything else
+/// (in practice always `4`) its polychrome ones (`Rgba8Unorm`) -- the only
+/// two formats `WgpuAtlas::push_texture` (`platform/cross/atlas.rs`) ever
+/// creates, so this doesn't need to carry a full `wgpu::TextureFormat`
+/// mirror through the capture's data model just for this.
+fn create_atlas_texture_bind_group(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    contents: &DeepCaptureTextureContents,
+) -> (wgpu::BindGroupLayout, wgpu::BindGroup) {
+    let format = if contents.bytes_per_pixel == 1 {
+        wgpu::TextureFormat::R8Unorm
+    } else {
+        wgpu::TextureFormat::Rgba8Unorm
+    };
+
+    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("flamegraph_replay_sprite_texture_bind_group_layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+
+    let width = contents.width.max(1);
+    let height = contents.height.max(1);
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("flamegraph_replay_sprite_texture"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    if !contents.bytes.is_empty() {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &contents.bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * contents.bytes_per_pixel),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("flamegraph_replay_sprite_sampler"),
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("flamegraph_replay_sprite_texture_bind_group"),
+        layout: &bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    });
+
+    (bind_group_layout, bind_group)
+}
+
+/// Mirrors [`render_quads_step`]'s recipe for `mono_sprites.wgsl`'s own
+/// `@group(3)` instance buffer (`mono_sprites_bind_group_layout` in
+/// `renderer.rs`: a single `VERTEX`-visible read-only storage buffer), plus
+/// two more real inputs `Quads` never needed: `@group(2)`'s atlas texture +
+/// sampler, built from `texture_contents` (real captured bytes, issue #72 --
+/// the completion of item 1's placeholder for this kind), and `@group(1)`'s
+/// `ColorAdjustments` uniform, for which replay has no captured value (see
+/// [`create_color_adjustments_bind_group`]'s doc comment for why an all-zero
+/// default is a safe, documented simplification here).
+fn render_mono_sprites_step(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    mono_sprites_bytes: &[u8],
+    texture_contents: &DeepCaptureTextureContents,
+    call: &DeepCaptureDrawCall,
+    viewport_width: u32,
+    viewport_height: u32,
+) -> Result<ReplayRenderOutput, ReplayError> {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("flamegraph_replay_mono_sprites_shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("platform/cross/shaders/mono_sprites.wgsl").into()),
+    });
+
+    let (globals_bind_group_layout, globals_bind_group) =
+        create_globals_bind_group(device, queue, viewport_width, viewport_height);
+    let (color_adjustments_bind_group_layout, color_adjustments_bind_group) =
+        create_color_adjustments_bind_group(device, queue);
+    let (sprite_texture_bind_group_layout, sprite_texture_bind_group) =
+        create_atlas_texture_bind_group(device, queue, texture_contents);
+    let (mono_sprites_bind_group_layout, mono_sprites_bind_group) = create_storage_bind_group(
+        device,
+        queue,
+        "flamegraph_replay_mono_sprites",
+        wgpu::ShaderStages::VERTEX,
+        mono_sprites_bytes,
+    );
+
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("flamegraph_replay_mono_sprites_pipeline_layout"),
+        bind_group_layouts: &[
+            Some(&globals_bind_group_layout),
+            Some(&color_adjustments_bind_group_layout),
+            Some(&sprite_texture_bind_group_layout),
+            Some(&mono_sprites_bind_group_layout),
+        ],
+        immediate_size: 0,
+    });
+
+    let color_targets = [Some(wgpu::ColorTargetState {
+        format: REPLAY_TARGET_FORMAT,
+        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+        write_mask: wgpu::ColorWrites::ALL,
+    })];
+
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("flamegraph_replay_mono_sprites_pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_mono_sprite"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleStrip,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_mono_sprite"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &color_targets,
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    render_pipeline_offscreen(
+        device,
+        queue,
+        &pipeline,
+        &[
+            &globals_bind_group,
+            &color_adjustments_bind_group,
+            &sprite_texture_bind_group,
+            &mono_sprites_bind_group,
+        ],
+        call.vertex_range,
+        call.instance_range,
+        viewport_width,
+        viewport_height,
+    )
+}
+
+/// Mirrors [`render_quads_step`]'s recipe for `poly_sprites.wgsl`'s own
+/// `@group(2)` instance buffer (`poly_sprites_bind_group_layout` in
+/// `renderer.rs`: a single `VERTEX_FRAGMENT`-visible read-only storage
+/// buffer), plus a real `@group(1)` atlas texture + sampler built from
+/// `texture_contents` (real captured bytes, issue #72). Simpler than
+/// [`render_mono_sprites_step`]: `poly_sprites.wgsl` has no
+/// `ColorAdjustments`-style uniform dependency at all.
+fn render_poly_sprites_step(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    poly_sprites_bytes: &[u8],
+    texture_contents: &DeepCaptureTextureContents,
+    call: &DeepCaptureDrawCall,
+    viewport_width: u32,
+    viewport_height: u32,
+) -> Result<ReplayRenderOutput, ReplayError> {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("flamegraph_replay_poly_sprites_shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("platform/cross/shaders/poly_sprites.wgsl").into()),
+    });
+
+    let (globals_bind_group_layout, globals_bind_group) =
+        create_globals_bind_group(device, queue, viewport_width, viewport_height);
+    let (sprite_texture_bind_group_layout, sprite_texture_bind_group) =
+        create_atlas_texture_bind_group(device, queue, texture_contents);
+    let (poly_sprites_bind_group_layout, poly_sprites_bind_group) = create_storage_bind_group(
+        device,
+        queue,
+        "flamegraph_replay_poly_sprites",
+        wgpu::ShaderStages::VERTEX_FRAGMENT,
+        poly_sprites_bytes,
+    );
+
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("flamegraph_replay_poly_sprites_pipeline_layout"),
+        bind_group_layouts: &[
+            Some(&globals_bind_group_layout),
+            Some(&sprite_texture_bind_group_layout),
+            Some(&poly_sprites_bind_group_layout),
+        ],
+        immediate_size: 0,
+    });
+
+    let color_targets = [Some(wgpu::ColorTargetState {
+        format: REPLAY_TARGET_FORMAT,
+        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+        write_mask: wgpu::ColorWrites::ALL,
+    })];
+
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("flamegraph_replay_poly_sprites_pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_poly_sprite"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleStrip,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_poly_sprite"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &color_targets,
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    render_pipeline_offscreen(
+        device,
+        queue,
+        &pipeline,
+        &[&globals_bind_group, &sprite_texture_bind_group, &poly_sprites_bind_group],
+        call.vertex_range,
+        call.instance_range,
+        viewport_width,
+        viewport_height,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1305,6 +1768,7 @@ mod tests {
                     bind_group_count: 2,
                     buffer_kind: Some(DeepCaptureBufferKind::Quads),
                     atlas_texture_id: None,
+                    surface_id: None,
                 },
                 DeepCaptureDrawCall {
                     sequence: 1,
@@ -1316,6 +1780,7 @@ mod tests {
                     bind_group_count: 4,
                     buffer_kind: Some(DeepCaptureBufferKind::MonoSprites),
                     atlas_texture_id: Some(9),
+                    surface_id: None,
                 },
                 DeepCaptureDrawCall {
                     sequence: 2,
@@ -1327,12 +1792,14 @@ mod tests {
                     bind_group_count: 2,
                     buffer_kind: Some(DeepCaptureBufferKind::Shadows),
                     atlas_texture_id: None,
+                    surface_id: None,
                 },
             ],
             buffer_contents: vec![DeepCaptureBufferContents {
                 kind: DeepCaptureBufferKind::Quads,
                 bytes: vec![0; 64],
             }],
+            texture_contents: Vec::new(),
             resources_finalized: false,
         }
     }
@@ -1484,11 +1951,13 @@ mod tests {
                 bind_group_count: 2,
                 buffer_kind: Some(DeepCaptureBufferKind::Quads),
                 atlas_texture_id: None,
+                surface_id: None,
             }],
             buffer_contents: vec![DeepCaptureBufferContents {
                 kind: DeepCaptureBufferKind::Quads,
                 bytes: quad_bytes(&quad),
             }],
+            texture_contents: Vec::new(),
             resources_finalized: true,
         };
 
@@ -1521,6 +1990,285 @@ mod tests {
         let replay = DeepCaptureReplay::new(sample_deep_capture());
         let output = render_deep_capture_step(&device, &queue, &replay, 1, 8, 8)
             .expect("sprite draw calls should degrade gracefully rather than error");
+        assert!(output.texture_unavailable);
+        assert_eq!(output.rgba8.len(), 8 * 8 * 4);
+    }
+
+    /// End-to-end GPU replay test for `MonoSprites` (issue #72's completion
+    /// of item 1's placeholder for this kind): builds a small, fully-opaque
+    /// monochrome atlas page and one `MonochromeSprite` instance covering
+    /// the whole replay viewport with a solid green text color, captures
+    /// both the instance buffer bytes and the atlas texture bytes the way a
+    /// real `DeepCapture` would hold them, replays that single draw call
+    /// against a real headless device, and asserts the rendered output's
+    /// center pixel is green and opaque -- proving `render_mono_sprites_step`
+    /// actually samples the real captured atlas texture (not a placeholder)
+    /// and that the all-zero `ColorAdjustments` default
+    /// (`create_color_adjustments_bind_group`) doesn't corrupt the color.
+    #[test]
+    fn render_deep_capture_step_reproduces_a_captured_mono_sprite() {
+        let Some((device, queue)) = create_headless_device() else {
+            eprintln!("skipping render_deep_capture_step_reproduces_a_captured_mono_sprite: no wgpu adapter available");
+            return;
+        };
+
+        let width = 32u32;
+        let height = 32u32;
+
+        // A 4x4 monochrome atlas page, fully opaque coverage everywhere
+        // (255 = full intensity in R8Unorm), so the sampled alpha is 1.0
+        // across the whole tile.
+        let atlas_width = 4u32;
+        let atlas_height = 4u32;
+        let atlas_bytes = vec![255u8; (atlas_width * atlas_height) as usize];
+
+        let bounds = crate::Bounds {
+            origin: crate::Point {
+                x: crate::ScaledPixels::from(0.0),
+                y: crate::ScaledPixels::from(0.0),
+            },
+            size: crate::Size {
+                width: crate::ScaledPixels::from(width as f32),
+                height: crate::ScaledPixels::from(height as f32),
+            },
+        };
+        let green: crate::Hsla = crate::rgb(0x00ff00).into();
+        let sprite = crate::scene::MonochromeSprite {
+            order: 0,
+            pad: 0,
+            bounds,
+            content_mask: crate::ContentMask { bounds },
+            text_color: crate::solid_text_color(green),
+            tile: crate::AtlasTile {
+                texture_id: crate::AtlasTextureId {
+                    index: 0,
+                    kind: crate::AtlasTextureKind::Monochrome,
+                },
+                tile_id: crate::TileId(0),
+                padding: 0,
+                bounds: crate::Bounds {
+                    origin: crate::Point {
+                        x: crate::DevicePixels(0),
+                        y: crate::DevicePixels(0),
+                    },
+                    size: crate::Size {
+                        width: crate::DevicePixels(atlas_width as i32),
+                        height: crate::DevicePixels(atlas_height as i32),
+                    },
+                },
+            },
+            transformation: crate::scene::TransformationMatrix::unit(),
+        };
+        let sprite_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &sprite as *const crate::scene::MonochromeSprite as *const u8,
+                core::mem::size_of::<crate::scene::MonochromeSprite>(),
+            )
+        }
+        .to_vec();
+
+        let encoded_atlas_id = 0u64; // (Monochrome as u64) << 32 | index 0
+        let capture = DeepCapture {
+            draw_calls: vec![DeepCaptureDrawCall {
+                sequence: 0,
+                kind: DrawCallKind::MonoSprites,
+                pipeline_label: "mono_sprites",
+                pass_label: "main",
+                vertex_range: (0, 4),
+                instance_range: (0, 1),
+                bind_group_count: 4,
+                buffer_kind: Some(DeepCaptureBufferKind::MonoSprites),
+                atlas_texture_id: Some(encoded_atlas_id),
+                surface_id: None,
+            }],
+            buffer_contents: vec![DeepCaptureBufferContents {
+                kind: DeepCaptureBufferKind::MonoSprites,
+                bytes: sprite_bytes,
+            }],
+            texture_contents: vec![DeepCaptureTextureContents {
+                id: DeepCaptureTextureId::Atlas(encoded_atlas_id),
+                width: atlas_width,
+                height: atlas_height,
+                bytes_per_pixel: 1,
+                bytes: atlas_bytes,
+            }],
+            resources_finalized: true,
+        };
+
+        let replay = DeepCaptureReplay::new(capture);
+        assert_eq!(replay.resource_status(0), DrawCallResourceStatus::Available);
+
+        let output = render_deep_capture_step(&device, &queue, &replay, 0, width, height)
+            .expect("replaying the captured mono sprite draw call should succeed");
+
+        assert!(!output.texture_unavailable);
+        let pixel = output.pixel(width / 2, height / 2).expect("center pixel should be in bounds");
+        assert!(pixel[0] < 60, "expected little red in the center pixel, got {pixel:?}");
+        assert!(pixel[1] > 200, "expected a strongly green center pixel, got {pixel:?}");
+        assert!(pixel[2] < 60, "expected little blue in the center pixel, got {pixel:?}");
+        assert!(pixel[3] > 200, "expected an opaque center pixel, got {pixel:?}");
+    }
+
+    /// End-to-end GPU replay test for `PolySprites`, mirroring the
+    /// `MonoSprites` test above but for a polychrome (RGBA) atlas page and a
+    /// `PolychromeSprite` instance, without `MonoSprites`'s extra
+    /// `ColorAdjustments` dependency.
+    #[test]
+    fn render_deep_capture_step_reproduces_a_captured_poly_sprite() {
+        let Some((device, queue)) = create_headless_device() else {
+            eprintln!("skipping render_deep_capture_step_reproduces_a_captured_poly_sprite: no wgpu adapter available");
+            return;
+        };
+
+        let width = 32u32;
+        let height = 32u32;
+
+        // A 2x2 polychrome atlas page, every pixel opaque blue.
+        let atlas_width = 2u32;
+        let atlas_height = 2u32;
+        let atlas_bytes: Vec<u8> = std::iter::repeat_n([0u8, 0, 255, 255], (atlas_width * atlas_height) as usize)
+            .flatten()
+            .collect();
+
+        let bounds = crate::Bounds {
+            origin: crate::Point {
+                x: crate::ScaledPixels::from(0.0),
+                y: crate::ScaledPixels::from(0.0),
+            },
+            size: crate::Size {
+                width: crate::ScaledPixels::from(width as f32),
+                height: crate::ScaledPixels::from(height as f32),
+            },
+        };
+        let sprite = crate::scene::PolychromeSprite {
+            order: 0,
+            pad: 0,
+            grayscale: false,
+            opacity: 1.0,
+            bounds,
+            content_mask: crate::ContentMask { bounds },
+            corner_radii: Default::default(),
+            tile: crate::AtlasTile {
+                texture_id: crate::AtlasTextureId {
+                    index: 0,
+                    kind: crate::AtlasTextureKind::Polychrome,
+                },
+                tile_id: crate::TileId(0),
+                padding: 0,
+                bounds: crate::Bounds {
+                    origin: crate::Point {
+                        x: crate::DevicePixels(0),
+                        y: crate::DevicePixels(0),
+                    },
+                    size: crate::Size {
+                        width: crate::DevicePixels(atlas_width as i32),
+                        height: crate::DevicePixels(atlas_height as i32),
+                    },
+                },
+            },
+        };
+        let sprite_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &sprite as *const crate::scene::PolychromeSprite as *const u8,
+                core::mem::size_of::<crate::scene::PolychromeSprite>(),
+            )
+        }
+        .to_vec();
+
+        let encoded_atlas_id = 1u64 << 32; // (Polychrome as u64) << 32 | index 0
+        let capture = DeepCapture {
+            draw_calls: vec![DeepCaptureDrawCall {
+                sequence: 0,
+                kind: DrawCallKind::PolySprites,
+                pipeline_label: "poly_sprites",
+                pass_label: "main",
+                vertex_range: (0, 4),
+                instance_range: (0, 1),
+                bind_group_count: 3,
+                buffer_kind: Some(DeepCaptureBufferKind::PolySprites),
+                atlas_texture_id: Some(encoded_atlas_id),
+                surface_id: None,
+            }],
+            buffer_contents: vec![DeepCaptureBufferContents {
+                kind: DeepCaptureBufferKind::PolySprites,
+                bytes: sprite_bytes,
+            }],
+            texture_contents: vec![DeepCaptureTextureContents {
+                id: DeepCaptureTextureId::Atlas(encoded_atlas_id),
+                width: atlas_width,
+                height: atlas_height,
+                bytes_per_pixel: 4,
+                bytes: atlas_bytes,
+            }],
+            resources_finalized: true,
+        };
+
+        let replay = DeepCaptureReplay::new(capture);
+        assert_eq!(replay.resource_status(0), DrawCallResourceStatus::Available);
+
+        let output = render_deep_capture_step(&device, &queue, &replay, 0, width, height)
+            .expect("replaying the captured poly sprite draw call should succeed");
+
+        assert!(!output.texture_unavailable);
+        let pixel = output.pixel(width / 2, height / 2).expect("center pixel should be in bounds");
+        assert!(pixel[0] < 60, "expected little red in the center pixel, got {pixel:?}");
+        assert!(pixel[1] < 60, "expected little green in the center pixel, got {pixel:?}");
+        assert!(pixel[2] > 200, "expected a strongly blue center pixel, got {pixel:?}");
+        assert!(pixel[3] > 200, "expected an opaque center pixel, got {pixel:?}");
+    }
+
+    /// `Surfaces` always degrades to the checkerboard placeholder, even once
+    /// its texture content has actually been captured -- see this module's
+    /// doc comment for why (no captured `SurfaceParams` geometry to
+    /// position/mask it with). This is the regression case for that
+    /// specific claim: unlike
+    /// `render_deep_capture_step_reports_texture_unavailable_placeholder_for_sprites`
+    /// above (which has no captured texture at all for its `MonoSprites`
+    /// call), this fixture's `Surfaces` call has real `texture_contents`
+    /// keyed by its `surface_id`, and the replay still must not error or
+    /// attempt to draw it.
+    #[test]
+    fn render_deep_capture_step_still_placeholders_surfaces_with_captured_texture() {
+        let Some((device, queue)) = create_headless_device() else {
+            eprintln!(
+                "skipping render_deep_capture_step_still_placeholders_surfaces_with_captured_texture: no wgpu adapter available"
+            );
+            return;
+        };
+
+        let capture = DeepCapture {
+            draw_calls: vec![DeepCaptureDrawCall {
+                sequence: 0,
+                kind: DrawCallKind::Surfaces,
+                pipeline_label: "surfaces",
+                pass_label: "main",
+                vertex_range: (0, 4),
+                instance_range: (0, 1),
+                bind_group_count: 2,
+                buffer_kind: None,
+                atlas_texture_id: None,
+                surface_id: Some(7),
+            }],
+            buffer_contents: Vec::new(),
+            texture_contents: vec![DeepCaptureTextureContents {
+                id: DeepCaptureTextureId::Surface(7),
+                width: 4,
+                height: 4,
+                bytes_per_pixel: 4,
+                bytes: vec![0; 4 * 4 * 4],
+            }],
+            resources_finalized: true,
+        };
+
+        let replay = DeepCaptureReplay::new(capture);
+        assert_eq!(
+            replay.resource_status(0),
+            DrawCallResourceStatus::TextureContentUnavailable,
+            "Surfaces should report unavailable even with a captured texture present"
+        );
+
+        let output = render_deep_capture_step(&device, &queue, &replay, 0, 8, 8)
+            .expect("Surfaces draw calls should degrade gracefully rather than error");
         assert!(output.texture_unavailable);
         assert_eq!(output.rgba8.len(), 8 * 8 * 4);
     }
@@ -1621,11 +2369,13 @@ mod tests {
                 bind_group_count: 2,
                 buffer_kind: Some(DeepCaptureBufferKind::Shadows),
                 atlas_texture_id: None,
+                surface_id: None,
             }],
             buffer_contents: vec![DeepCaptureBufferContents {
                 kind: DeepCaptureBufferKind::Shadows,
                 bytes: shadow_bytes(&shadow),
             }],
+            texture_contents: Vec::new(),
             resources_finalized: true,
         };
 
@@ -1709,11 +2459,13 @@ mod tests {
                 bind_group_count: 2,
                 buffer_kind: Some(DeepCaptureBufferKind::Paths),
                 atlas_texture_id: None,
+                surface_id: None,
             }],
             buffer_contents: vec![DeepCaptureBufferContents {
                 kind: DeepCaptureBufferKind::Paths,
                 bytes: path_bytes,
             }],
+            texture_contents: Vec::new(),
             resources_finalized: true,
         };
 

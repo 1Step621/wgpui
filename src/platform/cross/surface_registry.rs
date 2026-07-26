@@ -253,6 +253,30 @@ impl SurfaceRegistry {
         surfaces.get(&id).map(|tb| tb.format)
     }
 
+    /// One surface's currently-displayed triple-buffer texture, snapshotted
+    /// for a triggered GPU deep capture (Phase 4b of the profiling epic,
+    /// issue #72). Distinct from `front_view`, which only exposes a
+    /// `TextureView` -- enough to bind the surfaces pipeline, but
+    /// `copy_texture_to_buffer` needs the underlying `wgpu::Texture`
+    /// directly, plus the pixel dimensions/texel size a caller needs to
+    /// compute `wgpu::COPY_BYTES_PER_ROW_ALIGNMENT` row padding. A poisoned
+    /// lock is treated as "nothing to snapshot" rather than propagating the
+    /// panic -- this is a diagnostic-only read, matching `memory_usage`'s
+    /// same choice just below.
+    #[cfg(feature = "flamegraph")]
+    pub(crate) fn front_texture_snapshot(&self, id: SurfaceId) -> Option<SurfaceTextureSnapshot> {
+        let surfaces = self.surfaces.lock().ok()?;
+        surfaces.get(&id).map(|tb| {
+            let (_, _, display) = TripleBuffer::unpack_state(tb.state.load(Ordering::Acquire));
+            SurfaceTextureSnapshot {
+                texture: tb.textures[display as usize].clone(),
+                width: tb.width,
+                height: tb.height,
+                bytes_per_pixel: super::render_context::texel_size(tb.format) as u32,
+            }
+        })
+    }
+
     /// Remove a surface from the registry.
     pub fn remove(&self, id: SurfaceId) {
         self.surfaces.lock().unwrap().remove(&id);
@@ -313,6 +337,22 @@ impl SurfaceRegistry {
         let w = width.max(1);
         let h = height.max(1);
 
+        // Phase 4b of the profiling epic (issue #72) reads a surface's
+        // currently-displayed triple-buffer texture back via
+        // `copy_texture_to_buffer` during a triggered GPU deep capture,
+        // which requires `COPY_SRC` on the source texture or wgpu's
+        // validator rejects the encoder outright -- the exact same class of
+        // hard, process-wide panic `render_context.rs`'s fixed buffers hit
+        // before `COPY_SRC` was added to them (see that fix's commit
+        // message for the full incident). Add it only when the capture code
+        // that actually needs it is compiled in, so a non-`flamegraph`
+        // build's surface textures are byte-for-byte the same as before
+        // this change.
+        #[cfg(feature = "flamegraph")]
+        let deep_capture_readback = wgpu::TextureUsages::COPY_SRC;
+        #[cfg(not(feature = "flamegraph"))]
+        let deep_capture_readback = wgpu::TextureUsages::empty();
+
         let create_texture = |label: &str| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
@@ -326,7 +366,8 @@ impl SurfaceRegistry {
                 dimension: wgpu::TextureDimension::D2,
                 format,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | deep_capture_readback,
                 view_formats: &[],
             })
         };
@@ -349,5 +390,117 @@ impl SurfaceRegistry {
             height: h,
             format,
         }
+    }
+}
+
+/// See [`SurfaceRegistry::front_texture_snapshot`].
+#[cfg(feature = "flamegraph")]
+pub(crate) struct SurfaceTextureSnapshot {
+    pub(crate) texture: wgpu::Texture,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) bytes_per_pixel: u32,
+}
+
+#[cfg(all(test, feature = "flamegraph"))]
+mod tests {
+    use super::SurfaceRegistry;
+
+    /// Creates a headless (surface-less) `wgpu::Device`/`Queue`, the same
+    /// pattern `flamegraph_gpu.rs`/`flamegraph_replay.rs` already use for
+    /// their own GPU-backed tests (see either module's `create_headless_device`
+    /// doc comment for why `enumerate_adapters` + pick-first is used instead
+    /// of `request_adapter`, and why a missing adapter skips rather than
+    /// fails the test in this sandbox).
+    fn create_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            flags: wgpu::InstanceFlags::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            display: None,
+        });
+        let adapter = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()))
+            .into_iter()
+            .next()?;
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
+    }
+
+    /// Regression test for the exact bug class `render_context.rs`'s fixed
+    /// buffers hit before that fix landed (see `create_triple_buffer`'s
+    /// `deep_capture_readback` comment): a surface's triple-buffer textures
+    /// need `COPY_SRC` for a triggered GPU deep capture (issue #72) to read
+    /// their content back via `copy_texture_to_buffer`, or wgpu's validator
+    /// rejects the encoder outright -- a hard, process-wide panic by
+    /// default, not a soft/recoverable error. This goes through the real
+    /// `SurfaceRegistry::create` construction path -- the same one
+    /// `create_wgpu_surface` uses in production -- and uses a push/pop error
+    /// scope (rather than relying on wgpu's default uncaptured-error
+    /// handler, which is what would panic) so a regression here fails the
+    /// assertion cleanly instead of aborting the test process.
+    #[test]
+    fn surface_textures_created_with_flamegraph_feature_support_copy_texture_to_buffer_readback() {
+        let Some((device, queue)) = create_headless_device() else {
+            eprintln!(
+                "skipping surface_textures_created_with_flamegraph_feature_support_copy_texture_to_buffer_readback: no wgpu adapter available in this environment"
+            );
+            return;
+        };
+
+        let registry = SurfaceRegistry::new();
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let width = 16u32;
+        let height = 16u32;
+        let surface_id = registry.create(&device, width, height, format);
+
+        let snapshot = registry
+            .front_texture_snapshot(surface_id)
+            .expect("a surface just created should have a snapshot-able front texture");
+        assert_eq!(snapshot.width, width);
+        assert_eq!(snapshot.height, height);
+        assert_eq!(snapshot.bytes_per_pixel, 4);
+
+        let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+
+        let bytes_per_pixel = snapshot.bytes_per_pixel;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let unpadded_bytes_per_row = width * bytes_per_pixel;
+        let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(align) * align;
+        let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("regression_test_staging_buffer"),
+            size: (padded_bytes_per_row as u64) * (height as u64),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &snapshot.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging_buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(encoder.finish()));
+
+        let error = pollster::block_on(error_scope.pop());
+        assert!(
+            error.is_none(),
+            "surface front texture should accept a copy_texture_to_buffer read (COPY_SRC), got: {error:?}"
+        );
     }
 }

@@ -20,8 +20,15 @@ impl Default for WgpuOptions {
 
 pub struct WgpuContext {
     pub(super) adapter: wgpu::Adapter,
-    pub(super) device: wgpu::Device,
-    pub(super) queue: wgpu::Queue,
+    // `pub(crate)`, not `pub(super)` like most of this struct's other
+    // fields: Phase 4b of the profiling epic (issue #72) needs a real
+    // `wgpu::Device`/`wgpu::Queue` alongside a real `WgpuAtlas`/
+    // `SurfaceRegistry` in `flamegraph_gpu.rs`'s own tests (outside
+    // `platform::cross`) to exercise `DeepCaptureRecorder::finish`'s texture
+    // readback end-to-end, the same reason `surface_registry` below is
+    // already `pub(crate)` rather than `pub(super)`.
+    pub(crate) device: wgpu::Device,
+    pub(crate) queue: wgpu::Queue,
     pub(super) instance: wgpu::Instance,
 
     pub(super) globals_buffer: wgpu::Buffer,
