@@ -39,6 +39,7 @@ mod path_builder;
 mod platform;
 pub mod prelude;
 mod queue;
+pub mod render_stats;
 mod scene;
 mod shared_string;
 mod shared_uri;
