@@ -1763,6 +1763,13 @@ pub struct DeepCaptureDrawCall {
     /// `(AtlasTextureKind as u64) << 32 | AtlasTextureId::index`, for sprite
     /// calls (`MonoSprites`/`PolySprites`); `None` for every other kind.
     pub atlas_texture_id: Option<u64>,
+    /// `SurfaceId`'s inner id (`platform/cross/surface_registry.rs`), for
+    /// `Surfaces` calls; `None` for every other kind (Phase 4b, issue #72 --
+    /// the surface-identity counterpart to `atlas_texture_id` above, added
+    /// alongside real texture-content readback since without it a replay
+    /// has no way to know *which* touched surface's content a given
+    /// `Surfaces` draw call actually composited).
+    pub surface_id: Option<u64>,
 }
 
 /// One fixed buffer's full contents at the time of the triggered frame, part
@@ -1783,6 +1790,56 @@ pub struct DeepCaptureBufferContents {
     pub bytes: Vec<u8>,
 }
 
+/// Identifies one texture a [`DeepCapture`] read back the pixel contents of
+/// (Phase 4b of the profiling epic, issue #72) -- either one atlas texture
+/// page or one composited surface's currently displayed triple-buffer
+/// texture. The texture-content counterpart to [`DeepCaptureBufferKind`],
+/// but unlike the seven fixed buffers (a small, statically-known set),
+/// atlas pages and surfaces are both allocated dynamically at runtime
+/// (`WgpuAtlas`/`SurfaceRegistry`, `platform/cross/atlas.rs`/
+/// `surface_registry.rs`), so each variant carries the underlying dynamic
+/// id rather than this being itself a fixed-size enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DeepCaptureTextureId {
+    /// One atlas texture page, encoded exactly the same way
+    /// [`DeepCaptureDrawCall::atlas_texture_id`] already is:
+    /// `(AtlasTextureKind as u64) << 32 | AtlasTextureId::index`.
+    Atlas(u64),
+    /// One composited surface -- `SurfaceId`'s inner id
+    /// (`platform/cross/surface_registry.rs`).
+    Surface(u64),
+}
+
+/// One texture's full pixel contents at the time of the triggered frame,
+/// part of a [`DeepCapture`] -- the texture-content counterpart to
+/// [`DeepCaptureBufferContents`] (see that type's doc comment for the
+/// "recorded once per touched resource, not once per draw call" rationale,
+/// which applies here identically). `bytes` is tightly packed with no
+/// `wgpu::COPY_BYTES_PER_ROW_ALIGNMENT` row padding -- that padding exists
+/// only as a GPU-side copy constraint and is stripped during readback
+/// before it ever reaches this type, the same way
+/// [`crate::flamegraph_replay`]'s GPU replay already strips it off a render
+/// target before handing pixels back to a caller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeepCaptureTextureContents {
+    /// Which texture this is.
+    pub id: DeepCaptureTextureId,
+    /// Texture width, in pixels.
+    pub width: u32,
+    /// Texture height, in pixels.
+    pub height: u32,
+    /// Bytes per pixel -- `1` for the atlas's monochrome (`R8Unorm`) pages,
+    /// `4` for its polychrome (`Rgba8Unorm`) pages, and whatever a given
+    /// surface's own `wgpu::TextureFormat` requires. Computed from the real
+    /// format via `wgpu::TextureFormat::block_copy_size` at readback time,
+    /// never assumed, since surfaces may be created with any format a
+    /// caller of `create_wgpu_surface` chooses.
+    pub bytes_per_pixel: u32,
+    /// Tightly packed pixel bytes, `width * height * bytes_per_pixel`
+    /// bytes, row-major from the top-left.
+    pub bytes: Vec<u8>,
+}
+
 /// One on-demand, single-frame "deep capture" (Phase 4 of the profiling
 /// epic, issue #60): the full command stream and fixed-buffer resource
 /// contents for exactly one triggered `WgpuRenderer::draw()` call. See the
@@ -1796,12 +1853,19 @@ pub struct DeepCapture {
     /// Full contents of each fixed buffer touched by at least one entry in
     /// `draw_calls`, one entry per distinct [`DeepCaptureBufferKind`] seen.
     pub buffer_contents: Vec<DeepCaptureBufferContents>,
-    /// Whether every buffer readback that was attempted actually completed
-    /// successfully. `true` for an empty `draw_calls`/`buffer_contents` (there
-    /// was nothing to read back). `false` if any individual buffer's
-    /// `map_async` reported an error -- that buffer is simply missing from
-    /// `buffer_contents` rather than the whole capture being discarded, so a
-    /// partial result is still usable.
+    /// Full pixel contents of each atlas texture page/surface touched by at
+    /// least one entry in `draw_calls`, one entry per distinct
+    /// [`DeepCaptureTextureId`] seen (Phase 4b, issue #72). May be empty
+    /// even when `draw_calls` references atlas/surface content, if that
+    /// texture's readback did not complete -- see `resources_finalized`.
+    pub texture_contents: Vec<DeepCaptureTextureContents>,
+    /// Whether every buffer/texture readback that was attempted actually
+    /// completed successfully. `true` for an empty `draw_calls`/
+    /// `buffer_contents`/`texture_contents` (there was nothing to read
+    /// back). `false` if any individual buffer's or texture's `map_async`
+    /// reported an error -- that resource is simply missing from
+    /// `buffer_contents`/`texture_contents` rather than the whole capture
+    /// being discarded, so a partial result is still usable.
     pub resources_finalized: bool,
 }
 
@@ -1810,6 +1874,13 @@ impl DeepCapture {
     /// this capture's command stream and its readback completed.
     pub fn buffer_contents(&self, kind: DeepCaptureBufferKind) -> Option<&DeepCaptureBufferContents> {
         self.buffer_contents.iter().find(|contents| contents.kind == kind)
+    }
+
+    /// The texture contents recorded for `id`, if that atlas page/surface
+    /// was touched by this capture's command stream and its readback
+    /// completed.
+    pub fn texture_contents(&self, id: DeepCaptureTextureId) -> Option<&DeepCaptureTextureContents> {
+        self.texture_contents.iter().find(|contents| contents.id == id)
     }
 }
 
@@ -2282,11 +2353,13 @@ mod tests {
                 bind_group_count: 2,
                 buffer_kind: Some(DeepCaptureBufferKind::Quads),
                 atlas_texture_id: None,
+                surface_id: None,
             }],
             buffer_contents: vec![DeepCaptureBufferContents {
                 kind: DeepCaptureBufferKind::Quads,
                 bytes: quads_bytes.clone(),
             }],
+            texture_contents: Vec::new(),
             resources_finalized: true,
         };
         complete_deep_capture(capture);

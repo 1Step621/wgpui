@@ -2231,6 +2231,7 @@ impl WgpuRenderer {
                                 2,
                                 Some(crate::flamegraph::DeepCaptureBufferKind::Quads),
                                 None,
+                                None,
                             );
                         }
                     }
@@ -2287,6 +2288,7 @@ impl WgpuRenderer {
                                 4,
                                 Some(crate::flamegraph::DeepCaptureBufferKind::MonoSprites),
                                 Some(((texture_id.kind as u64) << 32) | texture_id.index as u64),
+                                None,
                             );
                         }
                     }
@@ -2341,6 +2343,7 @@ impl WgpuRenderer {
                                 3,
                                 Some(crate::flamegraph::DeepCaptureBufferKind::PolySprites),
                                 Some(((texture_id.kind as u64) << 32) | texture_id.index as u64),
+                                None,
                             );
                         }
                     }
@@ -2363,6 +2366,7 @@ impl WgpuRenderer {
                                 shadows_first_instance - count..shadows_first_instance,
                                 2,
                                 Some(crate::flamegraph::DeepCaptureBufferKind::Shadows),
+                                None,
                                 None,
                             );
                         }
@@ -2444,6 +2448,7 @@ impl WgpuRenderer {
                                 backdrop_filters_first_instance - count..backdrop_filters_first_instance,
                                 3,
                                 Some(crate::flamegraph::DeepCaptureBufferKind::BackdropFilters),
+                                None,
                                 None,
                             );
                         }
@@ -2628,6 +2633,7 @@ impl WgpuRenderer {
                                 2,
                                 Some(crate::flamegraph::DeepCaptureBufferKind::Underlines),
                                 None,
+                                None,
                             );
                         }
                     }
@@ -2762,6 +2768,7 @@ impl WgpuRenderer {
                                             2,
                                             None,
                                             None,
+                                            Some(surface_id.0),
                                         );
                                     }
 
@@ -2806,6 +2813,7 @@ impl WgpuRenderer {
                                     0..1,
                                     2,
                                     Some(crate::flamegraph::DeepCaptureBufferKind::Paths),
+                                    None,
                                     None,
                                 );
                             }
@@ -2855,7 +2863,13 @@ impl WgpuRenderer {
                 ),
                 (crate::flamegraph::DeepCaptureBufferKind::Paths, &paths_vertices_buffer_ref),
             ];
-            recorder.finish(&self.context.device, &mut command_encoder, &buffers)
+            recorder.finish(
+                &self.context.device,
+                &mut command_encoder,
+                &buffers,
+                &self.atlas,
+                &self.context.surface_registry,
+            )
         });
 
         log::debug!("Renderer::draw: submitting command buffer");

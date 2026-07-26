@@ -50,6 +50,46 @@ impl WgpuAtlas {
         atlas_texture_list_memory_usage(&state.storage.monochrome_textures)
             + atlas_texture_list_memory_usage(&state.storage.polychrome_textures)
     }
+
+    /// One atlas texture page's identity/metadata needed to read its pixel
+    /// contents back for a triggered GPU deep capture (Phase 4b of the
+    /// profiling epic, issue #72). Distinct from `get_texture_info`, which
+    /// only exposes a `TextureView` -- enough to bind a sprite pipeline, but
+    /// `copy_texture_to_buffer` needs the underlying `wgpu::Texture`
+    /// directly, plus the pixel dimensions and texel size a caller needs to
+    /// compute `wgpu::COPY_BYTES_PER_ROW_ALIGNMENT` row padding. Returns
+    /// `None` if `texture_id` no longer refers to a live page (e.g. it was
+    /// evicted between the draw call that touched it and this lookup --
+    /// shouldn't happen within one frame's own command stream, but reported
+    /// rather than panicking since there's no way to distinguish that from
+    /// a genuinely stale id).
+    #[cfg(feature = "flamegraph")]
+    pub(crate) fn texture_snapshot(&self, texture_id: AtlasTextureId) -> Option<WgpuAtlasTextureSnapshot> {
+        let state = self.0.lock();
+        let texture = state.storage[texture_id.kind]
+            .textures
+            .get(texture_id.index as usize)?
+            .as_ref()?;
+        Some(WgpuAtlasTextureSnapshot {
+            texture: texture.raw.clone(),
+            width: texture.raw.width(),
+            height: texture.raw.height(),
+            // `texel_size` (not `WgpuAtlasTexture::bytes_per_pixel`, which
+            // panics on any format outside the two this atlas currently
+            // creates) so this stays correct rather than crashing if the
+            // atlas ever grows a third texture kind.
+            bytes_per_pixel: super::render_context::texel_size(texture.format) as u32,
+        })
+    }
+}
+
+/// See [`WgpuAtlas::texture_snapshot`].
+#[cfg(feature = "flamegraph")]
+pub(crate) struct WgpuAtlasTextureSnapshot {
+    pub(crate) texture: wgpu::Texture,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) bytes_per_pixel: u32,
 }
 
 #[cfg(feature = "flamegraph")]
