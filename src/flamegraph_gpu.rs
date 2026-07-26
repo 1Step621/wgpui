@@ -71,6 +71,12 @@ struct QueryGeneration {
     /// readback ordering (`GpuSpan::query_set_generation`).
     epoch: u64,
     map_ready: Arc<AtomicBool>,
+    /// CPU-observed instant `queue.submit()` returned for this generation's
+    /// frame, set in `begin_readback` (called right after that submit at the
+    /// renderer's call site) -- see `FrameCapture::cpu_gpu_submit_ns`'s doc
+    /// comment for why this is a distinct thing from the GPU's own
+    /// (calibrated, inferred) execution-start time.
+    submit_cpu_ns: Option<u64>,
 }
 
 impl QueryGeneration {
@@ -105,6 +111,7 @@ impl QueryGeneration {
             truncated: false,
             epoch: 0,
             map_ready: Arc::new(AtomicBool::new(false)),
+            submit_cpu_ns: None,
         }
     }
 
@@ -122,6 +129,7 @@ impl QueryGeneration {
         self.truncated = false;
         self.epoch += 1;
         self.map_ready.store(false, Ordering::Release);
+        self.submit_cpu_ns = None;
     }
 
     /// Reserve a begin/end timestamp-write pair. Returns `None` (without
@@ -171,11 +179,15 @@ impl QueryGeneration {
     }
 
     /// Start the async readback map. Must be called after the encoder
-    /// recorded by `resolve` has been submitted.
+    /// recorded by `resolve` has been submitted -- this doubles as the CPU
+    /// submission-instant stamp (`FrameCapture::cpu_gpu_submit_ns`), since
+    /// this method's own doc contract already requires callers to invoke it
+    /// immediately after `queue.submit()` returns.
     fn begin_readback(&mut self) {
         if self.state != GenerationState::Resolving {
             return;
         }
+        self.submit_cpu_ns = flamegraph::anchor_relative_now_ns();
         self.state = GenerationState::MapPending;
         let size = (self.next_query_index as u64) * 8;
         let map_ready = self.map_ready.clone();
@@ -193,6 +205,10 @@ impl QueryGeneration {
         if self.state != GenerationState::MapPending || !self.map_ready.load(Ordering::Acquire) {
             return;
         }
+        // Stamped here, not after the (cheap, in-memory) span decoding below,
+        // so it reflects the moment the poll loop actually observed
+        // completion rather than however long this function takes to run.
+        let fence_observed_cpu_ns = flamegraph::anchor_relative_now_ns();
 
         let size = (self.next_query_index as u64) * 8;
         let calibration = flamegraph::gpu_calibration();
@@ -213,7 +229,13 @@ impl QueryGeneration {
         };
         self.staging_buffer.unmap();
 
-        flamegraph::attach_gpu_spans(self.frame_index, spans, self.truncated);
+        flamegraph::attach_gpu_spans(
+            self.frame_index,
+            spans,
+            self.truncated,
+            self.submit_cpu_ns,
+            fence_observed_cpu_ns,
+        );
         self.state = GenerationState::Idle;
     }
 }
@@ -817,6 +839,17 @@ mod tests {
     /// with no GPU or software rasterizer skips the readback assertions below
     /// instead of failing the whole suite.
     fn create_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        create_headless_device_with_features(wgpu::Features::empty())
+    }
+
+    /// Same as `create_headless_device`, but requests the given features --
+    /// needed by tests that create a `wgpu::QuerySet` (`QueryType::Timestamp`
+    /// requires `Features::TIMESTAMP_QUERY`), which `create_headless_device`'s
+    /// zero-features default device doesn't have, unlike the real
+    /// `WgpuContext::new` (`render_context.rs`), which requires
+    /// `TIMESTAMP_QUERY`/`TIMESTAMP_QUERY_INSIDE_ENCODERS` outright on
+    /// non-macOS.
+    fn create_headless_device_with_features(features: wgpu::Features) -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             flags: wgpu::InstanceFlags::default(),
@@ -831,8 +864,12 @@ mod tests {
         // that case.
         let adapter = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()))
             .into_iter()
-            .next()?;
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
+            .find(|adapter| adapter.features().contains(features))?;
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_features: features,
+            ..Default::default()
+        }))
+        .ok()
     }
 
     /// End-to-end readback test: records a command stream referencing a
@@ -892,5 +929,89 @@ mod tests {
             contents.bytes, source_bytes,
             "readback bytes should match exactly what was written to the source buffer"
         );
+    }
+
+    /// End-to-end test for the CPU/GPU timeline correlation markers: drives
+    /// a real `GpuQueryManager` through `begin_frame` -> `reserve_pair` ->
+    /// `finish_frame` -> submit -> `begin_readback` -> `poll_readback`
+    /// against a real headless device, with an active capture session, and
+    /// asserts the resulting `FrameCapture` has both `cpu_gpu_submit_ns` and
+    /// `cpu_gpu_fence_observed_ns` populated with a sane ordering --
+    /// `fence_observed >= submit`, since observing GPU completion can only
+    /// happen after the CPU asked the GPU to do the work, in wall-clock
+    /// terms. This is the concrete regression case for a real gap: before
+    /// this, `FrameCapture` had no CPU-side submit/fence-observed markers at
+    /// all, only the CPU-side `frame_start_ns`/`frame_end_ns` (drawing, not
+    /// GPU submission) and the calibrated (inferred, not directly observed)
+    /// `GpuSpan` timestamps.
+    #[test]
+    fn gpu_query_manager_records_cpu_submit_and_fence_observed_instants() {
+        let required = wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        let Some((device, queue)) = create_headless_device_with_features(required) else {
+            eprintln!(
+                "skipping gpu_query_manager_records_cpu_submit_and_fence_observed_instants: no wgpu adapter available in this environment"
+            );
+            return;
+        };
+
+        let handle = flamegraph::start_capture(flamegraph::CaptureOptions {
+            max_frames: 8,
+            capture_gpu: true,
+        })
+        .expect("no other capture should be active in this test process");
+
+        let mut manager_slot: Option<GpuQueryManager> = None;
+        sync_with_active_capture(&mut manager_slot, &device, &queue);
+        let manager = manager_slot.as_mut().expect("capture_gpu: true should allocate a manager");
+
+        let frame_index = flamegraph::open_frame_cpu_side(1).expect("capture is active, open_frame_cpu_side should succeed");
+        manager.begin_frame(frame_index);
+
+        let reserved = manager
+            .reserve_pair(SpanName::Static("test_pass"), GpuPassKind::Main)
+            .expect("first reservation in a freshly-begun frame should always succeed");
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.write_timestamp(reserved.query_set(), reserved.begin_index());
+        encoder.write_timestamp(reserved.query_set(), reserved.end_index());
+        manager.finish_frame(&mut encoder);
+        queue.submit(Some(encoder.finish()));
+        manager.begin_readback();
+
+        flamegraph::close_frame_cpu_side(Some(frame_index));
+
+        // `CaptureHandle` has no mid-flight peek (only `stop`, which ends the
+        // session), so drive the async readback to completion first -- a
+        // blocking wait forces the GPU to finish and process the pending
+        // `map_async` callback, then `poll_readback`'s own non-blocking poll
+        // sees `map_ready` already set and harvests immediately. Looped
+        // rather than a single attempt purely as a margin of safety for
+        // slower/software adapters, not because one iteration is expected to
+        // be insufficient.
+        for _ in 0..20 {
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            manager.poll_readback(&device);
+        }
+
+        let capture = handle.stop();
+        let frame = capture
+            .frames()
+            .find(|frame| frame.frame_index == frame_index)
+            .expect("frame should still be in the ring buffer (max_frames: 8, only one frame drawn)");
+
+        assert!(frame.gpu_spans_finalized, "readback should have completed within 20 blocking-poll iterations");
+
+        let submit_ns = frame
+            .cpu_gpu_submit_ns
+            .expect("begin_readback should have stamped a CPU submit instant");
+        let observed_ns = frame
+            .cpu_gpu_fence_observed_ns
+            .expect("try_harvest should have stamped a CPU fence-observed instant");
+        assert!(
+            observed_ns >= submit_ns,
+            "the CPU can only observe GPU completion after it asked the GPU to submit work: \
+             submit_ns={submit_ns}, observed_ns={observed_ns}"
+        );
+        assert!(!frame.gpu_spans.is_empty(), "the reserved pass should have resolved into a GpuSpan");
     }
 }
