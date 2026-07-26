@@ -21,6 +21,9 @@ struct WgpuSurfaceHandleInner {
     /// us call `request_redraw()` from another thread without touching the
     /// event bus.
     winit_window: Option<Arc<winit::window::Window>>,
+    /// Device-level guard shared with the renderer. See
+    /// `WgpuContext::gpu_submit_lock`'s doc comment for the full mechanism.
+    gpu_submit_lock: Arc<parking_lot::RwLock<()>>,
     size: Mutex<(u32, u32)>,
     pending_resize: Mutex<Option<(u32, u32)>>,
     deferred_resize: Mutex<Option<(u32, u32)>>,
@@ -62,6 +65,7 @@ impl WgpuSurfaceHandle {
         registry: Arc<SurfaceRegistry>,
         present_trigger: Arc<dyn Fn() + Send + Sync>,
         winit_window: Option<Arc<winit::window::Window>>,
+        gpu_submit_lock: Arc<parking_lot::RwLock<()>>,
         width: u32,
         height: u32,
         format: wgpu::TextureFormat,
@@ -74,6 +78,7 @@ impl WgpuSurfaceHandle {
                 queue,
                 present_trigger,
                 winit_window,
+                gpu_submit_lock,
                 size: Mutex::new((width, height)),
                 pending_resize: Mutex::new(None),
                 deferred_resize: Mutex::new(None),
@@ -91,6 +96,33 @@ impl WgpuSurfaceHandle {
     /// The wgpu `Queue` for submitting command buffers.
     pub fn queue(&self) -> &wgpu::Queue {
         &self.inner.queue
+    }
+
+    /// Acquire permission to submit GPU work on this surface's device.
+    ///
+    /// **External render threads must hold this across encoding, `queue.submit()`
+    /// and present.** The device and queue handed out by [`device()`](Self::device)
+    /// and [`queue()`](Self::queue) are shared with the compositor, and
+    /// `Surface::configure` (window resize) must observe an idle queue — wgpu
+    /// aborts the process with `GpuWaitTimeout` if anything submits while it waits.
+    ///
+    /// This is a **read** guard: any number of surfaces may hold one simultaneously
+    /// and none of them block each other, so each render thread keeps its own frame
+    /// pacing. Only a resize takes the exclusive side, and only for as long as the
+    /// swapchain takes to reconfigure.
+    ///
+    /// # Example
+    /// ```no_run
+    /// loop {
+    ///     let guard = surface.submit_guard();
+    ///     let (view, (w, h)) = surface.back_view_with_size()?;
+    ///     // ... encode and submit ...
+    ///     surface.present_synced_silent(submission_idx);
+    ///     drop(guard);
+    /// }
+    /// ```
+    pub fn submit_guard(&self) -> parking_lot::RwLockReadGuard<'_, ()> {
+        self.inner.gpu_submit_lock.read()
     }
 
     /// Get a `TextureView` of the back buffer for use as a render target.
@@ -150,6 +182,23 @@ impl WgpuSurfaceHandle {
         }
 
         // Return immediately - no blocking
+    }
+
+    /// Swap the rendered frame into the ready slot with GPU synchronization, but
+    /// without requesting a window redraw or marking the surface as needing one.
+    ///
+    /// Use this when the GPUI draw cycle already runs continuously (the element's
+    /// view calls [`Window::request_animation_frame`]) and therefore drives
+    /// compositing itself. The compositor promotes this frame to `display` on its
+    /// next pass over the element.
+    ///
+    /// Prefer this over [`present_synced()`](Self::present_synced) for render
+    /// threads embedded in a live GPUI view: `present_synced` drives repaints from
+    /// the render thread, which forces a full window refresh per presented frame.
+    pub fn present_synced_silent(&self, submission_index: wgpu::SubmissionIndex) {
+        self.inner
+            .registry
+            .swap_rendering_ready(self.inner.surface_id, submission_index);
     }
 
     /// Present the rendered frame without GPU synchronization (deprecated).
