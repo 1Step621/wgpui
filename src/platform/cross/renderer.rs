@@ -1711,6 +1711,23 @@ impl WgpuRenderer {
         self.gpu_query_manager.lock().as_mut()?.reserve_pair(name, pass_kind)
     }
 
+    /// Reconfigure the swapchain, excluding external render threads for the
+    /// duration.
+    ///
+    /// `Surface::configure` waits for the device to go idle and fails fatally
+    /// with `GpuWaitTimeout` if anything submits during that wait. Surfaces
+    /// handed to external render threads (`WgpuSurfaceHandle`) share this
+    /// device and queue, so the exclusive guard here is what keeps a window
+    /// resize from racing them -- see `WgpuContext::gpu_submit_lock`'s doc
+    /// comment for the full mechanism.
+    ///
+    /// All `Surface::configure` calls in this renderer must go through here.
+    fn reconfigure_surface(&self) {
+        let _exclusive = self.context.gpu_submit_lock.write();
+        self.surface
+            .configure(&self.context.device, &self.surface_configuration);
+    }
+
     pub fn draw(&mut self, scene: &Scene) {
         log::debug!("Renderer::draw: starting frame");
 
@@ -1970,8 +1987,7 @@ impl WgpuRenderer {
                 | CurrentSurfaceTexture::Lost
                 | CurrentSurfaceTexture::Validation => {
                     // Reconfigure with the current known size and retry.
-                    self.surface
-                        .configure(&self.context.device, &self.surface_configuration);
+                    self.reconfigure_surface();
                     match self.surface.get_current_texture() {
                         CurrentSurfaceTexture::Success(t)
                         | CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -2928,8 +2944,7 @@ impl WgpuRenderer {
             CurrentSurfaceTexture::Outdated
             | CurrentSurfaceTexture::Lost
             | CurrentSurfaceTexture::Validation => {
-                self.surface
-                    .configure(&self.context.device, &self.surface_configuration);
+                self.reconfigure_surface();
                 match self.surface.get_current_texture() {
                     CurrentSurfaceTexture::Success(t)
                     | CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -3094,8 +3109,7 @@ impl WgpuRenderer {
     pub fn update_drawable_size(&mut self, size: geometry::Size<DevicePixels>) {
         self.surface_configuration.width = size.width.0 as u32;
         self.surface_configuration.height = size.height.0 as u32;
-        self.surface
-            .configure(&self.context.device, &self.surface_configuration);
+        self.reconfigure_surface();
 
         // Recreate persistent framebuffer at new size
         let persistent_framebuffer = self
@@ -3188,8 +3202,7 @@ impl WgpuRenderer {
             // wgpu::CompositeAlphaMode::Opaque
             wgpu::CompositeAlphaMode::Inherit
         };
-        self.surface
-            .configure(&self.context.device, &self.surface_configuration);
+        self.reconfigure_surface();
     }
 
     pub fn viewport_size(&self) -> geometry::Size<DevicePixels> {
