@@ -102,6 +102,22 @@ impl CrossWindow {
             .set(Arc::new(winit_window))
             .expect("winit_window already initialized");
 
+        // On WASM, winit creates the canvas but doesn't append it to the DOM.
+        // We must do that ourselves.
+        #[cfg(target_family = "wasm")]
+        {
+            use winit::platform::web::WindowExtWebSys;
+            if let Some(canvas) = self.window().canvas() {
+                let canvas_node: &web_sys::Node = canvas.as_ref();
+                if let Some(body) = web_sys::window()
+                    .and_then(|w| w.document())
+                    .and_then(|d| d.body())
+                {
+                    let _ = body.append_child(canvas_node);
+                }
+            }
+        }
+
         if initial_size.width > 0 && initial_size.height > 0 {
             let mut renderer = WgpuRenderer::new(
                 self.0.wgpu_context.clone(),
