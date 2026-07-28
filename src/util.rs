@@ -82,7 +82,7 @@ mod wasm_compat {
     pub trait TryFutureExt: futures::Future + Sized {
         fn log_tracked_err(
             self,
-            location: &'static std::panic::Location<'static>,
+            location: std::panic::Location<'static>,
         ) -> impl futures::Future<Output = Self::Output>;
     }
 
@@ -91,11 +91,13 @@ mod wasm_compat {
     {
         fn log_tracked_err(
             self,
-            location: &'static std::panic::Location<'static>,
+            location: std::panic::Location<'static>,
         ) -> impl futures::Future<Output = Self::Output> {
+            let file = location.file();
+            let line = location.line();
             futures::FutureExt::map(self, |result| {
                 result.map_err(|error| {
-                    log::error!("{}:{}: {:?}", location.file(), location.line(), error);
+                    log::error!("{}:{}: {:?}", file, line, error);
                     error
                 })
             })
