@@ -100,6 +100,10 @@ struct AppState {
     active_window_id: Cell<Option<winit::window::WindowId>>,
     hovered_window_id: Cell<Option<winit::window::WindowId>>,
     hovered_external_paths: Vec<PathBuf>,
+    #[cfg(target_family = "wasm")]
+    wgpu_context: Arc<std::sync::OnceLock<Arc<WgpuContext>>>,
+    #[cfg(target_family = "wasm")]
+    wgpu_options: WgpuOptions,
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -311,52 +315,33 @@ impl Platform for CrossPlatform {
     }
 
     fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>) {
-        let event_loop = self.event_loop.take().expect("App is already running");
+        let mut event_loop = self.event_loop.take().expect("App is already running");
 
         #[cfg(target_family = "wasm")]
-        {
-            // On WASM, WGPU init is async and winit's run_app() dispatches
-            // Resumed synchronously (inside its setup). We must complete init
-            // BEFORE starting the event loop.  Defer the whole thing to a
-            // microtask chain: init → run_app.
-            let ctx_ref = self.wgpu_context.clone();
-            let wgpu_options = WgpuOptions {
+        let mut app_state = AppState {
+            windows: Default::default(),
+            window_handles: Default::default(),
+            on_finish_launching: Cell::new(Some(on_finish_launching)),
+            callbacks: self.callbacks.clone(),
+            main_rx: self.main_rx.clone(),
+            current_modifiers: Modifiers::default(),
+            pressed_button: None,
+            click_state: ClickState {
+                last_button: MouseButton::Left,
+                last_position: point(Pixels(0.0), Pixels(0.0)),
+                last_time: None,
+                current_count: 0,
+            },
+            active_window_id: Cell::new(None),
+            hovered_window_id: Cell::new(None),
+            hovered_external_paths: Vec::new(),
+            wgpu_context: self.wgpu_context.clone(),
+            wgpu_options: WgpuOptions {
                 additional_features: self.wgpu_options.additional_features,
-            };
-            let callbacks = self.callbacks.clone();
-            let main_rx = self.main_rx.clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                // ---- init phase ----
-                let ctx = WgpuContext::new_async(&wgpu_options).await
-                    .expect("WASM WGPU init failed");
-                ctx_ref.set(Arc::new(ctx)).ok();
+            },
+        };
 
-                // ---- event loop phase ----
-                let mut app_state = AppState {
-                    windows: Default::default(),
-                    window_handles: Default::default(),
-                    on_finish_launching: Cell::new(Some(on_finish_launching)),
-                    callbacks,
-                    main_rx,
-                    current_modifiers: Modifiers::default(),
-                    pressed_button: None,
-                    click_state: ClickState {
-                        last_button: MouseButton::Left,
-                        last_position: point(Pixels(0.0), Pixels(0.0)),
-                        last_time: None,
-                        current_count: 0,
-                    },
-                    active_window_id: Cell::new(None),
-                    hovered_window_id: Cell::new(None),
-                    hovered_external_paths: Vec::new(),
-                };
-                event_loop
-                    .run_app(&mut app_state)
-                    .expect("Failed to run App");
-            });
-            return;
-        }
-
+        #[cfg(not(target_family = "wasm"))]
         let mut app_state = AppState {
             windows: Default::default(),
             window_handles: Default::default(),
@@ -1079,6 +1064,53 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         self.set_active_context(event_loop);
+
+        #[cfg(target_family = "wasm")]
+        {
+            if self.wgpu_context.as_ref().get().is_none() {
+                // WGPU context not yet initialized — do it asynchronously.
+                // The wgpu_context Arc is shared with CrossPlatform, so once
+                // set here, open_window() on the platform side finds it.
+                let wgpu_ctx = self.wgpu_context.clone();
+                let wgpu_opts = WgpuOptions {
+                    additional_features: self.wgpu_options.additional_features,
+                };
+                let cb = self.on_finish_launching.take();
+                let reopen_cb = self.callbacks.on_reopen.take();
+                let callbacks = self.callbacks.clone();
+                // Capture the event_loop pointer so we can restore ACTIVE_CONTEXT
+                // when we call the callback (open_window requires it).
+                let event_loop_ptr = event_loop as *const ActiveEventLoop;
+                let self_ptr = self as *mut Self;
+                wasm_bindgen_futures::spawn_local(async move {
+                    match WgpuContext::new_async(&wgpu_opts).await {
+                        Ok(ctx) => {
+                            wgpu_ctx.set(Arc::new(ctx)).ok();
+                        }
+                        Err(e) => {
+                            log::error!("WASM WGPU init failed: {e}");
+                            return;
+                        }
+                    }
+                    // Restore active context before calling the callback
+                    // so open_window() can find it.
+                    ACTIVE_CONTEXT.with(|s| {
+                        s.set(Some((event_loop_ptr, self_ptr)));
+                    });
+                    if let Some(cb) = cb {
+                        cb();
+                    } else if let Some(mut cb) = reopen_cb {
+                        cb();
+                        callbacks.on_reopen.set(Some(cb));
+                    }
+                    ACTIVE_CONTEXT.with(|s| {
+                        s.set(None);
+                    });
+                });
+                self.clear_active_context();
+                return;
+            }
+        }
 
         if let Some(on_finish_launching) = self.on_finish_launching.take() {
             on_finish_launching();
