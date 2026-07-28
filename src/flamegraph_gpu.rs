@@ -361,7 +361,7 @@ impl GpuQueryManager {
             mapped_at_creation: false,
         });
 
-        let cpu_anchor_ns = std::time::Instant::now().duration_since(cpu_anchor).as_nanos().min(u64::MAX as u128) as u64;
+        let cpu_anchor_ns = crate::time_ext::Instant::now().duration_since(cpu_anchor).as_nanos().min(u64::MAX as u128) as u64;
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("flamegraph_gpu_calibration_encoder"),

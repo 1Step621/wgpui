@@ -1857,7 +1857,7 @@ impl WgpuRenderer {
             );
             self.context
                 .queue
-                .write_buffer(&self.context.quads_buffer.lock().unwrap(), 0, data);
+                .write_buffer(&self.context.quads_buffer.lock(), 0, data);
         }
         if !scene.shadows.is_empty() {
             let data = unsafe { as_bytes(&scene.shadows) };
@@ -1872,7 +1872,7 @@ impl WgpuRenderer {
             );
             self.context
                 .queue
-                .write_buffer(&self.context.shadows_buffer.lock().unwrap(), 0, data);
+                .write_buffer(&self.context.shadows_buffer.lock(), 0, data);
         }
         if !scene.backdrop_filters.is_empty() {
             let data = unsafe { as_bytes(&scene.backdrop_filters) };
@@ -1884,7 +1884,7 @@ impl WgpuRenderer {
                 wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             );
             self.context.queue.write_buffer(
-                &self.context.backdrop_filters_buffer.lock().unwrap(),
+                &self.context.backdrop_filters_buffer.lock(),
                 0,
                 data,
             );
@@ -1901,7 +1901,7 @@ impl WgpuRenderer {
                     | wgpu::BufferUsages::STORAGE,
             );
             self.context.queue.write_buffer(
-                &self.context.underlines_buffer.lock().unwrap(),
+                &self.context.underlines_buffer.lock(),
                 0,
                 data,
             );
@@ -1918,7 +1918,7 @@ impl WgpuRenderer {
                     | wgpu::BufferUsages::STORAGE,
             );
             self.context.queue.write_buffer(
-                &self.context.mono_sprites_buffer.lock().unwrap(),
+                &self.context.mono_sprites_buffer.lock(),
                 0,
                 data,
             );
@@ -1935,7 +1935,7 @@ impl WgpuRenderer {
                     | wgpu::BufferUsages::STORAGE,
             );
             self.context.queue.write_buffer(
-                &self.context.poly_sprites_buffer.lock().unwrap(),
+                &self.context.poly_sprites_buffer.lock(),
                 0,
                 data,
             );
@@ -1968,7 +1968,7 @@ impl WgpuRenderer {
                 wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             );
             self.context.queue.write_buffer(
-                &self.context.paths_vertices_buffer.lock().unwrap(),
+                &self.context.paths_vertices_buffer.lock(),
                 0,
                 data,
             );
@@ -2017,13 +2017,13 @@ impl WgpuRenderer {
         self.layout_version.fetch_add(1, Ordering::Release);
 
         // Borrow buffers for bind group creation - these borrows must live until bind groups are done
-        let quads_buffer_ref = self.context.quads_buffer.lock().unwrap();
-        let shadows_buffer_ref = self.context.shadows_buffer.lock().unwrap();
-        let backdrop_filters_buffer_ref = self.context.backdrop_filters_buffer.lock().unwrap();
-        let underlines_buffer_ref = self.context.underlines_buffer.lock().unwrap();
-        let mono_sprites_buffer_ref = self.context.mono_sprites_buffer.lock().unwrap();
-        let poly_sprites_buffer_ref = self.context.poly_sprites_buffer.lock().unwrap();
-        let paths_vertices_buffer_ref = self.context.paths_vertices_buffer.lock().unwrap();
+        let quads_buffer_ref = self.context.quads_buffer.lock();
+        let shadows_buffer_ref = self.context.shadows_buffer.lock();
+        let backdrop_filters_buffer_ref = self.context.backdrop_filters_buffer.lock();
+        let underlines_buffer_ref = self.context.underlines_buffer.lock();
+        let mono_sprites_buffer_ref = self.context.mono_sprites_buffer.lock();
+        let poly_sprites_buffer_ref = self.context.poly_sprites_buffer.lock();
+        let paths_vertices_buffer_ref = self.context.paths_vertices_buffer.lock();
 
         let quads_bind_group = self
             .context

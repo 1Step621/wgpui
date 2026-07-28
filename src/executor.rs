@@ -415,7 +415,7 @@ impl BackgroundExecutor {
         future: Fut,
         timeout: Option<Duration>,
     ) -> Result<Fut::Output, impl Future<Output = Fut::Output> + use<Fut>> {
-        use std::time::Instant;
+        use crate::time_ext::Instant;
 
         let mut future = Box::pin(future);
         if timeout == Some(Duration::ZERO) {

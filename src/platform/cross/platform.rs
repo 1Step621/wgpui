@@ -66,7 +66,8 @@ pub(crate) struct CrossPlatform {
     background_executor: BackgroundExecutor,
     foreground_executor: ForegroundExecutor,
     text_system: Arc<CosmicTextSystem>,
-    wgpu_context: Arc<WgpuContext>,
+    wgpu_context: Arc<std::sync::OnceLock<Arc<WgpuContext>>>,
+    wgpu_options: WgpuOptions,
     main_rx: PriorityQueueReceiver<RunnableVariant>,
     event_loop: Cell<Option<winit::event_loop::EventLoop<CrossEvent>>>,
     event_loop_proxy: winit::event_loop::EventLoopProxy<CrossEvent>,
@@ -117,6 +118,21 @@ struct ClickState {
 
 impl CrossPlatform {
     pub fn new(wgpu_options: WgpuOptions) -> Result<Self> {
+        Self::new_impl(wgpu_options)
+    }
+
+    fn new_impl(wgpu_options: WgpuOptions) -> Result<Self> {
+        let wgpu_context: Arc<std::sync::OnceLock<Arc<WgpuContext>>> = match WgpuContext::new(&wgpu_options) {
+            Ok(ctx) => {
+                let lock = Arc::new(std::sync::OnceLock::new());
+                lock.set(Arc::new(ctx)).ok();
+                lock
+            }
+            // On WASM, WgpuContext::new returns an error (needs async init).
+            // The OnceLock stays empty; run() will fill it via spawn_local.
+            Err(_) => Arc::new(std::sync::OnceLock::new()),
+        };
+
         let (main_tx, main_rx) = PriorityQueueReceiver::new();
         let mut event_loop =
             winit::event_loop::EventLoop::<CrossEvent>::with_user_event().build()?;
@@ -127,11 +143,14 @@ impl CrossPlatform {
         let background_executor = BackgroundExecutor::new(dispatcher.clone());
         let foreground_executor = ForegroundExecutor::new(dispatcher.clone());
 
+        let text_system = Arc::new(CosmicTextSystem::new());
+
         Ok(Self {
             background_executor,
             foreground_executor,
-            text_system: Arc::new(CosmicTextSystem::new()),
-            wgpu_context: Arc::new(WgpuContext::new(&wgpu_options)?),
+            text_system,
+            wgpu_context,
+            wgpu_options,
             main_rx,
             event_loop: Cell::new(Some(event_loop)),
             event_loop_proxy,
@@ -292,7 +311,51 @@ impl Platform for CrossPlatform {
     }
 
     fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>) {
-        let mut event_loop = self.event_loop.take().expect("App is already running");
+        let event_loop = self.event_loop.take().expect("App is already running");
+
+        #[cfg(target_family = "wasm")]
+        {
+            // On WASM, WGPU init is async and winit's run_app() dispatches
+            // Resumed synchronously (inside its setup). We must complete init
+            // BEFORE starting the event loop.  Defer the whole thing to a
+            // microtask chain: init → run_app.
+            let ctx_ref = self.wgpu_context.clone();
+            let wgpu_options = WgpuOptions {
+                additional_features: self.wgpu_options.additional_features,
+            };
+            let callbacks = self.callbacks.clone();
+            let main_rx = self.main_rx.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                // ---- init phase ----
+                let ctx = WgpuContext::new_async(&wgpu_options).await
+                    .expect("WASM WGPU init failed");
+                ctx_ref.set(Arc::new(ctx)).ok();
+
+                // ---- event loop phase ----
+                let mut app_state = AppState {
+                    windows: Default::default(),
+                    window_handles: Default::default(),
+                    on_finish_launching: Cell::new(Some(on_finish_launching)),
+                    callbacks,
+                    main_rx,
+                    current_modifiers: Modifiers::default(),
+                    pressed_button: None,
+                    click_state: ClickState {
+                        last_button: MouseButton::Left,
+                        last_position: point(Pixels(0.0), Pixels(0.0)),
+                        last_time: None,
+                        current_count: 0,
+                    },
+                    active_window_id: Cell::new(None),
+                    hovered_window_id: Cell::new(None),
+                    hovered_external_paths: Vec::new(),
+                };
+                event_loop
+                    .run_app(&mut app_state)
+                    .expect("Failed to run App");
+            });
+            return;
+        }
 
         let mut app_state = AppState {
             windows: Default::default(),
@@ -423,7 +486,10 @@ impl Platform for CrossPlatform {
         handle: crate::AnyWindowHandle,
         options: crate::WindowParams,
     ) -> anyhow::Result<Box<dyn crate::PlatformWindow>> {
-        let window = CrossWindow::new(self.wgpu_context.clone(), self.event_loop_proxy.clone());
+        let window = CrossWindow::new(
+            self.wgpu_context.as_ref().get().expect("WgpuContext not initialized").clone(),
+            self.event_loop_proxy.clone(),
+        );
 
         let success = with_active_context(|event_loop, app_state| {
             let bounds = options.bounds;

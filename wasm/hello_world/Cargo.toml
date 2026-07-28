@@ -3,8 +3,10 @@ name = "gpui-wasm-hello-world"
 version = "0.1.0"
 edition = "2024"
 
-[package.metadata.wasm-pack]
+[package.metadata.wasm-pack.profile.release]
 wasm-opt = false
+
+
 
 [lib]
 crate-type = ["cdylib"]

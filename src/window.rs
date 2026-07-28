@@ -46,8 +46,9 @@ use std::{
         Arc, Weak,
         atomic::{AtomicUsize, Ordering::SeqCst},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
+use crate::time_ext::Instant;
 use crate::util::post_inc;
 use crate::util::{ResultExt, measure};
 use uuid::Uuid;

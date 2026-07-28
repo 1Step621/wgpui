@@ -1,4 +1,5 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 
 use super::surface_registry::SurfaceRegistry;
 
@@ -71,19 +72,25 @@ impl WgpuContext {
             display: None,
         });
 
-        // Features WGPUI itself needs for its rendering pipeline.
+        // On WASM, adapter enumeration is async and pollster::block_on panics
+        // (Condvar::wait not supported). Return an error so CrossPlatform defers
+        // to the spawn_local path in run().
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = instance;
+            let _ = options;
+            anyhow::bail!("WgpuContext requires async initialization on WASM");
+        }
+
+        // ============ Native-only path below ============
         #[cfg(not(target_family = "wasm"))]
+        {
+        // Features WGPUI itself needs for its rendering pipeline.
         let wgpui_features = wgpu::Features::TEXTURE_BINDING_ARRAY
             | wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING
             | wgpu::Features::PRIMITIVE_INDEX
             | wgpu::Features::INDIRECT_FIRST_INSTANCE;
 
-        // On WASM/WebGPU, only request features actually supported by the browser.
-        #[cfg(target_family = "wasm")]
-        let wgpui_features = wgpu::Features::PRIMITIVE_INDEX
-            | wgpu::Features::INDIRECT_FIRST_INSTANCE;
-
-        // Combine with any additional features requested by the application.
         let required_features = wgpui_features | options.additional_features;
 
         let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
@@ -121,22 +128,6 @@ impl WgpuContext {
                 | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT
                 | wgpu::Features::TIMESTAMP_QUERY
                 | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
-            let adapter = adapters
-                .into_iter()
-                .find(|adapter| adapter.features().contains(required_features))
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "No adapter available with required features: {:?}",
-                        required_features
-                    )
-                })?;
-            (adapter, required_features)
-        };
-
-        // On WASM/WebGPU, just require the base features (WebGPU doesn't support
-        // MULTI_DRAW_INDIRECT_COUNT, TIMESTAMP_QUERY, etc.)
-        #[cfg(target_family = "wasm")]
-        let (adapter, device_features) = {
             let adapter = adapters
                 .into_iter()
                 .find(|adapter| adapter.features().contains(required_features))
@@ -293,6 +284,166 @@ impl WgpuContext {
             surface_registry: Arc::new(SurfaceRegistry::new()),
             gpu_submit_lock: Arc::new(parking_lot::RwLock::new(())),
         })
+        } // end #[cfg(not(target_family = "wasm"))]
+    }
+
+    /// Async constructor for WASM. Enumerates adapters and creates device+buffers
+    /// without blocking (pollster::block_on panics on WASM's no_threads impl).
+    #[cfg(target_family = "wasm")]
+    pub async fn new_async(options: &WgpuOptions) -> anyhow::Result<Self> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            flags: wgpu::InstanceFlags::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            display: None,
+        });
+
+        let wgpui_features = wgpu::Features::empty();
+
+        let required_features = wgpui_features | options.additional_features;
+
+        let adapters = instance.enumerate_adapters(wgpu::Backends::all()).await;
+
+        let adapter = adapters
+            .into_iter()
+            .find(|adapter| adapter.features().contains(required_features))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No adapter available with required features: {:?}",
+                    required_features
+                )
+            })?;
+
+        let device_features = required_features;
+
+        let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor {
+            label: None,
+            required_features: device_features,
+            required_limits: wgpu::Limits {
+                max_binding_array_elements_per_shader_stage: 512,
+                ..adapter.limits()
+            },
+            ..Default::default()
+        }).await?;
+
+        Self::create_buffers(instance, adapter, device, queue)
+    }
+
+    /// Shared buffer-creation helper, used by both sync (native) and async (WASM) paths.
+    fn create_buffers(
+        instance: wgpu::Instance,
+        adapter: wgpu::Adapter,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+    ) -> anyhow::Result<Self> {
+        let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Globals Buffer"),
+            size: 16 as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        #[cfg(feature = "flamegraph")]
+        let deep_capture_readback = wgpu::BufferUsages::COPY_SRC;
+        #[cfg(not(feature = "flamegraph"))]
+        let deep_capture_readback = wgpu::BufferUsages::empty();
+
+        let quads_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Quads Buffer"),
+            size: 8 * 1024 * 1024,
+            usage: wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::STORAGE
+                | deep_capture_readback,
+            mapped_at_creation: false,
+        });
+
+        let mono_sprites_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Monosprites Buffer"),
+            size: 8 * 1024 * 1024,
+            usage: wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::STORAGE
+                | deep_capture_readback,
+            mapped_at_creation: false,
+        });
+
+        let shadows_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Shadows Buffer"),
+            size: 8 * 1024 * 1024,
+            usage: wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::STORAGE
+                | deep_capture_readback,
+            mapped_at_creation: false,
+        });
+
+        let backdrop_filters_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Backdrop Filters Buffer"),
+            size: 8 * 1024 * 1024,
+            usage: wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::STORAGE
+                | deep_capture_readback,
+            mapped_at_creation: false,
+        });
+
+        let underlines_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Underlines Buffer"),
+            size: 8 * 1024 * 1024,
+            usage: wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::STORAGE
+                | deep_capture_readback,
+            mapped_at_creation: false,
+        });
+
+        let poly_sprites_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Poly Sprites Buffer"),
+            size: 8 * 1024 * 1024,
+            usage: wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::STORAGE
+                | deep_capture_readback,
+            mapped_at_creation: false,
+        });
+
+        let paths_vertices_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Path Vertices Buffer"),
+            size: 8 * 1024 * 1024,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | deep_capture_readback,
+            mapped_at_creation: false,
+        });
+
+        let color_adjustments_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Color Adjustments Buffer"),
+            size: 1024 * 16,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::UNIFORM,
+            mapped_at_creation: false,
+        });
+
+        Ok(Self {
+            adapter,
+            device,
+            queue,
+            instance,
+            globals_buffer,
+            quads_buffer: Mutex::new(quads_buffer),
+            shadows_buffer: Mutex::new(shadows_buffer),
+            backdrop_filters_buffer: Mutex::new(backdrop_filters_buffer),
+            underlines_buffer: Mutex::new(underlines_buffer),
+            mono_sprites_buffer: Mutex::new(mono_sprites_buffer),
+            poly_sprites_buffer: Mutex::new(poly_sprites_buffer),
+            color_adjustments_buffer,
+            paths_vertices_buffer: Mutex::new(paths_vertices_buffer),
+            surface_registry: Arc::new(SurfaceRegistry::new()),
+            gpu_submit_lock: Arc::new(parking_lot::RwLock::new(())),
+        })
     }
 }
 
@@ -358,7 +509,7 @@ pub(super) fn ensure_buffer_size(
     label: &str,
     usage: wgpu::BufferUsages,
 ) {
-    let mut buffer_guard = buffer.lock().unwrap();
+    let mut buffer_guard = buffer.lock();
     let current_size = buffer_guard.size();
     if current_size < required_size {
         // Recreate buffer with new size (add some headroom to avoid frequent reallocations)
@@ -410,7 +561,7 @@ mod tests {
             return;
         };
 
-        let buffers: [(&str, &std::sync::Mutex<wgpu::Buffer>); 6] = [
+        let buffers: [(&str, &parking_lot::Mutex<wgpu::Buffer>); 6] = [
             ("quads_buffer", &context.quads_buffer),
             ("shadows_buffer", &context.shadows_buffer),
             ("underlines_buffer", &context.underlines_buffer),
@@ -437,11 +588,11 @@ mod tests {
     fn assert_copy_buffer_to_buffer_read_accepted(
         context: &WgpuContext,
         label: &str,
-        buffer: &std::sync::Mutex<wgpu::Buffer>,
+        buffer: &parking_lot::Mutex<wgpu::Buffer>,
     ) {
         let error_scope = context.device.push_error_scope(wgpu::ErrorFilter::Validation);
 
-        let source = buffer.lock().expect("fixed buffer mutex should not be poisoned");
+        let source = buffer.lock();
         let staging = context.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("regression_test_staging_buffer"),
             size: source.size(),

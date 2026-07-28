@@ -53,6 +53,7 @@ mod taffy;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test;
 mod text_system;
+mod time_ext;
 mod util;
 mod view;
 mod window;

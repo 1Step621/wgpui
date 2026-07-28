@@ -14,7 +14,8 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use crate::time_ext::Instant;
 
 static ENABLED: LazyLock<bool> = LazyLock::new(|| {
     std::env::var("WGPUI_RENDER_STATS")

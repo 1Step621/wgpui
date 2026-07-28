@@ -236,6 +236,8 @@ impl Application {
         }));
     }
 
+
+
     /// Register a handler to be invoked when the platform instructs the application
     /// to open one or more URLs.
     pub fn on_open_urls<F>(&self, mut callback: F) -> &Self

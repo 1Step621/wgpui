@@ -121,7 +121,7 @@ mod wasm_compat {
     }
 
     pub fn measure<T>(label: &str, f: impl FnOnce() -> T) -> T {
-        let start = std::time::Instant::now();
+        let start = crate::time_ext::Instant::now();
         let result = f();
         let elapsed = start.elapsed();
         log::info!("{} took {:?}", label, elapsed);
