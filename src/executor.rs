@@ -18,8 +18,9 @@ use std::{
     },
     task::{Context, Poll},
     thread::{self, ThreadId},
-    time::{Duration, Instant},
+    time::Duration,
 };
+use crate::time_ext::Instant;
 use crate::util::TryFutureExt;
 #[cfg(not(target_family = "wasm"))]
 use waker_fn::waker_fn;
