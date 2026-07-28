@@ -1071,12 +1071,10 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.set_active_context(event_loop);
-        web_sys::console::log_1(&"WGPUI: about_to_wait".into());
 
         self.drain_main_queue();
 
         for window in self.windows.values() {
-            web_sys::console::log_1(&"WGPUI: requesting redraw".into());
             window.window().request_redraw();
         }
 
@@ -1095,6 +1093,7 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
 
         #[cfg(target_family = "wasm")]
         {
+            use wasm_bindgen::JsCast;
             if self.wgpu_context.as_ref().get().is_none() {
                 web_sys::console::log_1(&"WGPUI: WGPU not ready, starting async init".into());
                 // WGPU context not yet initialized — do it asynchronously.
@@ -1107,7 +1106,6 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                 let proxy = self.proxy.clone();
                 // Use setTimeout(0) instead of spawn_local because winit's
                 // throw-based control flow would abort microtask processing.
-                use wasm_bindgen::JsCast;
                 let closure = wasm_bindgen::prelude::Closure::once({
                     let wgpu_ctx = wgpu_ctx.clone();
                     let wgpu_opts_clone = WgpuOptions {
