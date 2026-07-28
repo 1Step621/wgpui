@@ -140,7 +140,7 @@ where
     pub fn detach_and_log_err(self, cx: &App) {
         let location = core::panic::Location::caller();
         cx.foreground_executor()
-            .spawn(self.log_tracked_err(location))
+            .spawn(self.log_tracked_err(*location))
             .detach();
     }
 }
