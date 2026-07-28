@@ -16,5 +16,8 @@ rustflags = [
     "target-feature=+crt-static", # This fixes the linking issue when compiling livekit on Windows
 ]
 
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))']
+rustflags = ["--cfg", "web_sys_unstable_apis"]
+
 [env]
 MACOSX_DEPLOYMENT_TARGET = "10.15.7"

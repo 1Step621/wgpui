@@ -7,11 +7,123 @@ use std::{
     time::Duration,
 };
 
+#[cfg(not(target_family = "wasm"))]
 pub use util::*;
+
+#[cfg(target_family = "wasm")]
+pub use wasm_compat::*;
+
+#[cfg(target_family = "wasm")]
+mod wasm_compat {
+    pub mod arc_cow {
+        use std::sync::Arc;
+
+        pub enum ArcCow<'a, T: 'a> {
+            Borrowed(&'a T),
+            Owned(Arc<T>),
+        }
+
+        impl<'a, T> Clone for ArcCow<'a, T> {
+            fn clone(&self) -> Self {
+                match self {
+                    ArcCow::Borrowed(v) => ArcCow::Borrowed(v),
+                    ArcCow::Owned(v) => ArcCow::Owned(v.clone()),
+                }
+            }
+        }
+
+        impl<'a, T> std::ops::Deref for ArcCow<'a, T> {
+            type Target = T;
+            fn deref(&self) -> &T {
+                match self {
+                    ArcCow::Borrowed(v) => v,
+                    ArcCow::Owned(v) => v,
+                }
+            }
+        }
+    }
+
+    pub fn post_inc(x: &mut usize) -> usize {
+        let v = *x;
+        *x += 1;
+        v
+    }
+
+    #[macro_export]
+    macro_rules! debug_panic {
+        ( $($fmt_arg:tt)* ) => {
+            if cfg!(debug_assertions) {
+                panic!( $($fmt_arg)* );
+            } else {
+                log::error!( $($fmt_arg)* );
+            }
+        };
+    }
+
+    pub trait ResultExt<T, E> {
+        fn log_err(self) -> std::result::Result<T, E>;
+    }
+
+    impl<T, E: std::fmt::Debug> ResultExt<T, E> for std::result::Result<T, E> {
+        fn log_err(self) -> std::result::Result<T, E> {
+            self.map_err(|error| {
+                log::error!("{:?}", error);
+                error
+            })
+        }
+    }
+
+    pub trait TryFutureExt: futures::Future + Sized {
+        fn log_tracked_err(
+            self,
+            location: &'static std::panic::Location<'static>,
+        ) -> futures::future::MapErr<Self, fn(Self::Error) -> Self::Error>
+        where
+            Self::Error: std::fmt::Debug;
+    }
+
+    impl<T, E: std::fmt::Debug> TryFutureExt for futures::future::Ready<std::result::Result<T, E>> {
+        fn log_tracked_err(
+            self,
+            location: &'static std::panic::Location<'static>,
+        ) -> futures::future::MapErr<Self, fn(Self::Error) -> Self::Error>
+        where
+            Self::Error: std::fmt::Debug,
+        {
+            self.map_err(|error| {
+                log::error!("{}:{}: {:?}", location.file(), location.line(), error);
+                error
+            })
+        }
+    }
+
+    pub struct Deferred<F: FnOnce()>(Option<F>);
+
+    impl<F: FnOnce()> Deferred<F> {
+        pub fn new(f: F) -> Self {
+            Self(Some(f))
+        }
+    }
+
+    impl<F: FnOnce()> Drop for Deferred<F> {
+        fn drop(&mut self) {
+            if let Some(f) = self.0.take() {
+                f();
+            }
+        }
+    }
+
+    pub fn measure<T>(label: &str, f: impl FnOnce() -> T) -> T {
+        let start = std::time::Instant::now();
+        let result = f();
+        let elapsed = start.elapsed();
+        log::info!("{} took {:?}", label, elapsed);
+        result
+    }
+}
 
 /// A helper trait for building complex objects with imperative conditionals in a fluent style.
 pub trait FluentBuilder {
-    /// Imperatively modify self with the given closure.
     fn map<U>(self, f: impl FnOnce(Self) -> U) -> U
     where
         Self: Sized,
@@ -19,7 +131,6 @@ pub trait FluentBuilder {
         f(self)
     }
 
-    /// Conditionally modify self with the given closure.
     fn when(self, condition: bool, then: impl FnOnce(Self) -> Self) -> Self
     where
         Self: Sized,
@@ -27,7 +138,6 @@ pub trait FluentBuilder {
         self.map(|this| if condition { then(this) } else { this })
     }
 
-    /// Conditionally modify self with the given closure.
     fn when_else(
         self,
         condition: bool,
@@ -40,7 +150,6 @@ pub trait FluentBuilder {
         self.map(|this| if condition { then(this) } else { else_fn(this) })
     }
 
-    /// Conditionally unwrap and modify self with the given closure, if the given option is Some.
     fn when_some<T>(self, option: Option<T>, then: impl FnOnce(Self, T) -> Self) -> Self
     where
         Self: Sized,
@@ -53,7 +162,7 @@ pub trait FluentBuilder {
             }
         })
     }
-    /// Conditionally unwrap and modify self with the given closure, if the given option is None.
+
     fn when_none<T>(self, option: &Option<T>, then: impl FnOnce(Self) -> Self) -> Self
     where
         Self: Sized,
@@ -62,10 +171,7 @@ pub trait FluentBuilder {
     }
 }
 
-/// Extensions for Future types that provide additional combinators and utilities.
 pub trait FutureExt {
-    /// Requires a Future to complete before the specified duration has elapsed.
-    /// Similar to tokio::timeout.
     fn with_timeout(self, timeout: Duration, executor: &BackgroundExecutor) -> WithTimeout<Self>
     where
         Self: Sized;
@@ -93,7 +199,6 @@ pub struct WithTimeout<T> {
 
 #[derive(Debug, thiserror::Error)]
 #[error("Timed out before future resolved")]
-/// Error returned by with_timeout when the timeout duration elapsed before the future resolved
 pub struct Timeout;
 
 impl<T: Future> Future for WithTimeout<T> {
@@ -112,9 +217,7 @@ impl<T: Future> Future for WithTimeout<T> {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
-/// Uses smol executor to run a given future no longer than the timeout specified.
-/// Note that this won't "rewind" on `cx.executor().advance_clock` call, truly waiting for the timeout to elapse.
+#[cfg(all(any(test, feature = "test-support"), not(target_family = "wasm")))]
 pub async fn smol_timeout<F, T>(timeout: Duration, f: F) -> Result<T, ()>
 where
     F: Future<Output = T>,
@@ -127,8 +230,6 @@ where
     smol::future::FutureExt::race(timer, future).await
 }
 
-/// Increment the given atomic counter if it is not zero.
-/// Return the new value of the counter.
 pub(crate) fn atomic_incr_if_not_zero(counter: &AtomicUsize) -> usize {
     let mut loaded = counter.load(SeqCst);
     loop {

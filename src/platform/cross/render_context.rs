@@ -1,22 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use super::surface_registry::SurfaceRegistry;
-
-/// Options for configuring the WGPU device used by the application.
-#[derive(Clone, Debug)]
-pub struct WgpuOptions {
-    /// Additional WGPU features to request when creating the device.
-    /// These are OR'd with the features WGPUI itself requires.
-    pub additional_features: wgpu::Features,
-}
-
-impl Default for WgpuOptions {
-    fn default() -> Self {
-        Self {
-            additional_features: wgpu::Features::empty(),
-        }
-    }
-}
+use crate::WgpuOptions;
 
 pub struct WgpuContext {
     pub(super) adapter: wgpu::Adapter,

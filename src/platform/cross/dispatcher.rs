@@ -1,22 +1,23 @@
 use crate::{PlatformDispatcher, Priority, PriorityQueueSender, RealtimePriority, RunnableVariant};
-use priority_threadpool::ThreadPool;
 use std::thread::ThreadId;
 use winit::event_loop::EventLoopProxy;
+
+#[cfg(not(target_family = "wasm"))]
+use priority_threadpool::ThreadPool;
 
 pub enum CrossEvent {
     WakeUp,
     SurfacePresent(winit::window::WindowId),
     SingleInstanceActivated,
-    /// Sent by CrossWindow when GPUI programmatically removes a window,
-    /// so the platform layer removes it from AppState.windows and the OS window is destroyed.
     CloseWindow(winit::window::WindowId),
 }
 
 pub struct Dispatcher {
     main_thread_id: ThreadId,
     main_tx: PriorityQueueSender<RunnableVariant>,
-    threadpool: ThreadPool<Priority>,
     proxy: EventLoopProxy<CrossEvent>,
+    #[cfg(not(target_family = "wasm"))]
+    threadpool: ThreadPool<Priority>,
 }
 
 impl Dispatcher {
@@ -27,8 +28,9 @@ impl Dispatcher {
         Self {
             main_thread_id: std::thread::current().id(),
             main_tx,
-            threadpool: ThreadPool::new(num_cpus::get() * 8),
             proxy,
+            #[cfg(not(target_family = "wasm"))]
+            threadpool: ThreadPool::new(num_cpus::get() * 8),
         }
     }
 }
@@ -44,9 +46,18 @@ impl PlatformDispatcher for Dispatcher {
         _label: Option<crate::TaskLabel>,
         priority: Priority,
     ) {
+        #[cfg(not(target_family = "wasm"))]
         match runnable {
             RunnableVariant::Meta(runnable) => self.threadpool.queue(&priority, runnable),
             RunnableVariant::Compat(runnable) => self.threadpool.queue(&priority, runnable),
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = priority;
+            match runnable {
+                RunnableVariant::Meta(runnable) => runnable.run(),
+                RunnableVariant::Compat(runnable) => runnable.run(),
+            }
         }
     }
 
@@ -62,6 +73,7 @@ impl PlatformDispatcher for Dispatcher {
     }
 
     fn dispatch_after(&self, duration: std::time::Duration, runnable: RunnableVariant) {
+        #[cfg(not(target_family = "wasm"))]
         match runnable {
             RunnableVariant::Meta(runnable) => {
                 self.threadpool
@@ -72,18 +84,27 @@ impl PlatformDispatcher for Dispatcher {
                     .queue_delayed(&Priority::Low, duration, runnable);
             }
         }
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = duration;
+            match runnable {
+                RunnableVariant::Meta(runnable) => runnable.run(),
+                RunnableVariant::Compat(runnable) => runnable.run(),
+            }
+        }
     }
 
     fn spawn_realtime(&self, _priority: RealtimePriority, f: Box<dyn FnOnce() + Send>) {
-        // TODO(mdeand): There's a crate (thread-priority) that implements thread
-        // TODO(mdeand): priorities, but I don't want to add it right now.
-
+        #[cfg(not(target_family = "wasm"))]
         std::thread::spawn(move || {
             f();
         });
+        #[cfg(target_family = "wasm")]
+        f();
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl priority_threadpool::Priority for Priority {
     const COUNT: usize = 3;
 

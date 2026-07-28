@@ -1838,11 +1838,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "139ef39800118c7683f2fd3c98c1b23c09ae076556b435f8e9064ae108aaeeec"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi",
  "rand_core 0.10.0",
  "wasip2",
  "wasip3",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -1976,6 +1978,7 @@ dependencies = [
  "font-kit",
  "futures",
  "futures-concurrency",
+ "getrandom 0.4.1",
  "glam",
  "gpui-macros",
  "gpui_collections",
@@ -1989,6 +1992,7 @@ dependencies = [
  "image",
  "inventory",
  "itertools",
+ "js-sys",
  "libc",
  "log",
  "lyon",
@@ -2030,6 +2034,9 @@ dependencies = [
  "usvg",
  "uuid",
  "waker-fn",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
  "wgpu",
  "winit",
 ]

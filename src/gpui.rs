@@ -90,6 +90,7 @@ pub use executor::*;
 pub use geometry::*;
 pub use global::*;
 pub use gpui_macros::{AppContext, IntoElement, Render, VisualContext, register_action, test};
+#[cfg(not(target_family = "wasm"))]
 pub use http_client;
 pub use input::*;
 pub use inspector::*;
@@ -110,7 +111,13 @@ pub use refineable::*;
 pub use scene::*;
 pub use shared_string::*;
 pub use shared_uri::*;
+#[cfg(not(target_family = "wasm"))]
 pub use smol::Timer;
+#[cfg(target_family = "wasm")]
+pub use wasm_bindgen_futures::JsFuture as Timer;
+#[cfg(target_family = "wasm")]
+#[allow(unused_imports)]
+use web_sys::VideoFrame;
 use std::{any::Any, future::Future};
 pub use style::*;
 pub use styled::*;
@@ -122,7 +129,7 @@ pub use taffy::{AvailableSpace, LayoutId};
 #[cfg(any(test, feature = "test-support"))]
 pub use test::*;
 pub use text_system::*;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(all(any(test, feature = "test-support"), not(target_family = "wasm")))]
 pub use util::smol_timeout;
 pub use util::{FutureExt, Timeout, arc_cow::ArcCow};
 pub use view::*;

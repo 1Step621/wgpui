@@ -8,7 +8,7 @@ mod test;
 pub(crate) mod cross;
 
 use crate::platform::cross::platform::CrossPlatform;
-use crate::platform::cross::render_context::WgpuOptions;
+use crate::WgpuOptions;
 use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Font, FontId, FontMetrics, FontRun,
