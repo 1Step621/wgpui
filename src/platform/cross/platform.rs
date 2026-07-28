@@ -104,6 +104,8 @@ struct AppState {
     wgpu_context: Arc<std::sync::OnceLock<Arc<WgpuContext>>>,
     #[cfg(target_family = "wasm")]
     wgpu_options: WgpuOptions,
+    #[cfg(target_family = "wasm")]
+    proxy: winit::event_loop::EventLoopProxy<CrossEvent>,
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -315,6 +317,7 @@ impl Platform for CrossPlatform {
     }
 
     fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>) {
+        web_sys::console::log_1(&"WGPUI: CrossPlatform::run entered".into());
         let mut event_loop = self.event_loop.take().expect("App is already running");
 
         #[cfg(target_family = "wasm")]
@@ -339,6 +342,7 @@ impl Platform for CrossPlatform {
             wgpu_options: WgpuOptions {
                 additional_features: self.wgpu_options.additional_features,
             },
+            proxy: self.event_loop_proxy.clone(),
         };
 
         #[cfg(not(target_family = "wasm"))]
@@ -363,8 +367,9 @@ impl Platform for CrossPlatform {
 
         #[cfg(target_family = "wasm")]
         {
-            use winit::platform::web::EventLoopExtWebSys;
-            event_loop.spawn_app(app_state);
+            web_sys::console::log_1(&"WGPUI: calling run_app".into());
+            let _ = event_loop.run_app(&mut app_state);
+            web_sys::console::log_1(&"WGPUI: run_app returned (unexpected)".into());
         }
         #[cfg(not(target_family = "wasm"))]
         event_loop
@@ -937,10 +942,26 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
     fn new_events(&mut self, _event_loop: &ActiveEventLoop, _cause: winit::event::StartCause) {}
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: CrossEvent) {
+        web_sys::console::log_1(&"WGPUI: user_event".into());
         self.set_active_context(event_loop);
 
         match event {
             CrossEvent::WakeUp => {
+                web_sys::console::log_1(&"WGPUI: WakeUp received".into());
+                // After async WGPU init completes, run the deferred callback
+                // within a valid ActiveEventLoop context.
+                #[cfg(target_family = "wasm")]
+                if self.wgpu_context.as_ref().get().is_some() {
+                    web_sys::console::log_1(&"WGPUI: WGPU ready, calling on_finish_launching".into());
+                    if let Some(cb) = self.on_finish_launching.take() {
+                        cb();
+                    } else if let Some(mut callback) = self.callbacks.on_reopen.take() {
+                        callback();
+                        self.callbacks.on_reopen.set(Some(callback));
+                    }
+                    self.clear_active_context();
+                    return;
+                }
                 self.drain_main_queue();
             }
             CrossEvent::SurfacePresent(window_id) => {
@@ -955,8 +976,6 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                 }
             }
             CrossEvent::CloseWindow(window_id) => {
-                // Programmatic close: remove from platform map so the winit
-                // window is dropped and the OS window actually disappears.
                 self.windows.remove(&window_id);
                 self.window_handles.remove(&window_id);
                 if self.active_window_id.get() == Some(window_id) {
@@ -1052,10 +1071,12 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.set_active_context(event_loop);
+        web_sys::console::log_1(&"WGPUI: about_to_wait".into());
 
         self.drain_main_queue();
 
         for window in self.windows.values() {
+            web_sys::console::log_1(&"WGPUI: requesting redraw".into());
             window.window().request_redraw();
         }
 
@@ -1069,11 +1090,13 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
     fn memory_warning(&mut self, _event_loop: &ActiveEventLoop) {}
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        web_sys::console::log_1(&"WGPUI: resumed fired".into());
         self.set_active_context(event_loop);
 
         #[cfg(target_family = "wasm")]
         {
             if self.wgpu_context.as_ref().get().is_none() {
+                web_sys::console::log_1(&"WGPUI: WGPU not ready, starting async init".into());
                 // WGPU context not yet initialized — do it asynchronously.
                 // The wgpu_context Arc is shared with CrossPlatform, so once
                 // set here, open_window() on the platform side finds it.
@@ -1081,38 +1104,41 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                 let wgpu_opts = WgpuOptions {
                     additional_features: self.wgpu_options.additional_features,
                 };
-                let cb = self.on_finish_launching.take();
-                let reopen_cb = self.callbacks.on_reopen.take();
-                let callbacks = self.callbacks.clone();
-                // Capture the event_loop pointer so we can restore ACTIVE_CONTEXT
-                // when we call the callback (open_window requires it).
-                let event_loop_ptr = event_loop as *const ActiveEventLoop;
-                let self_ptr = self as *mut Self;
-                wasm_bindgen_futures::spawn_local(async move {
-                    match WgpuContext::new_async(&wgpu_opts).await {
-                        Ok(ctx) => {
-                            wgpu_ctx.set(Arc::new(ctx)).ok();
-                        }
-                        Err(e) => {
-                            log::error!("WASM WGPU init failed: {e}");
-                            return;
-                        }
+                let proxy = self.proxy.clone();
+                // Use setTimeout(0) instead of spawn_local because winit's
+                // throw-based control flow would abort microtask processing.
+                use wasm_bindgen::JsCast;
+                let closure = wasm_bindgen::prelude::Closure::once({
+                    let wgpu_ctx = wgpu_ctx.clone();
+                    let wgpu_opts_clone = WgpuOptions {
+                        additional_features: wgpu_opts.additional_features,
+                    };
+                    move || {
+                        web_sys::console::log_1(&"WGPUI: async WGPU init starting via setTimeout".into());
+                        wasm_bindgen_futures::spawn_local(async move {
+                            match WgpuContext::new_async(&wgpu_opts_clone).await {
+                                Ok(ctx) => {
+                                    web_sys::console::log_1(&"WGPUI: async WGPU init OK".into());
+                                    wgpu_ctx.set(Arc::new(ctx)).ok();
+                                }
+                                Err(e) => {
+                                    let msg = format!("WGPUI: WASM WGPU init failed: {e}");
+                                    web_sys::console::log_1(&msg.into());
+                                    return;
+                                }
+                            }
+                            web_sys::console::log_1(&"WGPUI: sending WakeUp".into());
+                            let _ = proxy.send_event(CrossEvent::WakeUp);
+                        });
                     }
-                    // Restore active context before calling the callback
-                    // so open_window() can find it.
-                    ACTIVE_CONTEXT.with(|s| {
-                        s.set(Some((event_loop_ptr, self_ptr)));
-                    });
-                    if let Some(cb) = cb {
-                        cb();
-                    } else if let Some(mut cb) = reopen_cb {
-                        cb();
-                        callbacks.on_reopen.set(Some(cb));
-                    }
-                    ACTIVE_CONTEXT.with(|s| {
-                        s.set(None);
-                    });
                 });
+                if let Some(window) = web_sys::window() {
+                    let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                        closure.as_ref().unchecked_ref(),
+                        0,
+                    );
+                    closure.forget();
+                }
                 self.clear_active_context();
                 return;
             }
