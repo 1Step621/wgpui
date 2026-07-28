@@ -97,6 +97,14 @@ impl<T> PriorityQueueSender<T> {
     }
 }
 
+impl<T> Clone for PriorityQueueSender<T> {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+        }
+    }
+}
+
 impl<T> Drop for PriorityQueueSender<T> {
     fn drop(&mut self) {
         self.state

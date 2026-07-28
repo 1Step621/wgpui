@@ -90,11 +90,13 @@ impl PlatformDispatcher for Dispatcher {
             let proxy = self.proxy.clone();
             let ms = duration.as_millis().min(u32::MAX as u128) as f64;
             wasm_bindgen_futures::spawn_local(async move {
-                let resolve_fn = js_sys::Function::new_with_args(
-                    "resolve",
-                    &format!("setTimeout(resolve, {ms})"),
-                );
-                let promise = js_sys::Promise::new(&resolve_fn);
+                let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+                    let window = web_sys::window().unwrap();
+                    let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                        &resolve,
+                        ms as i32,
+                    );
+                });
                 let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
                 let _ = main_tx.send(Priority::Low, runnable);
                 let _ = proxy.send_event(CrossEvent::WakeUp);
