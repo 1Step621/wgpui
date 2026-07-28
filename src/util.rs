@@ -13,6 +13,19 @@ pub use util::*;
 #[cfg(target_family = "wasm")]
 pub use wasm_compat::*;
 
+/// Emit a panic in debug builds, otherwise log the error.
+/// Available at the crate root as `debug_panic!`.
+#[macro_export]
+macro_rules! debug_panic {
+    ( $($fmt_arg:tt)* ) => {
+        if cfg!(debug_assertions) {
+            panic!( $($fmt_arg)* );
+        } else {
+            log::error!( $($fmt_arg)* );
+        }
+    };
+}
+
 #[cfg(target_family = "wasm")]
 #[allow(missing_docs, dead_code)]
 mod wasm_compat {
@@ -48,17 +61,6 @@ mod wasm_compat {
         let v = *x;
         *x += 1;
         v
-    }
-
-    #[macro_export]
-    macro_rules! debug_panic {
-        ( $($fmt_arg:tt)* ) => {
-            if cfg!(debug_assertions) {
-                panic!( $($fmt_arg)* );
-            } else {
-                log::error!( $($fmt_arg)* );
-            }
-        };
     }
 
     pub trait ResultExt<T, E> {
