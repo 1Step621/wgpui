@@ -93,9 +93,9 @@ mod wasm_compat {
             self,
             location: std::panic::Location<'static>,
         ) -> impl futures::Future<Output = Self::Output> {
-            let file = location.file();
-            let line = location.line();
-            futures::FutureExt::map(self, |result| {
+            let file: &'static str = location.file();
+            let line: u32 = location.line();
+            futures::FutureExt::map(self, move |result| {
                 result.map_err(|error| {
                     log::error!("{}:{}: {:?}", file, line, error);
                     error
