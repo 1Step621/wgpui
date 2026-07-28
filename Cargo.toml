@@ -101,9 +101,11 @@ wgpu = { version = "30", default-features = false, features = [
     "web",
     "webgpu",
     "wgsl",
+    "fragile-send-sync-non-atomic-wasm",
 ] }
 web-sys = { version = "0.3", features = ["VideoFrame"] }
 js-sys = { version = "0.3" }
+wasm-bindgen-futures = "0.4"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 device_query = "2.1"
@@ -114,6 +116,7 @@ wgpu = { version = "30", default-features = false, features = [
     "dx12",
     "vulkan",
     "wgsl",
+    "fragile-send-sync-non-atomic-wasm",
 ] }
 priority-threadpool = { git = "https://github.com/tristanpoland/priority-threadpool", rev = "bb1ab91" }
 arboard = "3.6.1"

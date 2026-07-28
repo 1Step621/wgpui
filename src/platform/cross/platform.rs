@@ -28,6 +28,7 @@ fn device_button_to_gpui(button: u32) -> Option<MouseButton> {
     }
 }
 use anyhow::Result;
+#[cfg(not(target_family = "wasm"))]
 use arboard::Clipboard;
 use collections::FxHashMap;
 use std::{
@@ -506,6 +507,7 @@ impl Platform for CrossPlatform {
     }
 
     fn open_url(&self, url: &str) {
+        #[cfg(not(target_family = "wasm"))]
         if let Err(err) = ::open::that_detached(url) {
             log::error!("failed to open_url {url:?}: {err:?}");
         }
@@ -527,6 +529,8 @@ impl Platform for CrossPlatform {
     ) -> futures::channel::oneshot::Receiver<anyhow::Result<Option<Vec<std::path::PathBuf>>>> {
         let (sender, receiver) = futures::channel::oneshot::channel();
 
+        #[cfg(not(target_family = "wasm"))]
+        {
         enum PickType {
             File,
             Folder,
@@ -543,6 +547,7 @@ impl Platform for CrossPlatform {
         };
 
         let mut dialog = rfd::AsyncFileDialog::new();
+
         // Diverging from gpui implementation, where the prompt is the button. rfd doesnt support this and the gpui doesnt support an explicit title (unlike prompt_for_new_path).
         // So we hijack the prompt to use it as the title.
         dialog = match options.prompt {
@@ -579,6 +584,7 @@ impl Platform for CrossPlatform {
             };
         });
         task.detach();
+        } // #[cfg(not(target_family = "wasm"))]
 
         receiver
     }
@@ -590,6 +596,8 @@ impl Platform for CrossPlatform {
     ) -> futures::channel::oneshot::Receiver<anyhow::Result<Option<std::path::PathBuf>>> {
         let (sender, receiver) = futures::channel::oneshot::channel();
 
+        #[cfg(not(target_family = "wasm"))]
+        {
         let mut dialog = rfd::AsyncFileDialog::new();
         dialog = dialog.set_title("Save File");
         dialog = dialog.set_directory(directory);
@@ -602,6 +610,7 @@ impl Platform for CrossPlatform {
             let _ = sender.send(Ok(path));
         });
         task.detach();
+        }
 
         receiver
     }
@@ -612,6 +621,7 @@ impl Platform for CrossPlatform {
     }
 
     fn reveal_path(&self, path: &std::path::Path) {
+        #[cfg(not(target_family = "wasm"))]
         if let Err(err) = opener::reveal(path) {
             let fallback_path = if path.is_file() {
                 path.parent().unwrap_or(path)
@@ -631,6 +641,7 @@ impl Platform for CrossPlatform {
     }
 
     fn open_with_system(&self, path: &std::path::Path) {
+        #[cfg(not(target_family = "wasm"))]
         if let Err(err) = ::open::that_detached(path) {
             log::error!("failed to open_with_system {path:?}: {err:?}");
         }
@@ -754,6 +765,8 @@ impl Platform for CrossPlatform {
     }
 
     fn write_to_clipboard(&self, item: crate::ClipboardItem) {
+        #[cfg(not(target_family = "wasm"))]
+        {
         let Some(text) = item.text() else {
             log::warn!("write_to_clipboard currently supports text entries only on this platform");
             return;
@@ -763,9 +776,12 @@ impl Platform for CrossPlatform {
             Ok(()) => {}
             Err(error) => log::warn!("failed to write to clipboard: {error}"),
         }
+        }
     }
 
     fn read_from_clipboard(&self) -> Option<crate::ClipboardItem> {
+        #[cfg(not(target_family = "wasm"))]
+        {
         match Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
             Ok(text) => Some(crate::ClipboardItem::new_string(text)),
             Err(error) => {
@@ -773,6 +789,9 @@ impl Platform for CrossPlatform {
                 None
             }
         }
+        }
+        #[cfg(target_family = "wasm")]
+        { None }
     }
 
     fn write_credentials(

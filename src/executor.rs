@@ -2,6 +2,7 @@ use crate::{App, PlatformDispatcher, RunnableMeta, RunnableVariant};
 use async_task::Runnable;
 use futures::channel::mpsc;
 use parking_lot::{Condvar, Mutex};
+#[cfg(not(target_family = "wasm"))]
 use smol::prelude::*;
 use std::{
     fmt::Debug,
@@ -19,7 +20,8 @@ use std::{
     thread::{self, ThreadId},
     time::{Duration, Instant},
 };
-use util::TryFutureExt;
+use crate::util::TryFutureExt;
+#[cfg(not(target_family = "wasm"))]
 use waker_fn::waker_fn;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -138,7 +140,7 @@ where
     pub fn detach_and_log_err(self, cx: &App) {
         let location = core::panic::Location::caller();
         cx.foreground_executor()
-            .spawn(self.log_tracked_err(*location))
+            .spawn(self.log_tracked_err(location))
             .detach();
     }
 }
@@ -149,7 +151,7 @@ impl<T> Future for Task<T> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         match unsafe { self.get_unchecked_mut() } {
             Task(TaskState::Ready(val)) => Poll::Ready(val.take().unwrap()),
-            Task(TaskState::Spawned(task)) => task.poll(cx),
+            Task(TaskState::Spawned(task)) => Pin::new(task).poll(cx),
         }
     }
 }
@@ -384,6 +386,7 @@ impl BackgroundExecutor {
 
     /// Used by the test harness to run an async test in a synchronous fashion.
     #[cfg(any(test, feature = "test-support"))]
+    #[cfg(not(target_family = "wasm"))]
     #[track_caller]
     pub fn block_test<R>(&self, future: impl Future<Output = R>) -> R {
         if let Ok(value) = self.block_internal(false, future, None) {
@@ -395,6 +398,7 @@ impl BackgroundExecutor {
 
     /// Block the current thread until the given future resolves.
     /// Consider using `block_with_timeout` instead.
+    #[cfg(not(target_family = "wasm"))]
     pub fn block<R>(&self, future: impl Future<Output = R>) -> R {
         if let Ok(value) = self.block_internal(true, future, None) {
             value
@@ -404,6 +408,7 @@ impl BackgroundExecutor {
     }
 
     #[cfg(not(any(test, feature = "test-support")))]
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn block_internal<Fut: Future>(
         &self,
         _background_only: bool,
@@ -446,6 +451,7 @@ impl BackgroundExecutor {
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    #[cfg(not(target_family = "wasm"))]
     #[track_caller]
     pub(crate) fn block_internal<Fut: Future>(
         &self,
@@ -536,6 +542,7 @@ impl BackgroundExecutor {
 
     /// Block the current thread until the given future resolves
     /// or `duration` has elapsed.
+    #[cfg(not(target_family = "wasm"))]
     pub fn block_with_timeout<Fut: Future>(
         &self,
         duration: Duration,
@@ -678,8 +685,11 @@ impl BackgroundExecutor {
         #[cfg(any(test, feature = "test-support"))]
         return 4;
 
-        #[cfg(not(any(test, feature = "test-support")))]
+        #[cfg(all(not(any(test, feature = "test-support")), not(target_family = "wasm")))]
         return num_cpus::get();
+
+        #[cfg(target_family = "wasm")]
+        return 1;
     }
 
     /// Whether we're on the main thread.
@@ -873,6 +883,10 @@ impl Drop for Scope<'_> {
 
         // Wait until the channel is closed, which means that all of the spawned
         // futures have resolved.
+        #[cfg(not(target_family = "wasm"))]
+        {
+        use futures::StreamExt;
         self.executor.block(self.rx.next());
+        }
     }
 }

@@ -4,9 +4,9 @@ use crate::{
     Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels, RenderImage, Resource,
     SharedString, SharedUri, StyleRefinement, Styled, Task, Window, px,
 };
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 
-use futures::{AsyncReadExt, Future};
+use futures::Future;
 use image::{
     AnimationDecoder, DynamicImage, Frame, ImageError, ImageFormat, Rgba,
     codecs::{gif::GifDecoder, webp::WebPDecoder},
@@ -17,12 +17,14 @@ use std::{
     io::{self, Cursor},
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
-    str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
 };
+
+#[cfg(not(target_family = "wasm"))]
+use std::str::FromStr;
 use thiserror::Error;
-use util::ResultExt;
+use crate::util::ResultExt;
 
 use super::{Stateful, StatefulInteractiveElement};
 
@@ -48,8 +50,14 @@ pub enum ImageSource {
     Custom(Arc<dyn Fn(&mut Window, &mut App) -> Option<Result<Arc<RenderImage>, ImageCacheError>>>),
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn is_uri(uri: &str) -> bool {
     http_client::Uri::from_str(uri).is_ok()
+}
+
+#[cfg(target_family = "wasm")]
+fn is_uri(_uri: &str) -> bool {
+    false
 }
 
 impl From<SharedUri> for ImageSource {
@@ -593,14 +601,14 @@ impl Asset for ImageAssetLoader {
         source: Self::Source,
         cx: &mut App,
     ) -> impl Future<Output = Self::Output> + Send + 'static {
+        #[cfg(not(target_family = "wasm"))]
         let client = cx.http_client();
-        // TODO: Can we make SVGs always rescale?
-        // let scale_factor = cx.scale_factor();
         let svg_renderer = cx.svg_renderer();
         let asset_source = cx.asset_source().clone();
         async move {
             let bytes = match source.clone() {
                 Resource::Path(uri) => fs::read(uri.as_ref())?,
+                #[cfg(not(target_family = "wasm"))]
                 Resource::Uri(uri) => {
                     let mut response = client
                         .get(uri.as_ref(), ().into(), true)
@@ -619,6 +627,10 @@ impl Asset for ImageAssetLoader {
                         });
                     }
                     body
+                }
+                #[cfg(target_family = "wasm")]
+                Resource::Uri(_) => {
+                    return Err(ImageCacheError::Asset("HTTP URIs not supported on WASM".into()));
                 }
                 Resource::Embedded(path) => {
                     let data = asset_source.load(&path).ok().flatten();
@@ -692,6 +704,7 @@ pub enum ImageCacheError {
     #[error("IO error: {0}")]
     Io(Arc<std::io::Error>),
     /// An error that occurred while processing an image.
+    #[cfg(not(target_family = "wasm"))]
     #[error("unexpected http status for {uri}: {status}, body: {body}")]
     BadStatus {
         /// The URI of the image.
@@ -708,6 +721,7 @@ pub enum ImageCacheError {
     #[error("image error: {0}")]
     Image(Arc<ImageError>),
     /// An error that occurred while processing an SVG.
+    #[cfg(not(target_family = "wasm"))]
     #[error("svg error: {0}")]
     Usvg(Arc<usvg::Error>),
 }
@@ -724,6 +738,7 @@ impl From<io::Error> for ImageCacheError {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl From<usvg::Error> for ImageCacheError {
     fn from(value: usvg::Error) -> Self {
         Self::Usvg(Arc::new(value))

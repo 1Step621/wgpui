@@ -48,8 +48,8 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use util::post_inc;
-use util::{ResultExt, measure};
+use crate::util::post_inc;
+use crate::util::{ResultExt, measure};
 use uuid::Uuid;
 
 mod prompts;

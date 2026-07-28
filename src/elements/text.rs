@@ -15,7 +15,7 @@ use std::{
     rc::Rc,
     sync::Arc,
 };
-use util::ResultExt;
+use crate::util::ResultExt;
 
 impl Element for &'static str {
     type RequestLayoutState = TextLayout;

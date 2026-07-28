@@ -103,6 +103,8 @@ impl PlatformTextSystem for CosmicTextSystem {
             state.font_ids_by_family_cache[&key].as_ref()
         };
 
+        #[cfg(not(target_family = "wasm"))]
+        {
         let candidate_properties = candidates
             .iter()
             .map(|font_id| {
@@ -115,7 +117,13 @@ impl PlatformTextSystem for CosmicTextSystem {
         let ix = find_best_match(&candidate_properties, &font_into_properties(font))
             .context("requested font family contains no font matching the other parameters")?;
 
-        Ok(candidates[ix])
+        return Ok(candidates[ix]);
+        }
+
+        #[cfg(target_family = "wasm")]
+        {
+        anyhow::bail!("font_id is not available on WASM")
+        }
     }
 
     fn font_metrics(&self, font_id: FontId) -> FontMetrics {
@@ -608,6 +616,7 @@ impl From<FontStyle> for cosmic_text::Style {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn font_into_properties(font: &crate::Font) -> font_kit::properties::Properties {
     font_kit::properties::Properties {
         style: match font.style {
@@ -624,6 +633,7 @@ fn font_into_properties(font: &crate::Font) -> font_kit::properties::Properties 
 /// Copied from font-kit's private `matching` module to avoid depending on the
 /// zed-font-kit fork which made that module public.
 /// https://drafts.csswg.org/css-fonts-3/#font-style-matching
+#[cfg(not(target_family = "wasm"))]
 fn find_best_match(
     candidates: &[font_kit::properties::Properties],
     query: &font_kit::properties::Properties,
@@ -769,6 +779,7 @@ fn find_best_match(
         .context("no matching font found")
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn face_info_into_properties(
     face_info: &cosmic_text::fontdb::FaceInfo,
 ) -> font_kit::properties::Properties {

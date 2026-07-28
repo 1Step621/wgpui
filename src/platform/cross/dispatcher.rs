@@ -54,10 +54,10 @@ impl PlatformDispatcher for Dispatcher {
         #[cfg(target_family = "wasm")]
         {
             let _ = priority;
-            match runnable {
+            let _ = match runnable {
                 RunnableVariant::Meta(runnable) => runnable.run(),
                 RunnableVariant::Compat(runnable) => runnable.run(),
-            }
+            };
         }
     }
 
@@ -87,10 +87,10 @@ impl PlatformDispatcher for Dispatcher {
         #[cfg(target_family = "wasm")]
         {
             let _ = duration;
-            match runnable {
+            let _ = match runnable {
                 RunnableVariant::Meta(runnable) => runnable.run(),
                 RunnableVariant::Compat(runnable) => runnable.run(),
-            }
+            };
         }
     }
 

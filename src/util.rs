@@ -14,6 +14,7 @@ pub use util::*;
 pub use wasm_compat::*;
 
 #[cfg(target_family = "wasm")]
+#[allow(missing_docs, dead_code)]
 mod wasm_compat {
     pub mod arc_cow {
         use std::sync::Arc;
@@ -61,15 +62,18 @@ mod wasm_compat {
     }
 
     pub trait ResultExt<T, E> {
-        fn log_err(self) -> std::result::Result<T, E>;
+        fn log_err(self) -> std::option::Option<T>;
     }
 
     impl<T, E: std::fmt::Debug> ResultExt<T, E> for std::result::Result<T, E> {
-        fn log_err(self) -> std::result::Result<T, E> {
-            self.map_err(|error| {
-                log::error!("{:?}", error);
-                error
-            })
+        fn log_err(self) -> std::option::Option<T> {
+            match self {
+                Ok(val) => Some(val),
+                Err(error) => {
+                    log::error!("{:?}", error);
+                    None
+                }
+            }
         }
     }
 
@@ -77,22 +81,21 @@ mod wasm_compat {
         fn log_tracked_err(
             self,
             location: &'static std::panic::Location<'static>,
-        ) -> futures::future::MapErr<Self, fn(Self::Error) -> Self::Error>
-        where
-            Self::Error: std::fmt::Debug;
+        ) -> impl futures::Future<Output = Self::Output>;
     }
 
-    impl<T, E: std::fmt::Debug> TryFutureExt for futures::future::Ready<std::result::Result<T, E>> {
+    impl<T, E: std::fmt::Debug, F: futures::Future<Output = std::result::Result<T, E>>> TryFutureExt
+        for F
+    {
         fn log_tracked_err(
             self,
             location: &'static std::panic::Location<'static>,
-        ) -> futures::future::MapErr<Self, fn(Self::Error) -> Self::Error>
-        where
-            Self::Error: std::fmt::Debug,
-        {
-            self.map_err(|error| {
-                log::error!("{}:{}: {:?}", location.file(), location.line(), error);
-                error
+        ) -> impl futures::Future<Output = Self::Output> {
+            futures::FutureExt::map(self, |result| {
+                result.map_err(|error| {
+                    log::error!("{}:{}: {:?}", location.file(), location.line(), error);
+                    error
+                })
             })
         }
     }
@@ -120,9 +123,13 @@ mod wasm_compat {
         log::info!("{} took {:?}", label, elapsed);
         result
     }
+
+    pub fn defer(f: impl FnOnce() + 'static) -> Deferred<impl FnOnce()> {
+        Deferred::new(f)
+    }
 }
 
-/// A helper trait for building complex objects with imperative conditionals in a fluent style.
+#[allow(missing_docs)]
 pub trait FluentBuilder {
     fn map<U>(self, f: impl FnOnce(Self) -> U) -> U
     where
@@ -171,6 +178,7 @@ pub trait FluentBuilder {
     }
 }
 
+#[allow(missing_docs)]
 pub trait FutureExt {
     fn with_timeout(self, timeout: Duration, executor: &BackgroundExecutor) -> WithTimeout<Self>
     where
@@ -199,6 +207,7 @@ pub struct WithTimeout<T> {
 
 #[derive(Debug, thiserror::Error)]
 #[error("Timed out before future resolved")]
+#[allow(missing_docs)]
 pub struct Timeout;
 
 impl<T: Future> Future for WithTimeout<T> {

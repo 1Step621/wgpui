@@ -30,7 +30,13 @@ use http_client::{HttpClient, Url};
 use smallvec::SmallVec;
 #[cfg(any(test, feature = "test-support"))]
 pub use test_context::*;
-use util::{ResultExt, debug_panic};
+use crate::util::ResultExt;
+use crate::debug_panic;
+
+#[cfg(target_family = "wasm")]
+pub(crate) type BoxedHttpClient = ();
+#[cfg(not(target_family = "wasm"))]
+pub(crate) type BoxedHttpClient = Arc<dyn HttpClient>;
 
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::InspectorElementRegistry;
@@ -140,10 +146,20 @@ impl Application {
         #[cfg(any(test, feature = "test-support"))]
         log::info!("GPUI was compiled in test mode");
 
+        let http_client = {
+            #[cfg(not(target_family = "wasm"))]
+            {
+                Arc::new(NullHttpClient) as BoxedHttpClient
+            }
+            #[cfg(target_family = "wasm")]
+            {
+                ()
+            }
+        };
         Self(App::new_app(
             current_platform(false, options),
             Arc::new(()),
-            Arc::new(NullHttpClient),
+            http_client,
         ))
     }
 
@@ -151,10 +167,20 @@ impl Application {
     /// but makes it possible to run an application in an context like
     /// SSH, where GUI applications are not allowed.
     pub fn headless() -> Self {
+        let http_client = {
+            #[cfg(not(target_family = "wasm"))]
+            {
+                Arc::new(NullHttpClient) as BoxedHttpClient
+            }
+            #[cfg(target_family = "wasm")]
+            {
+                ()
+            }
+        };
         Self(App::new_app(
             current_platform(true, WgpuOptions::default()),
             Arc::new(()),
-            Arc::new(NullHttpClient),
+            http_client,
         ))
     }
 
@@ -169,7 +195,7 @@ impl Application {
     }
 
     /// Sets the HTTP client for the application.
-    pub fn with_http_client(self, http_client: Arc<dyn HttpClient>) -> Self {
+    pub fn with_http_client(self, http_client: BoxedHttpClient) -> Self {
         let mut context_lock = self.0.borrow_mut();
         context_lock.http_client = http_client;
         drop(context_lock);
@@ -650,7 +676,7 @@ pub struct App {
     pub(crate) loading_assets: FxHashMap<(TypeId, u64), Box<dyn Any>>,
     asset_source: Arc<dyn AssetSource>,
     pub(crate) svg_renderer: SvgRenderer,
-    http_client: Arc<dyn HttpClient>,
+    http_client: BoxedHttpClient,
 
     // below is plain data, the drop order is insignificant here
     pub(crate) pending_notifications: FxHashSet<EntityId>,
@@ -691,7 +717,7 @@ impl App {
     pub(crate) fn new_app(
         platform: Rc<dyn Platform>,
         asset_source: Arc<dyn AssetSource>,
-        http_client: Arc<dyn HttpClient>,
+        http_client: BoxedHttpClient,
     ) -> Rc<AppCell> {
         let background_executor = platform.background_executor();
         let foreground_executor = platform.foreground_executor();
@@ -848,6 +874,7 @@ impl App {
         self.quitting = true;
 
         let futures = futures::future::join_all(futures);
+        #[cfg(not(target_family = "wasm"))]
         if self
             .background_executor
             .block_with_timeout(SHUTDOWN_TIMEOUT, futures)
@@ -1281,11 +1308,13 @@ impl App {
     }
 
     /// Returns the HTTP client for the application.
+    #[cfg(not(target_family = "wasm"))]
     pub fn http_client(&self) -> Arc<dyn HttpClient> {
         self.http_client.clone()
     }
 
     /// Sets the HTTP client for the application.
+    #[cfg(not(target_family = "wasm"))]
     pub fn set_http_client(&mut self, new_client: Arc<dyn HttpClient>) {
         self.http_client = new_client;
     }
@@ -2594,6 +2623,7 @@ pub struct KeystrokeEvent {
 
 struct NullHttpClient;
 
+#[cfg(not(target_family = "wasm"))]
 impl HttpClient for NullHttpClient {
     fn type_name(&self) -> &'static str {
         "NullHttpClient"

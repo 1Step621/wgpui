@@ -46,6 +46,7 @@ mod shared_uri;
 mod style;
 mod styled;
 mod subscription;
+#[cfg(not(target_family = "wasm"))]
 mod svg_renderer;
 mod tab_stop;
 mod taffy;
@@ -112,17 +113,56 @@ pub use scene::*;
 pub use shared_string::*;
 pub use shared_uri::*;
 #[cfg(not(target_family = "wasm"))]
+#[cfg(not(target_family = "wasm"))]
 pub use smol::Timer;
 #[cfg(target_family = "wasm")]
 pub use wasm_bindgen_futures::JsFuture as Timer;
-#[cfg(target_family = "wasm")]
-#[allow(unused_imports)]
-use web_sys::VideoFrame;
 use std::{any::Any, future::Future};
 pub use style::*;
 pub use styled::*;
 pub use subscription::*;
+#[cfg(not(target_family = "wasm"))]
 pub use svg_renderer::*;
+#[cfg(target_family = "wasm")]
+pub use wasm_svg_stubs::*;
+#[cfg(target_family = "wasm")]
+#[allow(missing_docs)]
+mod wasm_svg_stubs {
+    use crate::{DevicePixels, SharedString, Size};
+    use std::sync::Arc;
+
+    pub const SMOOTH_SVG_SCALE_FACTOR: f32 = 2.;
+
+    #[derive(Clone, PartialEq, Hash, Eq)]
+    pub struct RenderSvgParams {
+        pub path: SharedString,
+        pub size: Size<DevicePixels>,
+    }
+
+    #[derive(Clone)]
+    pub struct SvgRenderer;
+
+    impl SvgRenderer {
+        pub fn new(_asset_source: Arc<dyn crate::AssetSource>) -> Self {
+            Self
+        }
+        pub fn render_single_frame(
+            &self,
+            _bytes: &[u8],
+            _scale_factor: f32,
+            _to_brga: bool,
+        ) -> crate::Result<Arc<crate::RenderImage>> {
+            anyhow::bail!("SVG rendering not available on WASM")
+        }
+        pub fn render_alpha_mask(
+            &self,
+            _params: &RenderSvgParams,
+            _bytes: Option<&[u8]>,
+        ) -> crate::Result<Option<(crate::Size<DevicePixels>, Vec<u8>)>> {
+            anyhow::bail!("SVG rendering not available on WASM")
+        }
+    }
+}
 pub(crate) use tab_stop::*;
 use taffy::TaffyLayoutEngine;
 pub use taffy::{AvailableSpace, LayoutId};

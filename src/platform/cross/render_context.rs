@@ -1,7 +1,21 @@
 use std::sync::{Arc, Mutex};
 
 use super::surface_registry::SurfaceRegistry;
-use crate::WgpuOptions;
+
+/// Options for configuring the WGPU backend.
+pub struct WgpuOptions {
+    /// Additional WGPU features to request when creating the device.
+    /// These are OR'd with the features WGPUI itself requires.
+    pub additional_features: wgpu::Features,
+}
+
+impl Default for WgpuOptions {
+    fn default() -> Self {
+        Self {
+            additional_features: wgpu::Features::empty(),
+        }
+    }
+}
 
 pub struct WgpuContext {
     pub(super) adapter: wgpu::Adapter,

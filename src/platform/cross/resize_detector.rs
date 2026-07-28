@@ -1,3 +1,4 @@
+#[cfg(not(target_family = "wasm"))]
 use device_query::{DeviceQuery, DeviceState};
 use std::cell::Cell;
 use std::time::{Duration, Instant};
@@ -18,6 +19,7 @@ pub struct ResizeDetector {
     /// Deadline for the timer-based fallback (programmatic / non-mouse resizes).
     deadline: Cell<Option<Instant>>,
     /// Cached device_query state — cheap to call, avoids re-initializing each poll.
+    #[cfg(not(target_family = "wasm"))]
     device_state: DeviceState,
 }
 
@@ -30,6 +32,7 @@ impl ResizeDetector {
         Self {
             active: Cell::new(false),
             deadline: Cell::new(None),
+            #[cfg(not(target_family = "wasm"))]
             device_state: DeviceState::new(),
         }
     }
@@ -46,6 +49,8 @@ impl ResizeDetector {
             return false;
         }
 
+        #[cfg(not(target_family = "wasm"))]
+        {
         // Poll the real global left-button state. If it's held the user is
         // still dragging the resize handle; keep deferring and push the
         // fallback deadline out so it doesn't fire during the drag.
@@ -56,6 +61,7 @@ impl ResizeDetector {
         if left_held {
             self.deadline.set(Some(Instant::now() + IDLE_THRESHOLD));
             return true;
+        }
         }
 
         // Left button is up. The user finished a mouse-driven resize; done immediately.

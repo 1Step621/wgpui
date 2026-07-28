@@ -12,7 +12,7 @@ use std::{
     ops,
     sync::Arc,
 };
-use util::Deferred;
+use crate::util::Deferred;
 
 use super::{App, AsyncWindowContext, Entity, KeystrokeEvent};
 
@@ -278,7 +278,7 @@ impl<'a, T: 'static> Context<'a, T> {
     ) -> Deferred<impl FnOnce()> {
         let this = self.weak_entity();
         let mut cx = self.to_async();
-        util::defer(move || {
+        crate::util::defer(move || {
             this.update(&mut cx, f).ok();
         })
     }
