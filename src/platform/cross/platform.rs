@@ -8,6 +8,7 @@ use crate::{
         dispatcher::{CrossEvent, Dispatcher},
         keyboard::CrossKeyboardLayout,
         render_context::WgpuContext,
+        renderer::WgpuRenderer,
         text_system::CosmicTextSystem,
         window::CrossWindow,
     },
