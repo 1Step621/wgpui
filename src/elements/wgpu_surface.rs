@@ -330,6 +330,8 @@ impl WgpuSurfaceHandle {
             .is_ok()
         {
             let inner = self.inner.clone();
+
+            #[cfg(not(target_family = "wasm"))]
             std::thread::spawn(move || {
                 let registry = inner.registry.clone();
                 let device = inner.device.clone();
@@ -363,6 +365,18 @@ impl WgpuSurfaceHandle {
                     *size = (width, height);
                 }
             });
+
+            #[cfg(target_family = "wasm")]
+            {
+                // On WASM, resize synchronously (no background threads)
+                let (width, height) = inner.pending_resize.lock().unwrap().take().unwrap_or_default();
+                if width > 0 && height > 0 {
+                    inner.registry.resize(&inner.device, inner.surface_id, width, height);
+                    let mut size = inner.size.lock().unwrap();
+                    *size = (width, height);
+                }
+                inner.is_resizing.store(false, Ordering::Release);
+            }
         }
     }
 }

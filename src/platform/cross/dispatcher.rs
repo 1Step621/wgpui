@@ -53,11 +53,10 @@ impl PlatformDispatcher for Dispatcher {
         }
         #[cfg(target_family = "wasm")]
         {
-            let _ = priority;
-            let _ = match runnable {
-                RunnableVariant::Meta(runnable) => runnable.run(),
-                RunnableVariant::Compat(runnable) => runnable.run(),
-            };
+            // On WASM, schedule on the main thread event loop instead of
+            // running synchronously (which would block rendering).
+            let _ = self.main_tx.send(priority, runnable);
+            let _ = self.proxy.send_event(CrossEvent::WakeUp);
         }
     }
 
@@ -86,11 +85,20 @@ impl PlatformDispatcher for Dispatcher {
         }
         #[cfg(target_family = "wasm")]
         {
-            let _ = duration;
-            let _ = match runnable {
-                RunnableVariant::Meta(runnable) => runnable.run(),
-                RunnableVariant::Compat(runnable) => runnable.run(),
-            };
+            // On WASM, use setTimeout via a JS promise to schedule after delay
+            let main_tx = self.main_tx.clone();
+            let proxy = self.proxy.clone();
+            let ms = duration.as_millis().min(u32::MAX as u128) as f64;
+            wasm_bindgen_futures::spawn_local(async move {
+                let resolve_fn = js_sys::Function::new_with_args(
+                    "resolve",
+                    &format!("setTimeout(resolve, {ms})"),
+                );
+                let promise = js_sys::Promise::new(&resolve_fn);
+                let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+                let _ = main_tx.send(Priority::Low, runnable);
+                let _ = proxy.send_event(CrossEvent::WakeUp);
+            });
         }
     }
 
@@ -100,7 +108,12 @@ impl PlatformDispatcher for Dispatcher {
             f();
         });
         #[cfg(target_family = "wasm")]
-        f();
+        {
+            // On WASM, schedule via microtask to avoid blocking the event loop
+            wasm_bindgen_futures::spawn_local(async move {
+                f();
+            });
+        }
     }
 }
 

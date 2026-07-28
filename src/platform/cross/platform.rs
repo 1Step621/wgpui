@@ -35,18 +35,18 @@ use collections::FxHashMap;
 use std::{
     cell::{Cell, RefCell},
     collections::HashSet,
-    fs::{self, OpenOptions},
     io::{Read, Write},
-    net::{TcpListener, TcpStream},
     path::PathBuf,
     rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    thread,
     time::{Duration, Instant},
 };
+
+#[cfg(not(target_family = "wasm"))]
+use std::{fs::{self, OpenOptions}, net::{TcpListener, TcpStream}, thread};
 use winit::event_loop::ActiveEventLoop;
 
 thread_local! {
@@ -73,6 +73,7 @@ pub(crate) struct CrossPlatform {
     callbacks: Rc<PlatformCallbacks>,
     menus: RefCell<Option<Vec<crate::OwnedMenu>>>,
     dock_menu: RefCell<Vec<crate::OwnedMenuItem>>,
+    #[cfg(not(target_family = "wasm"))]
     single_instance: RefCell<Option<SingleInstanceRuntime>>,
 }
 
@@ -100,6 +101,7 @@ struct AppState {
     hovered_external_paths: Vec<PathBuf>,
 }
 
+#[cfg(not(target_family = "wasm"))]
 struct SingleInstanceRuntime {
     lock_path: PathBuf,
     stop: Arc<AtomicBool>,
@@ -136,10 +138,12 @@ impl CrossPlatform {
             callbacks: Rc::new(PlatformCallbacks::default()),
             menus: RefCell::new(None),
             dock_menu: RefCell::new(Vec::new()),
+            #[cfg(not(target_family = "wasm"))]
             single_instance: RefCell::new(None),
         })
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn enable_single_instance(&self, app_id: &str) -> Result<()> {
         if self.single_instance.borrow().is_some() {
             return Ok(());
@@ -154,13 +158,20 @@ impl CrossPlatform {
             Err(err) => Err(err),
         }
     }
+
+    #[cfg(target_family = "wasm")]
+    fn enable_single_instance(&self, _app_id: &str) -> Result<()> {
+        Err(anyhow::anyhow!("single instance not supported on WASM"))
+    }
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn single_instance_lock_path(app_id: &str) -> PathBuf {
     let app_hash = seahash::hash(app_id.as_bytes());
     std::env::temp_dir().join(format!("gpui-single-instance-{app_hash:016x}.lock"))
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn acquire_single_instance_lock(
     lock_path: &PathBuf,
     event_loop_proxy: winit::event_loop::EventLoopProxy<
@@ -246,6 +257,7 @@ fn acquire_single_instance_lock(
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn notify_existing_single_instance(lock_path: &PathBuf) -> Result<()> {
     let port_text = fs::read_to_string(lock_path)?;
     let port: u16 = port_text.trim().parse()?;
@@ -255,6 +267,7 @@ fn notify_existing_single_instance(lock_path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Drop for SingleInstanceRuntime {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
@@ -314,6 +327,7 @@ impl Platform for CrossPlatform {
         });
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn restart(&self, binary_path: Option<std::path::PathBuf>) {
         let binary_path = match binary_path {
             Some(path) => path,
@@ -334,6 +348,11 @@ impl Platform for CrossPlatform {
         }
 
         self.quit();
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn restart(&self, _binary_path: Option<std::path::PathBuf>) {
+        log::warn!("restart is not supported on WASM");
     }
 
     fn activate(&self, ignoring_other_apps: bool) {

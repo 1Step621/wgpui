@@ -72,9 +72,15 @@ impl WgpuContext {
         });
 
         // Features WGPUI itself needs for its rendering pipeline.
+        #[cfg(not(target_family = "wasm"))]
         let wgpui_features = wgpu::Features::TEXTURE_BINDING_ARRAY
             | wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING
             | wgpu::Features::PRIMITIVE_INDEX
+            | wgpu::Features::INDIRECT_FIRST_INSTANCE;
+
+        // On WASM/WebGPU, only request features actually supported by the browser.
+        #[cfg(target_family = "wasm")]
+        let wgpui_features = wgpu::Features::PRIMITIVE_INDEX
             | wgpu::Features::INDIRECT_FIRST_INSTANCE;
 
         // Combine with any additional features requested by the application.
@@ -108,12 +114,29 @@ impl WgpuContext {
             (adapter, device_features)
         };
 
-        #[cfg(not(target_os = "macos"))]
+        // On non-macOS native, additionally require profiling features.
+        #[cfg(all(not(target_os = "macos"), not(target_family = "wasm")))]
         let (adapter, device_features) = {
             let required_features = required_features
                 | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT
                 | wgpu::Features::TIMESTAMP_QUERY
                 | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+            let adapter = adapters
+                .into_iter()
+                .find(|adapter| adapter.features().contains(required_features))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "No adapter available with required features: {:?}",
+                        required_features
+                    )
+                })?;
+            (adapter, required_features)
+        };
+
+        // On WASM/WebGPU, just require the base features (WebGPU doesn't support
+        // MULTI_DRAW_INDIRECT_COUNT, TIMESTAMP_QUERY, etc.)
+        #[cfg(target_family = "wasm")]
+        let (adapter, device_features) = {
             let adapter = adapters
                 .into_iter()
                 .find(|adapter| adapter.features().contains(required_features))
