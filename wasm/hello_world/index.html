@@ -23,7 +23,17 @@
 <body>
     <script type="module">
         import init from './pkg/gpui_wasm_hello_world.js';
-        await init();
+        try {
+            await init();
+        } catch (e) {
+            // winit uses throw on WASM for control-flow purposes.
+            // This is not an actual error — the event loop is running.
+            if (String(e).includes("exceptions for control flow")) {
+                console.log("Winit event loop running (expected throw)");
+            } else {
+                console.error("WASM init error:", e);
+            }
+        }
     </script>
 </body>
 </html>

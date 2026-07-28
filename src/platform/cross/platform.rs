@@ -361,6 +361,12 @@ impl Platform for CrossPlatform {
             hovered_external_paths: Vec::new(),
         };
 
+        #[cfg(target_family = "wasm")]
+        {
+            use winit::platform::web::EventLoopExtWebSys;
+            event_loop.spawn_app(app_state);
+        }
+        #[cfg(not(target_family = "wasm"))]
         event_loop
             .run_app(&mut app_state)
             .expect("Failed to run App");
