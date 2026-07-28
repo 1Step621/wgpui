@@ -6,7 +6,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 
-use futures::Future;
+use futures::{AsyncReadExt, Future};
 use image::{
     AnimationDecoder, DynamicImage, Frame, ImageError, ImageFormat, Rgba,
     codecs::{gif::GifDecoder, webp::WebPDecoder},
