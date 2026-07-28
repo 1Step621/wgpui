@@ -93,10 +93,11 @@ mod backend {
         fn render_pixmap(bytes: &[u8], params: &RenderSvgParams) -> Result<Pixmap> {
             let usvg_options = make_usvg_options();
             let tree = usvg::Tree::from_data(bytes, &usvg_options)?;
-            let scale = params.size.width.0 as f32 / tree.size.width();
+            let tree_size = tree.size();
+            let scale = params.size.width.0 as f32 / tree_size.width();
             let mut pixmap = Pixmap::new(
-                (tree.size.width() * scale) as u32,
-                (tree.size.height() * scale) as u32,
+                (tree_size.width() * scale) as u32,
+                (tree_size.height() * scale) as u32,
             )
             .ok_or(usvg::Error::InvalidSize)?;
             let transform = resvg::tiny_skia::Transform::from_scale(scale, scale);

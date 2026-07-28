@@ -885,8 +885,7 @@ impl Drop for Scope<'_> {
         // futures have resolved.
         #[cfg(not(target_family = "wasm"))]
         {
-        use futures::StreamExt;
-        self.executor.block(self.rx.next());
+        self.executor.block(futures::StreamExt::next(&mut self.rx));
         }
     }
 }
