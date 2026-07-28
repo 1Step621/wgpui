@@ -1103,6 +1103,23 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                         width: DevicePixels(physical_size.width as i32),
                         height: DevicePixels(physical_size.height as i32),
                     });
+                } else {
+                    // Renderer may not exist yet if initialization was skipped
+                    // (e.g. canvas reported 0x0 on WASM). Create it now.
+                    let mut renderer = WgpuRenderer::new(
+                        window.0.wgpu_context.clone(),
+                        window.window(),
+                        window.0.sprite_atlas.clone(),
+                        physical_size.width,
+                        physical_size.height,
+                        4,
+                    )
+                    .expect("Failed to create renderer from resize");
+                    renderer.update_drawable_size(Size {
+                        width: DevicePixels(physical_size.width as i32),
+                        height: DevicePixels(physical_size.height as i32),
+                    });
+                    let _ = window.0.renderer.set(RefCell::new(renderer));
                 }
                 let size = crate::Size {
                     width: crate::Pixels(physical_size.width as f32 / scale_factor),
