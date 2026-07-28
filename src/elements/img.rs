@@ -4,7 +4,7 @@ use crate::{
     Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels, RenderImage, Resource,
     SharedString, SharedUri, StyleRefinement, Styled, Task, Window, px,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use futures::Future;
 use image::{
