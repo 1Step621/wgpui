@@ -12,7 +12,7 @@ pub(crate) struct RenderSvgParams {
     pub(crate) size: Size<DevicePixels>,
 }
 
-/// The size in which to render the SVG.
+#[allow(missing_docs)]
 pub enum SvgSize {
     Size(Size<DevicePixels>),
     ScaleFactor(f32),
@@ -150,10 +150,12 @@ mod backend {
 }
 
 #[derive(Clone)]
+#[allow(missing_docs)]
 pub struct SvgRenderer {
     asset_source: Arc<dyn AssetSource>,
 }
 
+#[allow(missing_docs)]
 impl SvgRenderer {
     pub fn new(asset_source: Arc<dyn AssetSource>) -> Self {
         Self { asset_source }
