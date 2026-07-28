@@ -18,8 +18,9 @@ use std::{
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
+use crate::time_ext::Instant;
 
 #[cfg(not(target_family = "wasm"))]
 use std::str::FromStr;
