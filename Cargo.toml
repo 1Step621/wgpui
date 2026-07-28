@@ -106,6 +106,7 @@ wgpu = { version = "30", default-features = false, features = [
 web-sys = { version = "0.3", features = [
     "VideoFrame",
     "Window",
+    "Performance",
 ] }
 js-sys = { version = "0.3" }
 wasm-bindgen-futures = "0.4"
