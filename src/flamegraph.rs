@@ -20,8 +20,9 @@ use std::{
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     thread::ThreadId,
-    time::{Instant, SystemTime},
+    time::SystemTime,
 };
+use crate::time_ext::Instant;
 
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;

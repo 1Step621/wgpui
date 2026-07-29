@@ -1,7 +1,8 @@
 #[cfg(not(target_family = "wasm"))]
 use device_query::{DeviceQuery, DeviceState};
 use std::cell::Cell;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use crate::time_ext::Instant;
 
 /// Detects whether a window is actively being resized by watching the stream
 /// of [`winit::event::WindowEvent::Resized`] events.
