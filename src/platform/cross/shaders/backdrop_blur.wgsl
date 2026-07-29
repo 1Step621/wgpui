@@ -110,7 +110,7 @@ fn fs_backdrop_filter(input: BackdropFilterVarying) -> @location(0) vec4<f32> {
     // Skip blur sampling if radius is very small
     if blur_radius < 0.5 {
         let uv = pixel_position / globals.viewport_size;
-        blurred_color = textureSample(backdrop_texture, backdrop_sampler, uv);
+        blurred_color = textureSampleLevel(backdrop_texture, backdrop_sampler, uv, 0.0);
     } else {
         // Cap effective radius so the dynamic loops remain manageable on FXC/DX.
         let max_blur_radius = 32.0;
