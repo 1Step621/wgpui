@@ -4,6 +4,8 @@
 
 # WGPUI
 
+## [WGPUI Website](https://pulsarnative.com/UI/)
+
 WGPUI is a fork of [gpui-ce](https://github.com/gpui-ce/gpui-ce) — itself a community fork of Zed's GPUI framework — with one central goal: **a single cross-platform rendering and windowing backend**. Where gpui-ce keeps per-OS code paths (Metal on macOS, Vulkan/D3D12 on Linux/Windows, Cocoa/Win32/Wayland windowing), WGPUI replaces all of that with a single [wgpu](https://github.com/gfx-rs/wgpu) + [winit](https://github.com/rust-windowing/winit) backend. The result is a framework that compiles and runs on Windows, macOS, Linux, and WebAssembly from one unified code path.
 
 The public API is kept intentionally compatible with gpui-ce so existing applications require minimal changes to migrate.
