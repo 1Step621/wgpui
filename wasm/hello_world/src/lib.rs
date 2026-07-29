@@ -1,5 +1,7 @@
-use gpui::{div, prelude::*, px, rgb, size, App, Application, Bounds, Context, Window,
-    WindowBounds, WindowOptions};
+use gpui::{
+    div, prelude::*, px, rgb, size, App, Application, Bounds, Context, Window, WindowBounds,
+    WindowOptions,
+};
 use wasm_bindgen::prelude::*;
 
 fn elapsed_secs() -> f64 {
@@ -11,6 +13,9 @@ fn elapsed_secs() -> f64 {
 
 struct HelloWasm {
     start: f64,
+    dropdown_open: bool,
+    selected: usize,
+    items: Vec<&'static str>,
 }
 
 impl gpui::Render for HelloWasm {
@@ -31,6 +36,7 @@ impl gpui::Render for HelloWasm {
             .relative()
             .size_full()
             .bg(rgb(0x1a1a2e))
+            // Color swatches
             .child(
                 div()
                     .flex()
@@ -43,8 +49,16 @@ impl gpui::Render for HelloWasm {
                     .child(div().size_10().bg(gpui::green()).border_1().rounded_md())
                     .child(div().size_10().bg(gpui::blue()).border_1().rounded_md())
                     .child(div().size_10().bg(gpui::yellow()).border_1().rounded_md())
-                    .child(div().size_10().bg(rgb(0xffffff)).border_1().border_color(gpui::black()).rounded_md()),
+                    .child(
+                        div()
+                            .size_10()
+                            .bg(rgb(0xffffff))
+                            .border_1()
+                            .border_color(gpui::black())
+                            .rounded_md(),
+                    ),
             )
+            // Bouncing ball
             .child(
                 div()
                     .absolute()
@@ -55,6 +69,62 @@ impl gpui::Render for HelloWasm {
                     .rounded_full()
                     .shadow_lg(),
             )
+            // Dropdown menu
+            .child(
+                div()
+                    .absolute()
+                    .top(px(16.0))
+                    .right(px(16.0))
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .id("dropdown-button")
+                            .px_3()
+                            .py_1()
+                            .bg(rgb(0x16213e))
+                            .border_1()
+                            .border_color(rgb(0x4a9eff))
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0x1a5276)))
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.dropdown_open = !this.dropdown_open;
+                                cx.notify();
+                            }))
+                            .child(format!("Option {} ▾", self.items[self.selected])),
+                    )
+                    .children(
+                        if self.dropdown_open {
+                            self.items.iter().enumerate().map(|(i, item)| {
+                                let is_selected = i == self.selected;
+                                div()
+                                    .id(format!("dropdown-item-{i}"))
+                                    .px_3()
+                                    .py_1()
+                                    .mt_px()
+                                    .bg(if is_selected {
+                                        rgb(0x2a4a7f)
+                                    } else {
+                                        rgb(0x0f3460)
+                                    })
+                                    .hover(|style| style.bg(rgb(0x1a5276)))
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                                        this.selected = i;
+                                        this.dropdown_open = false;
+                                        cx.notify();
+                                    }))
+                                    .child(*item)
+                                    .into_any_element()
+                            }).collect::<Vec<_>>()
+                        } else {
+                            vec![]
+                        },
+                    ),
+            )
+            // Label
             .child(
                 div()
                     .absolute()
@@ -80,7 +150,14 @@ pub fn start() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| HelloWasm { start: elapsed_secs() }),
+            |_, cx| {
+                cx.new(|_| HelloWasm {
+                    start: elapsed_secs(),
+                    dropdown_open: false,
+                    selected: 0,
+                    items: vec!["Red", "Green", "Blue", "Yellow", "White"],
+                })
+            },
         )
         .unwrap();
         cx.activate(true);
