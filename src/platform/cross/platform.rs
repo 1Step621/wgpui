@@ -42,8 +42,9 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
+use crate::time_ext::Instant;
 
 #[cfg(not(target_family = "wasm"))]
 use std::{fs::{self, OpenOptions}, net::{TcpListener, TcpStream}, thread};
