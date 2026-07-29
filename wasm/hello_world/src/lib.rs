@@ -1,50 +1,61 @@
 use gpui::{
-    div, prelude::*, px, rgb, size, App, Application, Bounds, Context, Window, WindowBounds,
-    WindowOptions,
+    div, prelude::*, px, rgb, size, App, Application, Bounds, Context, SharedString, Window,
+    WindowBounds, WindowOptions,
 };
 use wasm_bindgen::prelude::*;
 
-struct HelloWasm;
+fn elapsed_secs() -> f64 {
+    web_sys::window()
+        .and_then(|w| w.performance())
+        .map(|p| p.now() / 1000.0)
+        .unwrap_or(0.0)
+}
+
+struct HelloWasm {
+    start: f64,
+    text: SharedString,
+}
 
 impl gpui::Render for HelloWasm {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl gpui::IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+        cx.notify();
+        let elapsed = (elapsed_secs() - self.start) as f32;
+        let view = window.viewport_size();
+        let max_w = (view.width - px(48.0)).max(px(0.0));
+        let max_h = (view.height - px(48.0)).max(px(0.0));
+        let tx = (elapsed * 1.2) % 2.0;
+        let ty = (elapsed * 0.9) % 2.0;
+        let prog_x = if tx < 1.0 { tx } else { 2.0 - tx };
+        let prog_y = if ty < 1.0 { ty } else { 2.0 - ty };
+        let x = max_w * prog_x;
+        let y = max_h * prog_y;
+
         div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .bg(rgb(0x2a6f97))
+            .relative()
             .size_full()
-            .justify_center()
-            .items_center()
-            .p_4()
+            .bg(rgb(0x1a1a2e))
             .child(
                 div()
-                    .flex()
-                    .flex_row()
-                    .gap_2()
-                    .child(div().size_16().bg(gpui::red()).rounded_md())
-                    .child(div().size_16().bg(gpui::green()).rounded_md())
-                    .child(div().size_16().bg(gpui::blue()).rounded_md())
-                    .child(div().size_16().bg(gpui::yellow()).rounded_md())
-                    .child(
-                        div()
-                            .size_16()
-                            .bg(rgb(0xffffff))
-                            .border_2()
-                            .border_color(gpui::black())
-                            .rounded_md(),
-                    ),
+                    .absolute()
+                    .left(x)
+                    .top(y)
+                    .size_12()
+                    .bg(rgb(0xe94560))
+                    .rounded_full()
+                    .shadow_lg(),
             )
             .child(
                 div()
-                    .mt_4()
-                    .bg(rgb(0x1b3a5c))
-                    .px_6()
-                    .py_3()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(0x4a9eff))
-                    .child("Hello World!"),
+                    .flex()
+                    .absolute()
+                    .bottom(px(16.0))
+                    .left(px(16.0))
+                    .bg(rgb(0x16213e))
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .text_color(rgb(0xaaaaaa))
+                    .child(format!("{}", &self.text)),
             )
     }
 }
@@ -59,7 +70,12 @@ pub fn start() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| HelloWasm),
+            |_, cx| {
+                cx.new(|_| HelloWasm {
+                    start: elapsed_secs(),
+                    text: "WGPUI on WASM".into(),
+                })
+            },
         )
         .unwrap();
         cx.activate(true);

@@ -1867,6 +1867,7 @@ dependencies = [
  "getrandom 0.4.3",
  "gpui-ce",
  "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]
