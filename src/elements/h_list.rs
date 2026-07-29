@@ -6,7 +6,7 @@
 use super::ListHorizontalSizingBehavior;
 use crate::elements::smooth_scroll::SmoothScrollState;
 use crate::{
-    AnyElement, App, AvailableSpace, Bounds, ContentMask, Element, ElementId, Entity,
+    AnyElement, App, AvailableSpace, Bounds, ContentMask, Element, ElementId,
     GlobalElementId, Hitbox, InspectorElementId, InteractiveElement, Interactivity, IntoElement,
     IsZero, LayoutId, ListSizingBehavior, Overflow, Pixels, Point, ScrollHandle, Size,
     StyleRefinement, Styled, Window, point, px, size,

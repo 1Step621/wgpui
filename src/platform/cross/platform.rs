@@ -318,6 +318,7 @@ impl Platform for CrossPlatform {
     }
 
     fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>) {
+        #[cfg(target_family = "wasm")]
         web_sys::console::log_1(&"WGPUI: CrossPlatform::run entered".into());
         let mut event_loop = self.event_loop.take().expect("App is already running");
 
@@ -943,11 +944,13 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
     fn new_events(&mut self, _event_loop: &ActiveEventLoop, _cause: winit::event::StartCause) {}
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: CrossEvent) {
+        #[cfg(target_family = "wasm")]
         web_sys::console::log_1(&"WGPUI: user_event".into());
         self.set_active_context(event_loop);
 
         match event {
             CrossEvent::WakeUp => {
+                #[cfg(target_family = "wasm")]
                 web_sys::console::log_1(&"WGPUI: WakeUp received".into());
                 // After async WGPU init completes, run the deferred callback
                 // within a valid ActiveEventLoop context.
@@ -1089,6 +1092,7 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
     fn memory_warning(&mut self, _event_loop: &ActiveEventLoop) {}
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(target_family = "wasm")]
         web_sys::console::log_1(&"WGPUI: resumed fired".into());
         self.set_active_context(event_loop);
 
