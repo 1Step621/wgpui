@@ -1,6 +1,6 @@
 use gpui::{
-    App, Application, Bounds, Context, Window, WindowBounds, WindowOptions, div, prelude::*, px,
-    rgb, size,
+    div, prelude::*, px, rgb, size, App, Application, Bounds, Context, Window, WindowBounds,
+    WindowOptions,
 };
 use wasm_bindgen::prelude::*;
 
@@ -43,7 +43,8 @@ impl gpui::Render for HelloWasm {
                     .py_3()
                     .rounded_lg()
                     .border_1()
-                    .border_color(rgb(0x4a9eff)),
+                    .border_color(rgb(0x4a9eff))
+                    .child("Hello World!"),
             )
     }
 }

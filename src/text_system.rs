@@ -66,19 +66,30 @@ impl TextSystem {
             font_ids_by_font: RwLock::default(),
             wrapper_pool: Mutex::default(),
             font_runs_pool: Mutex::default(),
-            fallback_font_stack: smallvec![
-                // TODO: Remove this when Linux have implemented setting fallbacks.
-                font(".ZedMono"),
-                font(".ZedSans"),
-                font("Helvetica"),
-                font("Segoe UI"),     // Windows
-                font("Ubuntu"),       // Gnome (Ubuntu)
-                font("Adwaita Sans"), // Gnome 47
-                font("Cantarell"),    // Gnome
-                font("Noto Sans"),    // KDE
-                font("DejaVu Sans"),
-                font("Arial"), // macOS, Windows
-            ],
+            fallback_font_stack: {
+                #[cfg(target_family = "wasm")]
+                {
+                    smallvec![
+                        font("IBM Plex Sans"),
+                        font("Lilex"),
+                    ]
+                }
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    smallvec![
+                        font(".ZedMono"),
+                        font(".ZedSans"),
+                        font("Helvetica"),
+                        font("Segoe UI"),
+                        font("Ubuntu"),
+                        font("Adwaita Sans"),
+                        font("Cantarell"),
+                        font("Noto Sans"),
+                        font("DejaVu Sans"),
+                        font("Arial"),
+                    ]
+                }
+            },
         }
     }
 

@@ -53,8 +53,15 @@ struct LoadedFont {
 
 impl CosmicTextSystem {
     pub(crate) fn new() -> Self {
-        // todo(linux) make font loading non-blocking
         let mut font_system = FontSystem::new();
+
+        // On WASM there are no system fonts, so bundle a basic font.
+        #[cfg(target_family = "wasm")]
+        {
+            let db = font_system.db_mut();
+            db.load_font_data(include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf").to_vec());
+            db.load_font_data(include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf").to_vec());
+        }
 
         Self(RwLock::new(CosmicTextSystemState {
             font_system,
@@ -120,9 +127,12 @@ impl PlatformTextSystem for CosmicTextSystem {
         return Ok(candidates[ix]);
         }
 
+        // On WASM, we have no font_kit, so just return the first candidate.
         #[cfg(target_family = "wasm")]
         {
-        anyhow::bail!("font_id is not available on WASM")
+        candidates.first().copied().ok_or_else(|| {
+            anyhow::anyhow!("no font candidates available on WASM")
+        })
         }
     }
 
