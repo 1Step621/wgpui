@@ -104,7 +104,7 @@ wgpu = { version = "30", default-features = false, features = [
     "fragile-send-sync-non-atomic-wasm",
 ] }
 web-sys = { version = "0.3", features = [
-    "HtmlImageElement",
+    "HtmlImageElement", "VideoFrame",
     "VideoFrame",
     "Window",
     "Performance",
