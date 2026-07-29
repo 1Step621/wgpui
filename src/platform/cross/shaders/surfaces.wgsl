@@ -53,12 +53,10 @@ fn vs_surface(@builtin(vertex_index) vertex_id: u32) -> SurfaceVarying {
 // final gamma curve.
 @fragment
 fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
-    if (any(input.clip_distances < vec4<f32>(0.0))) {
-        return vec4<f32>(0.0);
-    }
-
+    let inside = !any(input.clip_distances < vec4<f32>(0.0));
     let color = textureSample(t_surface, s_surface, input.tex_coord);
     let alpha = color.a;
     let multiplier = select(1.0, alpha, globals.premultiplied_alpha != 0u);
-    return vec4<f32>(color.rgb * multiplier, alpha);
+    let result = vec4<f32>(color.rgb * multiplier, alpha);
+    return select(vec4<f32>(0.0), result, inside);
 }

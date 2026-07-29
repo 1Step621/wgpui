@@ -95,11 +95,7 @@ fn vs_backdrop_filter(@builtin(vertex_index) vertex_id: u32, @builtin(instance_i
 
 @fragment
 fn fs_backdrop_filter(input: BackdropFilterVarying) -> @location(0) vec4<f32> {
-    // Clip test
-    if any(input.clip_distances < vec4<f32>(0.0)) {
-        return vec4<f32>(0.0);
-    }
-
+    let clip_inside = !any(input.clip_distances < vec4<f32>(0.0));
     let backdrop_filter = b_backdrop_filters[input.backdrop_filter_id];
     let pixel_position = input.position.xy;
 
@@ -167,5 +163,6 @@ fn fs_backdrop_filter(input: BackdropFilterVarying) -> @location(0) vec4<f32> {
     let mask_alpha = saturate(0.5 - outer_sdf);
     let factor = mask_alpha * backdrop_filter.opacity;
 
-    return vec4<f32>(blurred_color.rgb * factor, blurred_color.a * factor);
+    let result = vec4<f32>(blurred_color.rgb * factor, blurred_color.a * factor);
+    return select(vec4<f32>(0.0), result, clip_inside);
 }
