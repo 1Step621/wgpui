@@ -46,6 +46,7 @@ mod shared_uri;
 mod style;
 mod styled;
 mod subscription;
+#[cfg(not(target_family = "wasm"))]
 mod svg_renderer;
 mod tab_stop;
 mod taffy;
@@ -124,7 +125,10 @@ pub use subscription::*;
 #[cfg(not(target_family = "wasm"))]
 pub use svg_renderer::*;
 #[cfg(target_family = "wasm")]
-pub use svg_renderer::*;
+pub use wasm_svg_stubs::*;
+#[cfg(target_family = "wasm")]
+#[allow(missing_docs)]
+mod wasm_svg_stubs {
     use crate::{DevicePixels, SharedString, Size};
     use std::sync::Arc;
 
@@ -145,27 +149,21 @@ pub use svg_renderer::*;
         }
         pub fn render_single_frame(
             &self,
-            bytes: &[u8],
+            _bytes: &[u8],
             _scale_factor: f32,
             _to_brga: bool,
         ) -> crate::Result<Arc<crate::RenderImage>> {
-            // Try resvg for WASM SVG rendering
-            let tree = resvg::usvg::Tree::from_data(bytes, &resvg::usvg::Options::default())
-                .map_err(|e| anyhow::anyhow!("Failed to parse SVG: {e}"))?;
-            let pixmap_size = tree.size().to_int_size();
-            let mut pixmap = resvg::tiny_skia::Pixmap::new(pixmap_size.width(), pixmap_size.height())
-                .ok_or_else(|| anyhow::anyhow!("Failed to create pixmap"))?;
-            resvg::render(&tree, resvg::tiny_skia::Transform::default(), &mut pixmap.as_mut());
-            let bytes = pixmap.take();
-            Ok(Arc::new(crate::RenderImage {
-                width: DevicePixels(pixmap_size.width() as i32),
-                height: DevicePixels(pixmap_size.height() as i32),
-                bytes: bytes.into(),
-                ..Default::default()
-            }))
+            anyhow::bail!("SVG rendering not available on WASM")
+        }
+        pub fn render_alpha_mask(
+            &self,
+            _params: &RenderSvgParams,
+            _bytes: Option<&[u8]>,
+        ) -> crate::Result<Option<(crate::Size<DevicePixels>, Vec<u8>)>> {
+            anyhow::bail!("SVG rendering not available on WASM")
         }
     }
-
+}
 pub(crate) use tab_stop::*;
 use taffy::TaffyLayoutEngine;
 pub use taffy::{AvailableSpace, LayoutId};
