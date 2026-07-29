@@ -96,7 +96,7 @@ wasm-bindgen-futures = { version = "0.4", optional = true }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 getrandom = { version = "0.4", features = ["wasm_js"] }
-winit = "0.30.12"
+winit = { version = "0.30.12", default-features = false, features = ["rwh_06"] }
 wgpu = { version = "30", default-features = false, features = [
     "web",
     "webgpu",
@@ -104,13 +104,14 @@ wgpu = { version = "30", default-features = false, features = [
     "fragile-send-sync-non-atomic-wasm",
 ] }
 web-sys = { version = "0.3", features = [
+    "HtmlImageElement", "VideoFrame",
     "VideoFrame",
     "Window",
     "Performance",
 ] }
 js-sys = { version = "0.3" }
 wasm-bindgen-futures = "0.4"
-wasm-bindgen = "0.2"
+resvg = { version = "0.47.0", default-features = false, features = [ "text", "system-fonts", "memmap-fonts" ] }
 web-time = "1.0"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
@@ -383,3 +384,5 @@ single_range_in_vec_init = "allow"
 too_many_arguments = "allow"
 large_enum_variant = "allow"
 nonminimal_bool = "allow"
+
+
