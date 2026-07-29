@@ -1,7 +1,5 @@
-use gpui::{
-    div, prelude::*, px, rgb, size, App, Application, Bounds, Context, SharedString, Window,
-    WindowBounds, WindowOptions,
-};
+use gpui::{div, prelude::*, px, rgb, size, App, Application, Bounds, Context, Window,
+    WindowBounds, WindowOptions};
 use wasm_bindgen::prelude::*;
 
 fn elapsed_secs() -> f64 {
@@ -13,7 +11,6 @@ fn elapsed_secs() -> f64 {
 
 struct HelloWasm {
     start: f64,
-    text: SharedString,
 }
 
 impl gpui::Render for HelloWasm {
@@ -36,6 +33,20 @@ impl gpui::Render for HelloWasm {
             .bg(rgb(0x1a1a2e))
             .child(
                 div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .absolute()
+                    .top(px(16.0))
+                    .left(px(16.0))
+                    .child(div().size_10().bg(gpui::red()).border_1().rounded_md())
+                    .child(div().size_10().bg(gpui::green()).border_1().rounded_md())
+                    .child(div().size_10().bg(gpui::blue()).border_1().rounded_md())
+                    .child(div().size_10().bg(gpui::yellow()).border_1().rounded_md())
+                    .child(div().size_10().bg(rgb(0xffffff)).border_1().border_color(gpui::black()).rounded_md()),
+            )
+            .child(
+                div()
                     .absolute()
                     .left(x)
                     .top(y)
@@ -46,7 +57,6 @@ impl gpui::Render for HelloWasm {
             )
             .child(
                 div()
-                    .flex()
                     .absolute()
                     .bottom(px(16.0))
                     .left(px(16.0))
@@ -55,7 +65,7 @@ impl gpui::Render for HelloWasm {
                     .py_1()
                     .rounded_md()
                     .text_color(rgb(0xaaaaaa))
-                    .child(format!("{}", &self.text)),
+                    .child("WGPUI on WASM"),
             )
     }
 }
@@ -70,12 +80,7 @@ pub fn start() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| {
-                cx.new(|_| HelloWasm {
-                    start: elapsed_secs(),
-                    text: "WGPUI on WASM".into(),
-                })
-            },
+            |_, cx| cx.new(|_| HelloWasm { start: elapsed_secs() }),
         )
         .unwrap();
         cx.activate(true);
