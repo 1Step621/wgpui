@@ -961,20 +961,43 @@ impl App {
         })
     }
 
+    /// Run `callback` and report every entity it touched through [`EntityMap`].
+    ///
+    /// The returned set is the cached-view dependency set: `AnyView` stores it,
+    /// and it decides both which windows track the view
+    /// ([`record_entities_accessed`](Self::record_entities_accessed)) and
+    /// whether the view's cached output is still valid
+    /// (`Window::accessed_entity_invalidated`).
+    ///
+    /// This is done by swapping a fresh set in for the duration rather than by
+    /// diffing before and after. The diff was wrong in a way that is invisible
+    /// until it isn't: `difference()` subtracts everything already accessed
+    /// when the scope opened, so an entity an ancestor had *also* read — very
+    /// commonly the view's own id, or a model a parent reads for a title —
+    /// dropped out of the child's set. The child then looked like it depended
+    /// on nothing, was never invalidated when that entity changed, and replayed
+    /// stale content forever. Re-reads inside the callback are genuine
+    /// dependencies and must be reported as such.
+    ///
+    /// Nesting composes: an inner scope's entities land in the outer scope's
+    /// set too, because each scope merges its result back into the set it
+    /// displaced. It is also cheaper than the diff, which cloned the entire
+    /// window-wide accessed set on every cached view, every frame.
     pub(crate) fn detect_accessed_entities<R>(
         &mut self,
         callback: impl FnOnce(&mut App) -> R,
     ) -> (R, FxHashSet<EntityId>) {
-        let accessed_entities_start = self.entities.accessed_entities.get_mut().clone();
+        let displaced = mem::take(self.entities.accessed_entities.get_mut().deref_mut());
         let result = callback(self);
-        let entities_accessed_in_callback = self
-            .entities
+        let accessed_in_callback = mem::replace(
+            self.entities.accessed_entities.get_mut().deref_mut(),
+            displaced,
+        );
+        self.entities
             .accessed_entities
             .get_mut()
-            .difference(&accessed_entities_start)
-            .copied()
-            .collect::<FxHashSet<EntityId>>();
-        (result, entities_accessed_in_callback)
+            .extend(accessed_in_callback.iter().copied());
+        (result, accessed_in_callback)
     }
 
     pub(crate) fn record_entities_accessed(
@@ -2322,6 +2345,14 @@ impl App {
             .collect();
 
         if live_invalidators.is_empty() {
+            // Nothing on screen is known to depend on this entity, so no window
+            // is marked dirty and only observers will hear about it. That is
+            // correct for an entity nothing renders, and a silently dropped
+            // update for one that something does — the two are
+            // indistinguishable from here, which is why it is counted rather
+            // than logged. A rising count while the UI looks stale means
+            // tracking, not invalidation, is what is broken.
+            crate::render_stats::count("notify: no window tracking entity");
             if self.pending_notifications.insert(entity_id) {
                 self.pending_effects
                     .push_back(Effect::Notify { emitter: entity_id });

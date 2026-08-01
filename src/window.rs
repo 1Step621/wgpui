@@ -978,6 +978,18 @@ pub struct Window {
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
+    /// The entities notified since the last frame, as reported, before the
+    /// dispatch-tree ancestor walk turns them into `dirty_views`.
+    ///
+    /// `dirty_views` throws away everything that is not a view: the walk starts
+    /// from `view_node_ids` and a model is not in it. Keeping the raw set is
+    /// what lets a cached view ask whether anything *it reads* changed, rather
+    /// than only whether anything it *contains* changed. See
+    /// [`Self::accessed_entity_invalidated`].
+    ///
+    /// Lives for the duration of one draw, and is cleared alongside
+    /// `dirty_views`.
+    pub(crate) invalidated_entities: FxHashSet<EntityId>,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
     default_prevented: bool,
@@ -1434,6 +1446,7 @@ impl Window {
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
             dirty_views: FxHashSet::default(),
+            invalidated_entities: FxHashSet::default(),
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
             default_prevented: true,
@@ -1513,6 +1526,13 @@ impl Window {
     fn mark_view_dirty(&mut self, view_id: EntityId) {
         // Mark ancestor views as dirty. If already in the `dirty_views` set, then all its ancestors
         // should already be dirty.
+        //
+        // This is the *containment* half of invalidation, and it only reaches
+        // entities that own a dispatch node — that is, views that were
+        // prepainted. Entities without one (models, and anything a view merely
+        // reads) produce an empty path and mark nothing. The *dependency* half
+        // lives in [`Self::accessed_entity_invalidated`], which `AnyView`
+        // consults with each cached view's own recorded dependency set.
         for view_id in self
             .rendered_frame
             .dispatch_tree
@@ -1521,6 +1541,45 @@ impl Window {
             if !self.dirty_views.insert(view_id) {
                 break;
             }
+        }
+    }
+
+    /// Whether any entity invalidated since the last frame appears in a cached
+    /// view's recorded dependency set — that is, whether its stored output is
+    /// known to be out of date.
+    ///
+    /// This is the half of invalidation that `dirty_views` cannot express.
+    /// `dirty_views` answers "does this view *contain* something that changed",
+    /// via the dispatch-tree ancestor path, and a model has no node on that
+    /// path: notifying one marked no view dirty at all, so every cached view
+    /// judged itself clean and replayed stale content indefinitely. That is
+    /// issue #83.
+    ///
+    /// Asking each cached view about its own dependency set instead is exact
+    /// and needs no extra bookkeeping — `AnyView` already records the set for
+    /// window tracking. It also composes with nesting for free: a cached view's
+    /// set is cumulative over its whole subtree, so every cached layer between
+    /// the root and the view that actually reads the entity fails this test
+    /// too, and the inner one gets prepainted at all. That last part is what a
+    /// reverse "who depends on this entity" index cannot do on its own — a
+    /// nested cached view that replayed last frame is absent from any
+    /// per-frame index precisely because it never ran.
+    ///
+    /// Cost is one membership test per invalidated entity per cached view; the
+    /// invalidated set is normally a handful of entries, and the loop runs over
+    /// whichever side is smaller.
+    pub(crate) fn accessed_entity_invalidated(&self, accessed: &FxHashSet<EntityId>) -> bool {
+        if self.invalidated_entities.is_empty() || accessed.is_empty() {
+            return false;
+        }
+        if self.invalidated_entities.len() <= accessed.len() {
+            self.invalidated_entities
+                .iter()
+                .any(|entity_id| accessed.contains(entity_id))
+        } else {
+            accessed
+                .iter()
+                .any(|entity_id| self.invalidated_entities.contains(entity_id))
         }
     }
 
@@ -2386,6 +2445,7 @@ impl Window {
             }
         }
         self.dirty_views.clear();
+        self.invalidated_entities.clear();
         self.next_frame.window_active = self.active.get();
 
         // Register requested input handler with the platform window.
@@ -2479,6 +2539,12 @@ impl Window {
         let mut views = self.invalidator.take_views();
         for entity in views.drain() {
             self.mark_view_dirty(entity);
+            // Kept in full, unlike `dirty_views`, which only retains the
+            // entities that turned out to be views on a dispatch path. Cached
+            // views test their own dependency sets against this. Cleared at the
+            // end of the draw rather than here, so it describes exactly the
+            // invalidations this frame is answering.
+            self.invalidated_entities.insert(entity);
         }
         self.invalidator.replace_views(views);
     }
@@ -6364,6 +6430,554 @@ mod test {
                 }
             })
             .ok();
+    }
+
+    // ── Issue #83 scaffolding ────────────────────────────────────────────
+    //
+    // A cached `AnyView` nested under a root view, where the leaf counts its
+    // own renders. `cx.notify()` on the leaf must produce a rebuild of the
+    // leaf on the next frame; anything else is the #83 symptom (stale
+    // content silently replayed forever).
+
+    struct CacheLeaf {
+        renders: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl crate::Render for CacheLeaf {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> impl crate::IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            crate::div().w(px(10.)).h(px(10.))
+        }
+    }
+
+    struct CacheRoot {
+        leaf: crate::Entity<CacheLeaf>,
+        renders: std::rc::Rc<std::cell::Cell<usize>>,
+        /// Touch the leaf through `EntityMap` before rendering it, the way a
+        /// panel that reads its child's state for a title or a badge would.
+        read_leaf_first: bool,
+    }
+
+    impl crate::Render for CacheRoot {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            cx: &mut Context<Self>,
+        ) -> impl crate::IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            if self.read_leaf_first {
+                let _ = self.leaf.read(cx).renders.get();
+            }
+            crate::div().size_full().child(
+                crate::AnyView::from(self.leaf.clone())
+                    .cached(crate::StyleRefinement::default().w(px(10.)).h(px(10.))),
+            )
+        }
+    }
+
+    fn cached_leaf_window(
+        cx: &mut TestAppContext,
+        read_leaf_first: bool,
+    ) -> (
+        crate::WindowHandle<CacheRoot>,
+        crate::Entity<CacheLeaf>,
+        std::rc::Rc<std::cell::Cell<usize>>,
+        std::rc::Rc<std::cell::Cell<usize>>,
+    ) {
+        let leaf_renders = std::rc::Rc::new(std::cell::Cell::new(0));
+        let root_renders = std::rc::Rc::new(std::cell::Cell::new(0));
+        let leaf = cx.update(|cx| {
+            cx.new(|_| CacheLeaf {
+                renders: leaf_renders.clone(),
+            })
+        });
+        let leaf_for_root = leaf.clone();
+        let root_renders_for_root = root_renders.clone();
+        let window = cx.open_window(size(px(800.), px(600.)), move |_, _| CacheRoot {
+            leaf: leaf_for_root,
+            renders: root_renders_for_root,
+            read_leaf_first,
+        });
+        cx.run_until_parked();
+        (window, leaf, leaf_renders, root_renders)
+    }
+
+    /// Drive one frame the way an external frame pump does: the window needs
+    /// to draw, but nothing is invalidated, so every cached view takes the
+    /// reuse path. `refresh_windows`/`Window::refresh` is *not* equivalent —
+    /// it sets `refreshing`, which bypasses the cache entirely and would hide
+    /// exactly the bug these tests are looking for.
+    fn clean_frame(cx: &mut TestAppContext, window: crate::AnyWindowHandle) {
+        window
+            .update(cx, |_, window, _| window.refresh_buffers())
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    /// `cx.notify()` on a cached leaf must rebuild that leaf on the next
+    /// frame, whether or not an ancestor happened to touch it through
+    /// `EntityMap` first.
+    #[gpui::test]
+    fn notify_rebuilds_cached_view(cx: &mut TestAppContext) {
+        for read_leaf_first in [false, true] {
+            let (_window, leaf, leaf_renders, root_renders) =
+                cached_leaf_window(cx, read_leaf_first);
+
+            let leaf_before = leaf_renders.get();
+            let root_before = root_renders.get();
+
+            leaf.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+
+            assert!(
+                root_renders.get() > root_before,
+                "read_leaf_first={read_leaf_first}: notifying the leaf did not even \
+                 produce a frame (root renders stuck at {root_before})"
+            );
+            assert!(
+                leaf_renders.get() > leaf_before,
+                "read_leaf_first={read_leaf_first}: the frame happened but the cached \
+                 leaf replayed its stale prepaint instead of rebuilding \
+                 (leaf renders stuck at {leaf_before})"
+            );
+        }
+    }
+
+    /// The same thing, repeated. One successful invalidation is not enough:
+    /// the reuse path re-registers a view's dependencies from the *stored*
+    /// set, so a set that lost the view's own id goes stale permanently after
+    /// the first clean frame.
+    #[gpui::test]
+    fn notify_rebuilds_cached_view_repeatedly(cx: &mut TestAppContext) {
+        for read_leaf_first in [false, true] {
+            let (window, leaf, leaf_renders, _) = cached_leaf_window(cx, read_leaf_first);
+
+            for round in 0..4 {
+                // A clean frame in between, so the leaf takes the reuse path
+                // and re-registers itself from its stored dependency set.
+                clean_frame(cx, window.into());
+
+                let before = leaf_renders.get();
+                leaf.update(cx, |_, cx| cx.notify());
+                cx.run_until_parked();
+                assert!(
+                    leaf_renders.get() > before,
+                    "read_leaf_first={read_leaf_first} round {round}: cached leaf stopped \
+                     responding to notify (renders stuck at {before})"
+                );
+            }
+        }
+    }
+
+    struct CacheMid {
+        leaf: crate::Entity<CacheLeaf>,
+        renders: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl crate::Render for CacheMid {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> impl crate::IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            crate::div().size_full().child(
+                crate::AnyView::from(self.leaf.clone())
+                    .cached(crate::StyleRefinement::default().w(px(10.)).h(px(10.))),
+            )
+        }
+    }
+
+    struct CacheNestedRoot {
+        mid: crate::Entity<CacheMid>,
+    }
+
+    impl crate::Render for CacheNestedRoot {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> impl crate::IntoElement {
+            crate::div().size_full().child(
+                crate::AnyView::from(self.mid.clone())
+                    .cached(crate::StyleRefinement::default().w(px(10.)).h(px(10.))),
+            )
+        }
+    }
+
+    /// A cached view nested inside another cached view. When the leaf is
+    /// notified the middle view must rebuild too, otherwise the leaf never
+    /// gets a chance to prepaint at all.
+    #[gpui::test]
+    fn notify_rebuilds_nested_cached_view(cx: &mut TestAppContext) {
+        let leaf_renders = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mid_renders = std::rc::Rc::new(std::cell::Cell::new(0));
+        let leaf = cx.update(|cx| {
+            cx.new(|_| CacheLeaf {
+                renders: leaf_renders.clone(),
+            })
+        });
+        let leaf_for_mid = leaf.clone();
+        let mid_renders_for_mid = mid_renders.clone();
+        let mid = cx.update(|cx| {
+            cx.new(|_| CacheMid {
+                leaf: leaf_for_mid,
+                renders: mid_renders_for_mid,
+            })
+        });
+        let mid_for_root = mid.clone();
+        let window = cx.open_window(size(px(800.), px(600.)), move |_, _| CacheNestedRoot {
+            mid: mid_for_root,
+        });
+        cx.run_until_parked();
+
+        for round in 0..4 {
+            clean_frame(cx, window.into());
+            let leaf_before = leaf_renders.get();
+            let mid_before = mid_renders.get();
+            leaf.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+            assert!(
+                mid_renders.get() > mid_before,
+                "round {round}: notifying the leaf left its cached parent replaying, \
+                 so the leaf could never prepaint"
+            );
+            assert!(
+                leaf_renders.get() > leaf_before,
+                "round {round}: the leaf replayed stale content after notify"
+            );
+        }
+
+        // And the parent must stay independently invalidatable.
+        for round in 0..4 {
+            clean_frame(cx, window.into());
+            let mid_before = mid_renders.get();
+            mid.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+            assert!(
+                mid_renders.get() > mid_before,
+                "round {round}: notifying the middle cached view did nothing"
+            );
+        }
+    }
+
+    /// Direct measurement of the invalidation bookkeeping: after a frame in
+    /// which a cached view took the *reuse* path, the window must still be
+    /// registered as an invalidation target for that view. If it is not,
+    /// `App::notify` falls through to `pending_notifications` and the view is
+    /// permanently stuck.
+    #[gpui::test]
+    fn reused_cached_view_stays_tracked(cx: &mut TestAppContext) {
+        let (window, leaf, leaf_renders, _root_renders) = cached_leaf_window(cx, false);
+        let leaf_id = leaf.entity_id();
+        let window_id = window.window_id();
+
+        for round in 0..4 {
+            // Force a frame in which nothing is dirty, so the cached leaf
+            // reuses and re-registers itself purely from its stored set.
+            let before = leaf_renders.get();
+            clean_frame(cx, window.into());
+            assert_eq!(
+                leaf_renders.get(),
+                before,
+                "round {round}: the leaf rebuilt, so this frame did not exercise \
+                 the reuse path the assertions below are about"
+            );
+
+            cx.update(|cx| {
+                assert!(
+                    cx.tracked_entities
+                        .get(&window_id)
+                        .is_some_and(|set| set.contains(&leaf_id)),
+                    "round {round}: the cached leaf dropped out of `tracked_entities` \
+                     after a reuse frame; `App::notify` can no longer find it"
+                );
+                assert!(
+                    cx.window_invalidators_by_entity
+                        .get(&leaf_id)
+                        .is_some_and(|windows| windows.contains_key(&window_id)),
+                    "round {round}: the cached leaf dropped out of \
+                     `window_invalidators_by_entity` after a reuse frame"
+                );
+            });
+        }
+    }
+
+    /// An *uncached* child view sitting inside nested cached panels — the dock
+    /// shape. Notifying the child must reach it through both cached layers.
+    #[gpui::test]
+    fn notify_reaches_uncached_view_under_cached_panels(cx: &mut TestAppContext) {
+        struct Panel {
+            child: crate::AnyView,
+            cached: bool,
+        }
+        impl crate::Render for Panel {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl crate::IntoElement {
+                let child = self.child.clone();
+                crate::div().size_full().child(if self.cached {
+                    child
+                        .cached(crate::StyleRefinement::default().w(px(10.)).h(px(10.)))
+                        .into_any_element()
+                } else {
+                    child.into_any_element()
+                })
+            }
+        }
+
+        let leaf_renders = std::rc::Rc::new(std::cell::Cell::new(0));
+        let leaf = cx.update(|cx| {
+            cx.new(|_| CacheLeaf {
+                renders: leaf_renders.clone(),
+            })
+        });
+        // leaf is rendered as a plain `Entity<V>` element (uncached) inside
+        // cached B, inside cached A, inside the uncached root.
+        let inner = cx.update({
+            let leaf = leaf.clone();
+            move |cx| {
+                cx.new(|_| Panel {
+                    child: leaf.into(),
+                    cached: false,
+                })
+            }
+        });
+        let outer = cx.update({
+            let inner = inner.clone();
+            move |cx| {
+                cx.new(|_| Panel {
+                    child: inner.into(),
+                    cached: true,
+                })
+            }
+        });
+        let outer_for_root = outer.clone();
+        let window = cx.open_window(size(px(800.), px(600.)), move |_, _| Panel {
+            child: outer_for_root.into(),
+            cached: true,
+        });
+        cx.run_until_parked();
+
+        for round in 0..4 {
+            clean_frame(cx, window.into());
+            let before = leaf_renders.get();
+            leaf.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+            assert!(
+                leaf_renders.get() > before,
+                "round {round}: notifying a view nested under cached panels did not \
+                 rebuild it (renders stuck at {before})"
+            );
+        }
+    }
+
+    // ── Model-dependency scaffolding ─────────────────────────────────────
+
+    struct DepModel {
+        value: usize,
+    }
+
+    /// Reads `model` during render and publishes what it saw. Nests an
+    /// optional child so the read can be pushed arbitrarily deep inside a
+    /// cached view's subtree.
+    struct DepReader {
+        model: crate::Entity<DepModel>,
+        seen: std::rc::Rc<std::cell::Cell<usize>>,
+        renders: std::rc::Rc<std::cell::Cell<usize>>,
+        child: Option<crate::AnyView>,
+        /// Wrap the child in `.cached(..)` rather than rendering it plainly.
+        cache_child: bool,
+        /// Read the model *before* rendering the child, so the child's own
+        /// dependency scope opens with the model already marked accessed.
+        read_model: bool,
+    }
+
+    impl crate::Render for DepReader {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            cx: &mut Context<Self>,
+        ) -> impl crate::IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            if self.read_model {
+                self.seen.set(self.model.read(cx).value);
+            }
+            let child = self.child.clone().map(|child| {
+                if self.cache_child {
+                    child
+                        .cached(crate::StyleRefinement::default().w(px(10.)).h(px(10.)))
+                        .into_any_element()
+                } else {
+                    child.into_any_element()
+                }
+            });
+            crate::div().size_full().children(child)
+        }
+    }
+
+    /// A cached view that derives its content from a *model* entity it reads
+    /// during render. Notifying the model must rebuild that view.
+    ///
+    /// `mark_view_dirty` used to walk only `view_path_reversed`, which knows
+    /// about entities owning a dispatch node — a model has none, so the walk
+    /// yielded nothing, no view was marked dirty, and every cached view
+    /// replayed. This is issue #83's mechanism.
+    ///
+    /// The `parent_reads_model_first` case is the one that also exercises
+    /// `App::detect_accessed_entities`: with the old `difference()` capture,
+    /// an entity an ancestor had already read was subtracted out of the
+    /// child's dependency set, so the child looked like it depended on nothing.
+    #[gpui::test]
+    fn notify_on_model_rebuilds_cached_reader(cx: &mut TestAppContext) {
+        for parent_reads_model_first in [false, true] {
+            let seen = std::rc::Rc::new(std::cell::Cell::new(usize::MAX));
+            let renders = std::rc::Rc::new(std::cell::Cell::new(0));
+            let model = cx.update(|cx| cx.new(|_| DepModel { value: 0 }));
+
+            let reader = cx.update({
+                let (model, seen, renders) = (model.clone(), seen.clone(), renders.clone());
+                move |cx| {
+                    cx.new(|_| DepReader {
+                        model,
+                        seen,
+                        renders,
+                        child: None,
+                        cache_child: false,
+                        read_model: true,
+                    })
+                }
+            });
+
+            let window = cx.open_window(size(px(800.), px(600.)), {
+                let (model, reader) = (model.clone(), reader.clone());
+                move |_, _| DepReader {
+                    model,
+                    seen: std::rc::Rc::new(std::cell::Cell::new(0)),
+                    renders: std::rc::Rc::new(std::cell::Cell::new(0)),
+                    child: Some(reader.into()),
+                    cache_child: true,
+                    read_model: parent_reads_model_first,
+                }
+            });
+            cx.run_until_parked();
+
+            for round in 1..=4 {
+                clean_frame(cx, window.into());
+                model.update(cx, |model, cx| {
+                    model.value = round;
+                    cx.notify();
+                });
+                cx.run_until_parked();
+                assert_eq!(
+                    seen.get(),
+                    round,
+                    "parent_reads_model_first={parent_reads_model_first} round {round}: \
+                     the cached view reading this model replayed stale content after the \
+                     model was notified ({} renders so far)",
+                    renders.get()
+                );
+            }
+        }
+    }
+
+    /// The model is read by a view buried under two cached layers, and the
+    /// notified entity is neither a view nor on anyone's ancestor path. Every
+    /// cached layer above the reader has to rebuild, or the reader never
+    /// prepaints.
+    #[gpui::test]
+    fn notify_on_model_rebuilds_deeply_nested_cached_reader(cx: &mut TestAppContext) {
+        let seen = std::rc::Rc::new(std::cell::Cell::new(usize::MAX));
+        let renders = std::rc::Rc::new(std::cell::Cell::new(0));
+        let model = cx.update(|cx| cx.new(|_| DepModel { value: 0 }));
+
+        let leaf = cx.update({
+            let (model, seen, renders) = (model.clone(), seen.clone(), renders.clone());
+            move |cx| {
+                cx.new(|_| DepReader {
+                    model,
+                    seen,
+                    renders,
+                    child: None,
+                    cache_child: false,
+                    read_model: true,
+                })
+            }
+        });
+        let mid = cx.update({
+            let (model, leaf) = (model.clone(), leaf.clone());
+            move |cx| {
+                cx.new(|_| DepReader {
+                    model,
+                    seen: std::rc::Rc::new(std::cell::Cell::new(0)),
+                    renders: std::rc::Rc::new(std::cell::Cell::new(0)),
+                    child: Some(leaf.into()),
+                    cache_child: true,
+                    read_model: false,
+                })
+            }
+        });
+        let window = cx.open_window(size(px(800.), px(600.)), {
+            let (model, mid) = (model.clone(), mid.clone());
+            move |_, _| DepReader {
+                model,
+                seen: std::rc::Rc::new(std::cell::Cell::new(0)),
+                renders: std::rc::Rc::new(std::cell::Cell::new(0)),
+                child: Some(mid.into()),
+                cache_child: true,
+                read_model: false,
+            }
+        });
+        cx.run_until_parked();
+
+        for round in 1..=4 {
+            clean_frame(cx, window.into());
+            model.update(cx, |model, cx| {
+                model.value = round;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                seen.get(),
+                round,
+                "round {round}: a model read two cached layers down did not invalidate \
+                 the layers above it"
+            );
+        }
+    }
+
+    /// The dependency index must not make everything rebuild: a model nobody
+    /// on screen reads still has to leave cached views alone. Without this the
+    /// fix for #83 would just be the `refreshing` sledgehammer under another
+    /// name.
+    #[gpui::test]
+    fn unrelated_notify_leaves_cached_views_alone(cx: &mut TestAppContext) {
+        let (window, _leaf, leaf_renders, _root_renders) = cached_leaf_window(cx, false);
+        let unrelated = cx.update(|cx| cx.new(|_| DepModel { value: 0 }));
+
+        clean_frame(cx, window.into());
+        let before = leaf_renders.get();
+
+        for _ in 0..4 {
+            unrelated.update(cx, |model, cx| {
+                model.value += 1;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            clean_frame(cx, window.into());
+        }
+
+        assert_eq!(
+            leaf_renders.get(),
+            before,
+            "a cached view rebuilt because of an entity it never reads"
+        );
     }
 
     #[gpui::test]

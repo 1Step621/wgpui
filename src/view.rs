@@ -283,12 +283,31 @@ impl Element for AnyView {
                         log_stale_reuse_range(self.entity_id(), array, end, len);
                     }
 
+                    // `dirty_views` alone is not enough. It is built by walking
+                    // the dispatch tree upward from each notified entity, so it
+                    // only ever contains entities that own a dispatch node —
+                    // views that were prepainted. Notifying anything else (a
+                    // model, or any entity a view merely reads) marks nothing,
+                    // and every cached view rendering that entity's data judges
+                    // itself clean and replays, indefinitely. That is issue #83.
+                    //
+                    // So also ask whether anything in this view's *own* recorded
+                    // dependency set changed. Nesting is covered for free: the
+                    // set is cumulative over the whole subtree, so every cached
+                    // layer above the view that actually reads the entity fails
+                    // this test too and rebuilds, which is what gets the inner
+                    // one prepainted at all.
+                    let dependency_invalidated = element_state.as_ref().is_some_and(|state| {
+                        window.accessed_entity_invalidated(&state.accessed_entities)
+                    });
+
                     if let Some(mut element_state) = element_state
                         && stale_range.is_none()
                         && element_state.cache_key.bounds == bounds
                         && element_state.cache_key.content_mask == content_mask
                         && element_state.cache_key.text_style == text_style
                         && !window.dirty_views.contains(&self.entity_id())
+                        && !dependency_invalidated
                         && !window.refreshing
                     {
                         crate::render_stats::count("view cache: reused");
@@ -309,6 +328,14 @@ impl Element for AnyView {
                     // the ancestor path, so a chatty leaf invalidates every
                     // cached view above it.
                     crate::render_stats::count("view cache: rebuilt");
+                    if dependency_invalidated {
+                        // Counted separately because this is the class of
+                        // rebuild the #83 fix added. If it dominates, some
+                        // entity read across a whole subtree is being notified
+                        // every frame, and the fix to make is at that call site
+                        // rather than here.
+                        crate::render_stats::count("view cache: rebuilt (dependency changed)");
+                    }
                     let _t = crate::render_stats::scope("view cache: rebuild");
 
                     // Rebuilding this view normally forces every cached view
