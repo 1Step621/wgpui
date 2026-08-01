@@ -99,11 +99,36 @@ impl DispatchPhase {
     }
 }
 
+/// After this many consecutive draws that each ended with deferred
+/// notifications, warn once. A view that notifies from inside its own render
+/// now genuinely re-renders forever; that is arguably correct, but it is also
+/// a self-perpetuating frame cost and should be visible rather than silent.
+const DEFERRED_NOTIFY_LOOP_WARN_DRAWS: u32 = 120;
+
 struct WindowInvalidatorInner {
     pub dirty: bool,
     pub draw_phase: DrawPhase,
     pub dirty_views: FxHashSet<EntityId>,
     pub update_count: usize,
+    /// Entities notified while a draw was in progress.
+    ///
+    /// A notify that arrives mid-draw cannot be applied where it happens: the
+    /// frame being built has already read whatever it was going to read, and
+    /// pushing an `Effect::Notify` from inside prepaint/paint would run
+    /// observer callbacks in the middle of an element tree walk. It used to be
+    /// dropped instead, which lost two separate things — the dirty flag that
+    /// schedules the frame able to answer it, and the effect that runs
+    /// `cx.observe` callbacks. Recorded here and applied by
+    /// [`WindowInvalidator::flush_deferred_notifications`] once the draw is
+    /// over and `&mut App` is available again.
+    ///
+    /// A set, so a view notifying the same entity repeatedly inside one draw
+    /// costs one entry.
+    deferred_notifies: FxHashSet<EntityId>,
+    /// Consecutive flushes that had something to apply. Only used to decide
+    /// whether to emit the loop warning.
+    consecutive_deferred_draws: u32,
+    warned_about_deferred_loop: bool,
 }
 
 #[derive(Clone)]
@@ -119,10 +144,18 @@ impl WindowInvalidator {
                 draw_phase: DrawPhase::None,
                 dirty_views: FxHashSet::default(),
                 update_count: 0,
+                deferred_notifies: FxHashSet::default(),
+                consecutive_deferred_draws: 0,
+                warned_about_deferred_loop: false,
             })),
         }
     }
 
+    /// Record that `entity` changed.
+    ///
+    /// Returns whether the notification was applied immediately. `false` means
+    /// it was deferred to the end of the current draw, not that it was
+    /// dropped — see [`WindowInvalidatorInner::deferred_notifies`].
     pub fn invalidate_view(&self, entity: EntityId, cx: &mut App) -> bool {
         let mut inner = self.inner.borrow_mut();
         inner.update_count += 1;
@@ -131,10 +164,66 @@ impl WindowInvalidator {
         crate::record_entity_invalidated();
         if inner.draw_phase == DrawPhase::None {
             inner.dirty = true;
+            // Released before re-entering the app: `push_effect` does not touch
+            // the invalidator today, but nothing about its signature promises
+            // that, and an active borrow here has no purpose.
+            drop(inner);
             cx.push_effect(Effect::Notify { emitter: entity });
             true
         } else {
+            let first = inner.deferred_notifies.insert(entity);
+            drop(inner);
+            if first {
+                crate::render_stats::count("notify: deferred to end of draw");
+            } else {
+                crate::render_stats::count("notify: deferred (duplicate, collapsed)");
+            }
             false
+        }
+    }
+
+    /// Apply everything [`Self::invalidate_view`] deferred while a draw was in
+    /// progress: mark the window dirty so a frame is scheduled to answer the
+    /// invalidations already sitting in `dirty_views`, and push the
+    /// `Effect::Notify`s so `cx.observe` callbacks finally run.
+    ///
+    /// Must be called after the draw phase has returned to
+    /// [`DrawPhase::None`], with `&mut App` available. `Window::draw` is the
+    /// only production caller.
+    pub fn flush_deferred_notifications(&self, cx: &mut App) {
+        let (deferred, warn) = {
+            let mut inner = self.inner.borrow_mut();
+            debug_assert_eq!(
+                inner.draw_phase,
+                DrawPhase::None,
+                "deferred notifications must not be flushed while still drawing"
+            );
+            if inner.deferred_notifies.is_empty() {
+                inner.consecutive_deferred_draws = 0;
+                return;
+            }
+            inner.dirty = true;
+            inner.update_count += 1;
+            inner.consecutive_deferred_draws = inner.consecutive_deferred_draws.saturating_add(1);
+            let warn = inner.consecutive_deferred_draws >= DEFERRED_NOTIFY_LOOP_WARN_DRAWS
+                && !mem::replace(&mut inner.warned_about_deferred_loop, true);
+            (mem::take(&mut inner.deferred_notifies), warn)
+        };
+
+        crate::render_stats::count("notify: deferred flush scheduled a redraw");
+        if warn {
+            log::warn!(
+                "window has deferred notifications on {} consecutive draws \
+                 (entities: {:?}); something is notifying from inside its own \
+                 render, which now redraws every frame",
+                DEFERRED_NOTIFY_LOOP_WARN_DRAWS,
+                deferred.iter().take(8).collect::<Vec<_>>(),
+            );
+        }
+
+        // Borrow released: applying an effect can re-enter the invalidator.
+        for entity in deferred {
+            cx.push_effect(Effect::Notify { emitter: entity });
         }
     }
 
@@ -162,8 +251,18 @@ impl WindowInvalidator {
         mem::take(&mut self.inner.borrow_mut().dirty_views)
     }
 
+    /// Return a set previously removed by [`Self::take_views`].
+    ///
+    /// Merges rather than assigns. The caller drains what it consumed and hands
+    /// the (empty) set back, so in practice this adds nothing — but assigning
+    /// would silently discard anything inserted by
+    /// [`Self::invalidate_view`] in between, and "in between" is a window that
+    /// only ever gets wider.
     pub fn replace_views(&self, views: FxHashSet<EntityId>) {
-        self.inner.borrow_mut().dirty_views = views;
+        if views.is_empty() {
+            return;
+        }
+        self.inner.borrow_mut().dirty_views.extend(views);
     }
 
     pub fn not_drawing(&self) -> bool {
@@ -2516,6 +2615,19 @@ impl Window {
         self.reset_cursor_style(cx);
         self.refreshing = false;
         self.invalidator.set_phase(DrawPhase::None);
+
+        // Anything that notified while this draw was running — scrollbar thumb
+        // state computed during prepaint, a view notifying a sibling model, an
+        // observer chain kicked off from paint — was recorded rather than
+        // applied. Now that the phase is `None` again and `cx` is in hand, mark
+        // the window dirty so a frame arrives to consume the entries already in
+        // `dirty_views`, and push the notifications so observers run.
+        //
+        // This must come after `set_phase(DrawPhase::None)`: the focus
+        // listeners above run under `DrawPhase::Focus` and can themselves
+        // notify, and those notifies belong in this same flush.
+        self.invalidator.flush_deferred_notifications(cx);
+
         self.needs_present.set(true);
 
         ArenaClearNeeded::new(&cx.element_arena)
@@ -6977,6 +7089,254 @@ mod test {
             leaf_renders.get(),
             before,
             "a cached view rebuilt because of an entity it never reads"
+        );
+    }
+
+    // ── Notify-during-draw scaffolding ───────────────────────────────────
+    //
+    // A root view that notifies a *model* from inside its own `render`, which
+    // runs during `DrawPhase::Prepaint`. Real code does this constantly:
+    // scrollbar thumb geometry is computed during prepaint/paint, and
+    // `CodeEditor::set_language` notifies the `InputState` it owns rather than
+    // itself. `WindowInvalidator::invalidate_view` used to answer such a
+    // notify by inserting into `dirty_views` and then doing nothing else — no
+    // dirty flag, so no frame was ever scheduled to consume the insertion, and
+    // no `Effect::Notify`, so `cx.observe` callbacks never ran at all.
+
+    struct DrawNotifier {
+        signal: crate::Entity<DepModel>,
+        /// Number of remaining renders that should notify `signal`. Bounded so
+        /// a broken fix shows up as a failing assertion rather than a hang.
+        pending: std::rc::Rc<std::cell::Cell<usize>>,
+        /// Notifies to issue per render, to exercise deduplication.
+        per_render: usize,
+        renders: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl crate::Render for DrawNotifier {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            cx: &mut Context<Self>,
+        ) -> impl crate::IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            // Read it, so this window is registered as tracking the entity.
+            // Without that `App::notify` takes the "no window tracks this"
+            // fallback and pushes the effect regardless of draw phase, which
+            // would hide the bug under test.
+            let _ = self.signal.read(cx).value;
+            if self.pending.get() > 0 {
+                self.pending.set(self.pending.get() - 1);
+                for _ in 0..self.per_render {
+                    self.signal.update(cx, |model, cx| {
+                        model.value += 1;
+                        cx.notify();
+                    });
+                }
+            }
+            crate::div().size_full()
+        }
+    }
+
+    fn draw_notifier_window(
+        cx: &mut TestAppContext,
+        per_render: usize,
+    ) -> (
+        crate::WindowHandle<DrawNotifier>,
+        crate::Entity<DepModel>,
+        std::rc::Rc<std::cell::Cell<usize>>,
+        std::rc::Rc<std::cell::Cell<usize>>,
+    ) {
+        let pending = std::rc::Rc::new(std::cell::Cell::new(0));
+        let renders = std::rc::Rc::new(std::cell::Cell::new(0));
+        let signal = cx.update(|cx| cx.new(|_| DepModel { value: 0 }));
+        let window = cx.open_window(size(px(800.), px(600.)), {
+            let (signal, pending, renders) = (signal.clone(), pending.clone(), renders.clone());
+            move |_, _| DrawNotifier {
+                signal,
+                pending,
+                per_render,
+                renders,
+            }
+        });
+        cx.run_until_parked();
+        (window, signal, pending, renders)
+    }
+
+    fn observe_count(
+        cx: &mut TestAppContext,
+        signal: &crate::Entity<DepModel>,
+    ) -> (std::rc::Rc<std::cell::Cell<usize>>, crate::Subscription) {
+        let observed = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let subscription = cx.update({
+            let (observed, signal) = (observed.clone(), signal.clone());
+            move |cx| {
+                cx.observe(&signal, move |_, _| observed.set(observed.get() + 1))
+            }
+        });
+        (observed, subscription)
+    }
+
+    /// An entity notified while a draw is in progress must still reach its
+    /// observers. This is the "a bunch of events get skipped" symptom: the
+    /// `Effect::Notify` was simply never pushed.
+    #[gpui::test]
+    fn notify_during_draw_reaches_observers(cx: &mut TestAppContext) {
+        let (window, signal, pending, _renders) = draw_notifier_window(cx, 1);
+        let (observed, _sub) = observe_count(cx, &signal);
+
+        pending.set(1);
+        clean_frame(cx, window.into());
+
+        assert_eq!(
+            observed.get(),
+            1,
+            "an entity notified during a draw never reached its observers"
+        );
+    }
+
+    /// ...and the window must schedule a frame to answer that notify, rather
+    /// than leaving the entity sitting in `dirty_views` with nothing to
+    /// consume it.
+    #[gpui::test]
+    fn notify_during_draw_schedules_a_follow_up_frame(cx: &mut TestAppContext) {
+        let (window, _signal, pending, renders) = draw_notifier_window(cx, 1);
+
+        let before = renders.get();
+        pending.set(1);
+        clean_frame(cx, window.into());
+
+        assert_eq!(
+            renders.get(),
+            before + 2,
+            "expected the notifying frame plus exactly one follow-up frame"
+        );
+    }
+
+    /// Deduplication: a view that notifies the same entity many times inside a
+    /// single draw must cost one observer call and one follow-up frame, not N.
+    #[gpui::test]
+    fn repeated_notifies_during_one_draw_collapse(cx: &mut TestAppContext) {
+        let (window, signal, pending, renders) = draw_notifier_window(cx, 8);
+        let (observed, _sub) = observe_count(cx, &signal);
+
+        let before = renders.get();
+        pending.set(1);
+        clean_frame(cx, window.into());
+
+        assert_eq!(
+            observed.get(),
+            1,
+            "eight notifies of one entity in one draw should collapse to one"
+        );
+        assert_eq!(
+            renders.get(),
+            before + 2,
+            "eight notifies of one entity in one draw should cost one extra frame"
+        );
+    }
+
+    /// The other side of the ledger: a draw that notifies nothing must not
+    /// schedule anything. If this fails the deferral is a redraw loop.
+    #[gpui::test]
+    fn draw_without_notifications_schedules_no_extra_frame(cx: &mut TestAppContext) {
+        let (window, signal, _pending, renders) = draw_notifier_window(cx, 1);
+        let (observed, _sub) = observe_count(cx, &signal);
+
+        let before = renders.get();
+        for _ in 0..4 {
+            clean_frame(cx, window.into());
+        }
+
+        assert_eq!(
+            renders.get(),
+            before + 4,
+            "the deferred-notify flush scheduled redraws with nothing deferred"
+        );
+        assert_eq!(observed.get(), 0, "observers fired without any notify");
+    }
+
+    /// The hazard the deferral introduces, stated as a measurement rather than
+    /// a hope: each draw that notifies begets exactly one more draw. The chain
+    /// terminates only because the view stops notifying — a view that notifies
+    /// unconditionally from its own render or paint now redraws forever.
+    ///
+    /// This is why `TextInput`'s paint-time "record what was painted" update in
+    /// `wgpui-component` had to become conditional; it notified on every paint.
+    #[gpui::test]
+    fn each_notifying_draw_begets_exactly_one_more(cx: &mut TestAppContext) {
+        for chain in [1usize, 2, 5] {
+            let (window, _signal, pending, renders) = draw_notifier_window(cx, 1);
+
+            let before = renders.get();
+            pending.set(chain);
+            clean_frame(cx, window.into());
+
+            assert_eq!(
+                renders.get(),
+                before + chain + 1,
+                "chain {chain}: expected {chain} notifying draws plus one \
+                 settling draw"
+            );
+            let dirty = window
+                .update(cx, |_, window, _| window.invalidator.is_dirty())
+                .unwrap();
+            assert!(
+                !dirty,
+                "chain {chain}: the window never settled after the notifies stopped"
+            );
+        }
+    }
+
+    /// A notify issued during `Paint` (not just `Prepaint`) is dropped by the
+    /// same code path. Scrollbar thumb state is computed here.
+    #[gpui::test]
+    fn notify_during_paint_reaches_observers(cx: &mut TestAppContext) {
+        struct PaintNotifier {
+            signal: crate::Entity<DepModel>,
+            pending: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+
+        impl crate::Render for PaintNotifier {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                cx: &mut Context<Self>,
+            ) -> impl crate::IntoElement {
+                let _ = self.signal.read(cx).value;
+                let signal = self.signal.clone();
+                let pending = self.pending.clone();
+                crate::div()
+                    .size_full()
+                    .child(crate::canvas(|_, _, _| (), move |_, _, window, cx| {
+                        debug_assert!(!window.invalidator.not_drawing());
+                        if pending.get() > 0 {
+                            pending.set(pending.get() - 1);
+                            signal.update(cx, |model, cx| {
+                                model.value += 1;
+                                cx.notify();
+                            });
+                        }
+                    }))
+            }
+        }
+
+        let pending = std::rc::Rc::new(std::cell::Cell::new(0));
+        let signal = cx.update(|cx| cx.new(|_| DepModel { value: 0 }));
+        let window = cx.open_window(size(px(800.), px(600.)), {
+            let (signal, pending) = (signal.clone(), pending.clone());
+            move |_, _| PaintNotifier { signal, pending }
+        });
+        cx.run_until_parked();
+
+        let (observed, _sub) = observe_count(cx, &signal);
+        pending.set(1);
+        clean_frame(cx, window.into());
+
+        assert_eq!(
+            observed.get(),
+            1,
+            "an entity notified during paint never reached its observers"
         );
     }
 
