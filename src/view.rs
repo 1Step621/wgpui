@@ -7,6 +7,7 @@ use crate::{Empty, Window};
 use anyhow::Result;
 use collections::FxHashSet;
 use refineable::Refineable;
+use std::mem;
 use std::rc::Rc;
 use std::{any::TypeId, fmt, ops::Range};
 
@@ -237,32 +238,7 @@ impl Element for AnyView {
                     crate::render_stats::count("view cache: rebuilt");
                     let _t = crate::render_stats::scope("view cache: rebuild");
 
-                    // NOTE: this deliberately does *not* set `window.refreshing`
-                    // while rebuilding.
-                    //
-                    // `refreshing` means "this frame must ignore all view
-                    // caches" and is owned by `Window::refresh` / the global
-                    // refresh effect — theme swaps, GPU device recovery,
-                    // inspector picking — where cached paint content is stale in
-                    // ways the cache key cannot detect. Setting it here overloaded
-                    // it with a second meaning, "an ancestor is rebuilding", which
-                    // force-rebuilt every cached view nested inside this one no
-                    // matter how clean it was.
-                    //
-                    // Measured (`WGPUI_RENDER_STATS=1`) in the level editor: one
-                    // genuinely dirty view per frame produced five further cache
-                    // misses through this path, ~600ms/s of ~890ms/s of all UI
-                    // thread time.
-                    //
-                    // A nested view is safe to replay without it. Its own guard
-                    // already covers everything that can invalidate it:
-                    // `dirty_views` (which a descendant's notify propagates into
-                    // via `mark_view_dirty`), plus bounds, content mask and
-                    // inherited text style. Its `prepaint_range`/`paint_range`
-                    // index into `rendered_frame`, which is immutable for the
-                    // duration of this draw, and a view that did not render last
-                    // frame has no element state to replay from and misses here
-                    // anyway.
+                    let refreshing = mem::replace(&mut window.refreshing, true);
                     let prepaint_start = window.prepaint_index();
                     let (mut element, accessed_entities) = cx.detect_accessed_entities(|cx| {
                         let mut element = (self.render)(self, window, cx);
@@ -272,6 +248,7 @@ impl Element for AnyView {
                     });
 
                     let prepaint_end = window.prepaint_index();
+                    window.refreshing = refreshing;
 
                     (
                         Some(element),
@@ -312,12 +289,9 @@ impl Element for AnyView {
                         let paint_start = window.paint_index();
 
                         if let Some(element) = element {
-                            // Paired with the prepaint path above: painting a
-                            // rebuilt view must not disable caching for the
-                            // cached views nested inside it either, or a nested
-                            // view that reused its prepaint would be forced to
-                            // repaint and the two ranges would disagree.
+                            let refreshing = mem::replace(&mut window.refreshing, true);
                             element.paint(window, cx);
+                            window.refreshing = refreshing;
                         } else {
                             window.reuse_paint(element_state.paint_range.clone());
                         }
