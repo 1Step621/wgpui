@@ -322,9 +322,21 @@ impl Element for AnyView {
 
                     let prepaint_start = window.prepaint_index();
                     let (mut element, accessed_entities) = cx.detect_accessed_entities(|cx| {
-                        let mut element = (self.render)(self, window, cx);
-                        element.layout_as_root(bounds.size.into(), window, cx);
-                        element.prepaint_at(bounds.origin, window, cx);
+                        // Split three ways: building the element tree is usually
+                        // trivial next to laying it out and prepainting it, and
+                        // conflating them hides which one to go after.
+                        let mut element = {
+                            let _t = crate::render_stats::scope("  rebuild: render");
+                            (self.render)(self, window, cx)
+                        };
+                        {
+                            let _t = crate::render_stats::scope("  rebuild: layout");
+                            element.layout_as_root(bounds.size.into(), window, cx);
+                        }
+                        {
+                            let _t = crate::render_stats::scope("  rebuild: prepaint");
+                            element.prepaint_at(bounds.origin, window, cx);
+                        }
                         element
                     });
 
