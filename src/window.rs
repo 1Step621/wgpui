@@ -2772,6 +2772,128 @@ impl Window {
         }
     }
 
+    /// Check that a cached view's stored ranges still fit inside the arrays they
+    /// index, returning the name of the first array they don't fit.
+    ///
+    /// Both `PrepaintStateIndex` and `PaintIndex` are bundles of **absolute
+    /// offsets** into per-frame arrays, recorded during an earlier frame and
+    /// replayed against `rendered_frame` (and the text system's previous-frame
+    /// lists) on a later one. Nothing in the type system ties a stored range to
+    /// the array it came from, so a range that has aged — because the view went
+    /// unpainted for a frame, because a retryable prepaint truncated the arrays,
+    /// or for any reason not yet enumerated — will slice out of bounds and take
+    /// the process down.
+    ///
+    /// Callers must treat a `Some(_)` result as a cache miss and rebuild. That
+    /// turns every such case into a slower frame instead of a panic, without
+    /// needing to know in advance what made the range stale.
+    ///
+    /// Both ranges are validated together at prepaint time on purpose: once
+    /// prepaint has committed to reusing, paint has no rebuild path left, so a
+    /// bad paint range discovered later would be unrecoverable.
+    /// Returns `(array name, stored end offset, actual length)` on failure.
+    pub(crate) fn invalid_reuse_range(
+        &self,
+        prepaint: &Range<PrepaintStateIndex>,
+        paint: &Range<PaintIndex>,
+    ) -> Option<(&'static str, usize, usize)> {
+        let frame = &self.rendered_frame;
+        let layouts = self.text_system.previous_frame_layout_extent();
+
+        let checks: [(&'static str, usize, usize); 13] = [
+            ("hitboxes", prepaint.end.hitboxes_index, frame.hitboxes.len()),
+            (
+                "tooltip_requests",
+                prepaint.end.tooltips_index,
+                frame.tooltip_requests.len(),
+            ),
+            (
+                "deferred_draws",
+                prepaint.end.deferred_draws_index,
+                frame.deferred_draws.len(),
+            ),
+            (
+                "dispatch_tree",
+                prepaint.end.dispatch_tree_index,
+                frame.dispatch_tree.len(),
+            ),
+            (
+                "accessed_element_states (prepaint)",
+                prepaint.end.accessed_element_states_index,
+                frame.accessed_element_states.len(),
+            ),
+            (
+                "line_layouts (prepaint)",
+                prepaint.end.line_layout_index.lines_index,
+                layouts.lines_index,
+            ),
+            (
+                "wrapped_line_layouts (prepaint)",
+                prepaint.end.line_layout_index.wrapped_lines_index,
+                layouts.wrapped_lines_index,
+            ),
+            ("scene", paint.end.scene_index, frame.scene.len()),
+            (
+                "mouse_listeners",
+                paint.end.mouse_listeners_index,
+                frame.mouse_listeners.len(),
+            ),
+            (
+                "input_handlers",
+                paint.end.input_handlers_index,
+                frame.input_handlers.len(),
+            ),
+            (
+                "cursor_styles",
+                paint.end.cursor_styles_index,
+                frame.cursor_styles.len(),
+            ),
+            (
+                "tab_stops",
+                paint.end.tab_handle_index,
+                frame.tab_stops.paint_index(),
+            ),
+            (
+                "line_layouts (paint)",
+                paint.end.line_layout_index.lines_index,
+                layouts.lines_index,
+            ),
+        ];
+
+        for (name, end, len) in checks {
+            if end > len {
+                return Some((name, end, len));
+            }
+        }
+
+        // A reversed range would slice-panic just as hard as an overlong one.
+        if prepaint.start.hitboxes_index > prepaint.end.hitboxes_index {
+            return Some((
+                "hitboxes (start past end)",
+                prepaint.start.hitboxes_index,
+                prepaint.end.hitboxes_index,
+            ));
+        }
+        if paint.start.scene_index > paint.end.scene_index {
+            return Some((
+                "scene (start past end)",
+                paint.start.scene_index,
+                paint.end.scene_index,
+            ));
+        }
+        if prepaint.start.line_layout_index.lines_index
+            > prepaint.end.line_layout_index.lines_index
+        {
+            return Some((
+                "line_layouts (start past end)",
+                prepaint.start.line_layout_index.lines_index,
+                prepaint.end.line_layout_index.lines_index,
+            ));
+        }
+
+        None
+    }
+
     pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
         self.next_frame.hitboxes.extend(
             self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
@@ -6002,6 +6124,96 @@ mod test {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl crate::IntoElement {
             crate::Empty
         }
+    }
+
+    /// A stored reuse range that has outlived its array must be reported as
+    /// invalid, not sliced. This is the guard standing between a stale range and
+    /// the `range end index N out of range for slice of length M` abort in
+    /// `reuse_layouts`.
+    #[gpui::test]
+    fn stale_reuse_ranges_are_rejected_not_sliced(cx: &mut TestAppContext) {
+        use crate::{PaintIndex, PrepaintStateIndex};
+
+        let window = cx.open_window(size(px(800.), px(600.)), |_, _| EmptyView);
+
+        window
+            .update(cx, |_, this, _| {
+                // A freshly-drawn window's arrays are empty, so all-zero ranges
+                // are the only ones that fit. They must be accepted.
+                let empty_prepaint =
+                    PrepaintStateIndex::default()..PrepaintStateIndex::default();
+                let empty_paint = PaintIndex::default()..PaintIndex::default();
+                assert!(
+                    this.invalid_reuse_range(&empty_prepaint, &empty_paint)
+                        .is_none(),
+                    "a zero-length range fits any array"
+                );
+
+                // Each field is checked independently: a range overrunning any
+                // one of them has to be caught, or that array is the one that
+                // panics at replay time.
+                let overruns: [(&str, PrepaintStateIndex, PaintIndex); 5] = [
+                    (
+                        "hitboxes",
+                        PrepaintStateIndex {
+                            hitboxes_index: 9,
+                            ..Default::default()
+                        },
+                        PaintIndex::default(),
+                    ),
+                    (
+                        "dispatch_tree",
+                        PrepaintStateIndex {
+                            dispatch_tree_index: 9,
+                            ..Default::default()
+                        },
+                        PaintIndex::default(),
+                    ),
+                    (
+                        "line layouts",
+                        PrepaintStateIndex {
+                            line_layout_index: crate::LineLayoutIndex {
+                                lines_index: 9,
+                                wrapped_lines_index: 0,
+                            },
+                            ..Default::default()
+                        },
+                        PaintIndex::default(),
+                    ),
+                    (
+                        "scene",
+                        PrepaintStateIndex::default(),
+                        PaintIndex {
+                            scene_index: 9,
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "mouse_listeners",
+                        PrepaintStateIndex::default(),
+                        PaintIndex {
+                            mouse_listeners_index: 9,
+                            ..Default::default()
+                        },
+                    ),
+                ];
+
+                for (label, prepaint_end, paint_end) in overruns {
+                    let prepaint = PrepaintStateIndex::default()..prepaint_end;
+                    let paint = PaintIndex::default()..paint_end;
+                    let result = this.invalid_reuse_range(&prepaint, &paint);
+                    assert!(
+                        result.is_some(),
+                        "an over-long {label} range must be rejected, not replayed"
+                    );
+                    let (_, end, len) = result.unwrap();
+                    assert!(
+                        end > len,
+                        "{label}: reported stored_end {end} should exceed actual_len {len}"
+                    );
+                }
+            })
+            .ok();
     }
 
     #[gpui::test]

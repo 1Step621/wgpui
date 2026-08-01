@@ -7,7 +7,6 @@ use crate::{Empty, Window};
 use anyhow::Result;
 use collections::FxHashSet;
 use refineable::Refineable;
-use std::mem;
 use std::rc::Rc;
 use std::{any::TypeId, fmt, ops::Range};
 
@@ -76,6 +75,65 @@ impl<V: Render> Element for Entity<V> {
     ) {
         window.with_rendered_view(self.entity_id(), |window| element.paint(window, cx));
     }
+}
+
+/// Whether a cached view rebuilding is allowed to leave the cached views nested
+/// inside it reusing, rather than forcing the whole subtree to rebuild.
+///
+/// This is what makes "no state change = no op" actually hold for nested
+/// panels. Upstream forces the whole nested subtree to rebuild whenever any
+/// ancestor cached view rebuilds, which in the level editor meant one genuinely
+/// dirty view produced five collateral cache misses — measured at roughly 600ms
+/// of every 890ms spent on the UI thread. With this on, a reuse costs ~0.003ms
+/// against ~0.64ms for the rebuild it replaces.
+///
+/// Set `WGPUI_NESTED_VIEW_CACHE=0` to fall back to upstream behaviour.
+///
+/// **Why the escape hatch exists.** Enabling this repeatedly aborted the process
+/// in `LineLayoutCache::reuse_layouts` — a stored reuse range outliving the
+/// array it indexes. The ranges in `PrepaintStateIndex`/`PaintIndex` are
+/// absolute offsets into per-frame arrays with nothing tying them to the array
+/// they were recorded against. `Window::invalid_reuse_range` now bounds-checks
+/// every one of them before a single byte is copied and treats a bad range as a
+/// cache miss, so the failure mode is a slower frame rather than a crash. That
+/// guard is what makes this safe to leave on; if something still goes wrong, the
+/// env var reverts the behaviour without a rebuild.
+///
+/// Read once, at first use.
+fn nested_view_cache_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("WGPUI_NESTED_VIEW_CACHE")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(true)
+    });
+    *ENABLED
+}
+
+/// Report the first cached-view reuse whose stored range had outlived the array
+/// it indexes, then stay quiet.
+///
+/// One line is enough to identify the cause — which array, how far past the end,
+/// and which view — without a per-frame flood. Everything after the first is
+/// silently handled as a cache miss.
+fn log_stale_reuse_range(entity: EntityId, array: &'static str, end: usize, len: usize) {
+    // Counted on every occurrence, logged only on the first: the count is what
+    // tells you whether this is a one-off at startup or happening continuously,
+    // so it must not sit behind the log-once guard.
+    crate::render_stats::count("view cache: stale range (rebuilt)");
+
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    log::warn!(
+        "[VIEW CACHE] stale reuse range discarded: entity={:?} array={} stored_end={} actual_len={}. \
+         Rebuilding instead of replaying. This is the condition that used to panic in \
+         `reuse_layouts`; further occurrences are handled silently.",
+        entity,
+        array,
+        end,
+        len,
+    );
 }
 
 /// A dynamically-typed handle to a view, which can be downcast to a [Entity] for a specific type.
@@ -211,7 +269,22 @@ impl Element for AnyView {
                     let content_mask = window.content_mask();
                     let text_style = window.text_style();
 
+                    // Stored ranges are absolute offsets into per-frame arrays.
+                    // Verify they still fit before anything is copied — a stale
+                    // range would otherwise slice out of bounds and abort the
+                    // process. Both ranges are checked here, at prepaint, because
+                    // once prepaint commits to reusing, paint has no rebuild path
+                    // left. A failure is just a cache miss: we fall through and
+                    // rebuild, costing a frame's work rather than the process.
+                    let stale_range = element_state.as_ref().and_then(|state| {
+                        window.invalid_reuse_range(&state.prepaint_range, &state.paint_range)
+                    });
+                    if let Some((array, end, len)) = stale_range {
+                        log_stale_reuse_range(self.entity_id(), array, end, len);
+                    }
+
                     if let Some(mut element_state) = element_state
+                        && stale_range.is_none()
                         && element_state.cache_key.bounds == bounds
                         && element_state.cache_key.content_mask == content_mask
                         && element_state.cache_key.text_style == text_style
@@ -238,7 +311,15 @@ impl Element for AnyView {
                     crate::render_stats::count("view cache: rebuilt");
                     let _t = crate::render_stats::scope("view cache: rebuild");
 
-                    let refreshing = mem::replace(&mut window.refreshing, true);
+                    // Rebuilding this view normally forces every cached view
+                    // nested inside it to rebuild too, via `refreshing`. See
+                    // `nested_view_cache_enabled` for why, and for the opt-in
+                    // that lifts it.
+                    let refreshing = window.refreshing;
+                    if !nested_view_cache_enabled() {
+                        window.refreshing = true;
+                    }
+
                     let prepaint_start = window.prepaint_index();
                     let (mut element, accessed_entities) = cx.detect_accessed_entities(|cx| {
                         let mut element = (self.render)(self, window, cx);
@@ -289,7 +370,11 @@ impl Element for AnyView {
                         let paint_start = window.paint_index();
 
                         if let Some(element) = element {
-                            let refreshing = mem::replace(&mut window.refreshing, true);
+                            // Paired with the prepaint path above.
+                            let refreshing = window.refreshing;
+                            if !nested_view_cache_enabled() {
+                                window.refreshing = true;
+                            }
                             element.paint(window, cx);
                             window.refreshing = refreshing;
                         } else {
