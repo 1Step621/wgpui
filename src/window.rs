@@ -2830,95 +2830,120 @@ impl Window {
         let frame = &self.rendered_frame;
         let layouts = self.text_system.previous_frame_layout_extent();
 
-        let checks: [(&'static str, usize, usize); 13] = [
-            ("hitboxes", prepaint.end.hitboxes_index, frame.hitboxes.len()),
+        let frame = &self.rendered_frame;
+        let layouts = self.text_system.previous_frame_layout_extent();
+
+        // Every offset in both index types, paired with the array it slices.
+        //
+        // Listed exhaustively and checked uniformly on purpose: an earlier
+        // version enumerated these by hand and silently omitted two of them
+        // (`accessed_element_states` and `wrapped_lines_index` on the paint
+        // side), which left `reuse_paint` free to slice out of bounds on
+        // exactly the fields nobody had thought about. If a field is added to
+        // `PrepaintStateIndex` or `PaintIndex`, add it here.
+        let checks: [(&'static str, usize, usize, usize); 15] = [
+            // (name, start, end, length of the array it indexes)
             (
-                "tooltip_requests",
+                "prepaint hitboxes",
+                prepaint.start.hitboxes_index,
+                prepaint.end.hitboxes_index,
+                frame.hitboxes.len(),
+            ),
+            (
+                "prepaint tooltip_requests",
+                prepaint.start.tooltips_index,
                 prepaint.end.tooltips_index,
                 frame.tooltip_requests.len(),
             ),
             (
-                "deferred_draws",
+                "prepaint deferred_draws",
+                prepaint.start.deferred_draws_index,
                 prepaint.end.deferred_draws_index,
                 frame.deferred_draws.len(),
             ),
             (
-                "dispatch_tree",
+                "prepaint dispatch_tree",
+                prepaint.start.dispatch_tree_index,
                 prepaint.end.dispatch_tree_index,
                 frame.dispatch_tree.len(),
             ),
             (
-                "accessed_element_states (prepaint)",
+                "prepaint accessed_element_states",
+                prepaint.start.accessed_element_states_index,
                 prepaint.end.accessed_element_states_index,
                 frame.accessed_element_states.len(),
             ),
             (
-                "line_layouts (prepaint)",
+                "prepaint line_layouts",
+                prepaint.start.line_layout_index.lines_index,
                 prepaint.end.line_layout_index.lines_index,
                 layouts.lines_index,
             ),
             (
-                "wrapped_line_layouts (prepaint)",
+                "prepaint wrapped_line_layouts",
+                prepaint.start.line_layout_index.wrapped_lines_index,
                 prepaint.end.line_layout_index.wrapped_lines_index,
                 layouts.wrapped_lines_index,
             ),
-            ("scene", paint.end.scene_index, frame.scene.len()),
             (
-                "mouse_listeners",
+                "paint scene",
+                paint.start.scene_index,
+                paint.end.scene_index,
+                frame.scene.len(),
+            ),
+            (
+                "paint mouse_listeners",
+                paint.start.mouse_listeners_index,
                 paint.end.mouse_listeners_index,
                 frame.mouse_listeners.len(),
             ),
             (
-                "input_handlers",
+                "paint input_handlers",
+                paint.start.input_handlers_index,
                 paint.end.input_handlers_index,
                 frame.input_handlers.len(),
             ),
             (
-                "cursor_styles",
+                "paint cursor_styles",
+                paint.start.cursor_styles_index,
                 paint.end.cursor_styles_index,
                 frame.cursor_styles.len(),
             ),
             (
-                "tab_stops",
+                "paint accessed_element_states",
+                paint.start.accessed_element_states_index,
+                paint.end.accessed_element_states_index,
+                frame.accessed_element_states.len(),
+            ),
+            (
+                "paint tab_stops",
+                paint.start.tab_handle_index,
                 paint.end.tab_handle_index,
                 frame.tab_stops.paint_index(),
             ),
             (
-                "line_layouts (paint)",
+                "paint line_layouts",
+                paint.start.line_layout_index.lines_index,
                 paint.end.line_layout_index.lines_index,
                 layouts.lines_index,
             ),
+            (
+                "paint wrapped_line_layouts",
+                paint.start.line_layout_index.wrapped_lines_index,
+                paint.end.line_layout_index.wrapped_lines_index,
+                layouts.wrapped_lines_index,
+            ),
         ];
 
-        for (name, end, len) in checks {
+        for (name, start, end, len) in checks {
+            // `start > end` panics just as hard as `end > len`, and both mean
+            // the same thing: this range no longer describes the array.
+            if start > end {
+                return Some((name, start, end));
+            }
             if end > len {
                 return Some((name, end, len));
             }
-        }
-
-        // A reversed range would slice-panic just as hard as an overlong one.
-        if prepaint.start.hitboxes_index > prepaint.end.hitboxes_index {
-            return Some((
-                "hitboxes (start past end)",
-                prepaint.start.hitboxes_index,
-                prepaint.end.hitboxes_index,
-            ));
-        }
-        if paint.start.scene_index > paint.end.scene_index {
-            return Some((
-                "scene (start past end)",
-                paint.start.scene_index,
-                paint.end.scene_index,
-            ));
-        }
-        if prepaint.start.line_layout_index.lines_index
-            > prepaint.end.line_layout_index.lines_index
-        {
-            return Some((
-                "line_layouts (start past end)",
-                prepaint.start.line_layout_index.lines_index,
-                prepaint.end.line_layout_index.lines_index,
-            ));
         }
 
         None
@@ -6179,10 +6204,13 @@ mod test {
                     "a zero-length range fits any array"
                 );
 
-                // Each field is checked independently: a range overrunning any
-                // one of them has to be caught, or that array is the one that
-                // panics at replay time.
-                let overruns: [(&str, PrepaintStateIndex, PaintIndex); 5] = [
+                // Every field is checked independently. An earlier version of
+                // the validator enumerated these by hand and omitted two on the
+                // paint side, which shipped a panic in `reuse_paint`
+                // ("range start index 213 out of range for slice of length
+                // 211"). If a field is added to either index type, add it here
+                // and to `invalid_reuse_range`.
+                let overruns: [(&str, PrepaintStateIndex, PaintIndex); 15] = [
                     (
                         "hitboxes",
                         PrepaintStateIndex {
@@ -6223,6 +6251,98 @@ mod test {
                         PrepaintStateIndex::default(),
                         PaintIndex {
                             mouse_listeners_index: 9,
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "prepaint tooltips",
+                        PrepaintStateIndex {
+                            tooltips_index: 9,
+                            ..Default::default()
+                        },
+                        PaintIndex::default(),
+                    ),
+                    (
+                        "prepaint deferred_draws",
+                        PrepaintStateIndex {
+                            deferred_draws_index: 9,
+                            ..Default::default()
+                        },
+                        PaintIndex::default(),
+                    ),
+                    (
+                        "prepaint accessed_element_states",
+                        PrepaintStateIndex {
+                            accessed_element_states_index: 9,
+                            ..Default::default()
+                        },
+                        PaintIndex::default(),
+                    ),
+                    (
+                        "prepaint wrapped line layouts",
+                        PrepaintStateIndex {
+                            line_layout_index: crate::LineLayoutIndex {
+                                lines_index: 0,
+                                wrapped_lines_index: 9,
+                            },
+                            ..Default::default()
+                        },
+                        PaintIndex::default(),
+                    ),
+                    (
+                        "paint input_handlers",
+                        PrepaintStateIndex::default(),
+                        PaintIndex {
+                            input_handlers_index: 9,
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "paint cursor_styles",
+                        PrepaintStateIndex::default(),
+                        PaintIndex {
+                            cursor_styles_index: 9,
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        // Omitted from the original validator.
+                        "paint accessed_element_states",
+                        PrepaintStateIndex::default(),
+                        PaintIndex {
+                            accessed_element_states_index: 9,
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "paint tab_stops",
+                        PrepaintStateIndex::default(),
+                        PaintIndex {
+                            tab_handle_index: 9,
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "paint line layouts",
+                        PrepaintStateIndex::default(),
+                        PaintIndex {
+                            line_layout_index: crate::LineLayoutIndex {
+                                lines_index: 9,
+                                wrapped_lines_index: 0,
+                            },
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        // Omitted from the original validator — this is the one
+                        // that panicked in `reuse_paint`'s wrapped-lines loop.
+                        "paint wrapped line layouts",
+                        PrepaintStateIndex::default(),
+                        PaintIndex {
+                            line_layout_index: crate::LineLayoutIndex {
+                                lines_index: 0,
+                                wrapped_lines_index: 9,
+                            },
                             ..Default::default()
                         },
                     ),
