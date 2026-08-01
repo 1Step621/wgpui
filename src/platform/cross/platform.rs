@@ -1702,6 +1702,7 @@ struct CrossDisplay {
     id: crate::DisplayId,
     uuid: uuid::Uuid,
     bounds: crate::Bounds<Pixels>,
+    refresh_rate_millihertz: Option<u32>,
 }
 
 impl crate::PlatformDisplay for CrossDisplay {
@@ -1715,6 +1716,10 @@ impl crate::PlatformDisplay for CrossDisplay {
 
     fn bounds(&self) -> crate::Bounds<Pixels> {
         self.bounds
+    }
+
+    fn refresh_rate_millihertz(&self) -> Option<u32> {
+        self.refresh_rate_millihertz
     }
 }
 
@@ -1759,6 +1764,7 @@ fn collect_displays(
                 id: display_id,
                 uuid,
                 bounds,
+                refresh_rate_millihertz: monitor.refresh_rate_millihertz(),
             }) as Rc<dyn crate::PlatformDisplay>
         })
         .collect::<Vec<_>>();

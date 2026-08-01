@@ -177,6 +177,17 @@ pub trait PlatformDisplay: Send + Sync + Debug {
     /// Get the bounds for this display
     fn bounds(&self) -> Bounds<Pixels>;
 
+    /// This display's refresh rate in millihertz (60 Hz → `60_000`), if the
+    /// platform reports one.
+    ///
+    /// Useful for pacing an external render thread: presenting faster than the
+    /// display refreshes cannot show more frames, so the refresh rate is the
+    /// natural starting target. Returns `None` when the platform cannot say —
+    /// callers should fall back to a sensible default rather than assuming.
+    fn refresh_rate_millihertz(&self) -> Option<u32> {
+        None
+    }
+
     /// Get the visible bounds for this display, excluding taskbar/dock areas.
     /// This is the usable area where windows can be placed without being obscured.
     /// Defaults to the full display bounds if not overridden.
