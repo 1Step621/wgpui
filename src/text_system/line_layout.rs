@@ -409,8 +409,11 @@ struct FrameCache {
 
 #[derive(Clone, Default)]
 pub(crate) struct LineLayoutIndex {
-    lines_index: usize,
-    wrapped_lines_index: usize,
+    // Visible to the crate so `Window::invalid_reuse_range` can bounds-check a
+    // stored range against `LineLayoutCache::previous_frame_extent` before
+    // `reuse_layouts` slices with it.
+    pub(crate) lines_index: usize,
+    pub(crate) wrapped_lines_index: usize,
 }
 
 /// Approximate heap bytes held by one [`CacheKey`]: the cached text plus its
@@ -482,6 +485,20 @@ impl LineLayoutCache {
         LineLayoutIndex {
             lines_index: frame.used_lines.len(),
             wrapped_lines_index: frame.used_wrapped_lines.len(),
+        }
+    }
+
+    /// Extent of the previous frame's used-layout lists — the arrays that
+    /// [`reuse_layouts`](Self::reuse_layouts) slices.
+    ///
+    /// Callers replaying a stored range must check it against this first: the
+    /// range is a pair of absolute offsets recorded during an earlier frame, and
+    /// nothing in the type system stops it outliving the list it indexes.
+    pub fn previous_frame_extent(&self) -> LineLayoutIndex {
+        let previous_frame = self.previous_frame.lock();
+        LineLayoutIndex {
+            lines_index: previous_frame.used_lines.len(),
+            wrapped_lines_index: previous_frame.used_wrapped_lines.len(),
         }
     }
 

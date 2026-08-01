@@ -391,6 +391,12 @@ impl WindowTextSystem {
         self.line_layout_cache.reuse_layouts(index)
     }
 
+    /// Extent of the previous frame's layout lists. See
+    /// [`LineLayoutCache::previous_frame_extent`].
+    pub(crate) fn previous_frame_layout_extent(&self) -> LineLayoutIndex {
+        self.line_layout_cache.previous_frame_extent()
+    }
+
     pub(crate) fn truncate_layouts(&self, index: LineLayoutIndex) {
         self.line_layout_cache.truncate_layouts(index)
     }
