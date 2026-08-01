@@ -182,7 +182,17 @@ impl SurfaceRegistry {
                     .state
                     .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
                 {
-                    Ok(_) => return true,
+                    Ok(_) => {
+                        // Record consumption here too, not just in
+                        // `swap_ready_display_if_new`. Producers use
+                        // `has_unconsumed_frame` for backpressure, and if this
+                        // path (the fast blit) left the composited generation
+                        // behind, it would look to them like their frames were
+                        // never being consumed.
+                        tb.last_composited_generation
+                            .store(tb.frame_generation.load(Ordering::Acquire), Ordering::Release);
+                        return true;
+                    }
                     Err(updated) => current = updated,
                 }
             }
@@ -388,6 +398,33 @@ impl SurfaceRegistry {
             return true;
         }
         false
+    }
+
+    /// True if the producer has published a frame that the compositor has not
+    /// promoted to `display` yet.
+    ///
+    /// The triple buffer holds exactly **one** `ready` frame: publishing a
+    /// second before the first is consumed makes `swap_rendering_ready` recycle
+    /// the unconsumed buffer as the next render target, discarding that frame's
+    /// pixels. The GPU work, command buffers and per-frame allocations behind it
+    /// are not free, though — so an external render thread that ignores this is
+    /// an unbounded producer feeding a display-rate consumer.
+    ///
+    /// Render threads should use this for backpressure: skip producing while it
+    /// returns true. Prefer a *bounded* wait — the fast-blit consumer
+    /// ([`swap_ready_display`](Self::swap_ready_display)) does not advance the
+    /// composited generation, so this can stay true indefinitely on that path.
+    pub fn has_unconsumed_frame(&self, id: SurfaceId) -> bool {
+        self.surfaces
+            .lock()
+            .unwrap()
+            .get(&id)
+            .is_some_and(|tb| {
+                Self::should_composite_swap(
+                    tb.frame_generation.load(Ordering::Acquire),
+                    tb.last_composited_generation.load(Ordering::Acquire),
+                )
+            })
     }
 
     /// The current producer-swap generation for a surface (increments once per

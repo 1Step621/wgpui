@@ -230,6 +230,10 @@ impl<T: Future> Future for WithTimeout<T> {
     }
 }
 
+/// Await `f`, giving up after `timeout`.
+///
+/// Returns `Ok` with the future's output if it completed in time, or `Err(())`
+/// if the timer fired first.
 #[cfg(all(any(test, feature = "test-support"), not(target_family = "wasm")))]
 pub async fn smol_timeout<F, T>(timeout: Duration, f: F) -> Result<T, ()>
 where

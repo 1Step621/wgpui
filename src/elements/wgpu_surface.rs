@@ -241,6 +241,23 @@ impl WgpuSurfaceHandle {
             .swap_rendering_ready_no_sync(self.inner.surface_id);
     }
 
+    /// True if a frame published by [`present_synced`](Self::present_synced) or
+    /// [`present_synced_silent`](Self::present_synced_silent) has not been
+    /// composited yet.
+    ///
+    /// Use this to apply backpressure in an external render thread. The triple
+    /// buffer keeps only one `ready` frame, so anything produced while this is
+    /// true is discarded — the render is wasted work, but its GPU submission
+    /// and per-frame allocations still cost memory. Without backpressure an
+    /// uncapped render thread outruns the compositor without bound.
+    ///
+    /// Always pair this with a timeout rather than waiting indefinitely: the
+    /// fast-blit presentation path does not advance the composited generation,
+    /// so this can remain true while frames are in fact reaching the screen.
+    pub fn has_unconsumed_frame(&self) -> bool {
+        self.inner.registry.has_unconsumed_frame(self.inner.surface_id)
+    }
+
     /// Current size in device pixels.
     pub fn size(&self) -> (u32, u32) {
         *self.inner.size.lock().unwrap()
