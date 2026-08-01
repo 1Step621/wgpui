@@ -1613,6 +1613,36 @@ impl Window {
         }
     }
 
+    /// Request a frame because externally-rendered buffer contents changed,
+    /// without invalidating any view.
+    ///
+    /// This exists because "the window needs a frame" and "some view produced
+    /// stale output" are different questions that the dirty flag otherwise
+    /// conflates. A `WgpuSurface` producer only answers yes to the first: its
+    /// texture advanced, but nothing in the element tree changed. The scene
+    /// GPUI would rebuild is identical to the last one, and cached views replay
+    /// their primitives — including the surface quad — so the compositor
+    /// promotes the new texture with nothing re-rendered.
+    ///
+    /// The alternatives both over-trigger:
+    /// * [`refresh`](Self::refresh) sets `refreshing`, disabling view caching
+    ///   for the whole window.
+    /// * `cx.notify()` marks the view *and every ancestor* dirty
+    ///   ([`mark_view_dirty`](Self::mark_view_dirty) walks the ancestor path),
+    ///   so a leaf publishing frames re-renders everything above it.
+    ///
+    /// Because `dirty_views` is a set, this composes with genuine invalidation
+    /// in the same frame: whatever else was marked dirty still rebuilds, and a
+    /// buffer refresh neither blocks it nor forces anything extra.
+    ///
+    /// Callers must still ensure the producing view renders when its *layout*
+    /// changes — a view that never prepaints never observes new bounds.
+    pub fn refresh_buffers(&mut self) {
+        if self.invalidator.not_drawing() {
+            self.invalidator.set_dirty(true);
+        }
+    }
+
     /// Close this window.
     pub fn remove_window(&mut self) {
         self.removed = true;
