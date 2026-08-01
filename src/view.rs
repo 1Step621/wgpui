@@ -218,6 +218,8 @@ impl Element for AnyView {
                         && !window.dirty_views.contains(&self.entity_id())
                         && !window.refreshing
                     {
+                        crate::render_stats::count("view cache: reused");
+                        let _t = crate::render_stats::scope("view cache: reuse_prepaint");
                         let prepaint_start = window.prepaint_index();
                         window.reuse_prepaint(element_state.prepaint_range.clone());
                         cx.entities
@@ -227,6 +229,14 @@ impl Element for AnyView {
 
                         return (None, element_state);
                     }
+
+                    // Cache miss. If this fires every frame for a view whose
+                    // content is static, something is calling `cx.notify()` on
+                    // it or on one of its descendants — `mark_view_dirty` walks
+                    // the ancestor path, so a chatty leaf invalidates every
+                    // cached view above it.
+                    crate::render_stats::count("view cache: rebuilt");
+                    let _t = crate::render_stats::scope("view cache: rebuild");
 
                     let refreshing = mem::replace(&mut window.refreshing, true);
                     let prepaint_start = window.prepaint_index();

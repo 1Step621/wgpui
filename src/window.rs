@@ -1223,6 +1223,11 @@ impl Window {
                 if invalidator.is_dirty() || request_frame_options.force_render {
                     #[cfg(feature = "flamegraph")]
                     crate::record_frame_pacing(true);
+                    crate::render_stats::count("window: full draw");
+                    if request_frame_options.force_render {
+                        crate::render_stats::count("window: forced (cache bypassed)");
+                    }
+                    let _t = crate::render_stats::scope("window: draw + present");
                     measure("frame duration", || {
                         handle
                             .update(&mut cx, |_, window, cx| {
@@ -1241,6 +1246,7 @@ impl Window {
                 } else if needs_present {
                     #[cfg(feature = "flamegraph")]
                     crate::record_frame_pacing(false);
+                    crate::render_stats::count("window: present only (no draw)");
                     // Fast path: framebuffer already updated by surface blit, just present it
                     handle
                         .update(&mut cx, |_, window, _| window.present_framebuffer_only())
@@ -1252,6 +1258,12 @@ impl Window {
                         window.complete_frame();
                     })
                     .log_err();
+
+                // Drives the once-per-second dump for `WGPUI_RENDER_STATS=1`.
+                // Ticked per platform frame rather than per draw, so the
+                // "full draw" / "present only" counters above are meaningful
+                // relative to it.
+                crate::render_stats::tick_frame();
             }
         }));
         platform_window.on_resize(Box::new({
