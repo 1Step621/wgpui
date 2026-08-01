@@ -1353,12 +1353,26 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                     return;
                 }
 
-                // Try fast blit path for pending surfaces
-                let mut fast_blit_succeeded = false;
+                // Try fast blit path for pending surfaces.
+                //
+                // `force_render` means "the cached-view fast paths cannot be
+                // trusted this frame, run a full compositor pass". That is only
+                // true when a blit was *attempted and failed* — a failed blit
+                // has already flipped ready->display for the pending surfaces
+                // (see `blit_surfaces_direct`) without getting their pixels onto
+                // the swapchain, so the compositor has to redraw.
+                //
+                // Having no pending surfaces at all is the ordinary case (no
+                // wgpu surfaces in the tree, or a render thread using
+                // `present_synced_silent`) and must NOT force a render:
+                // `about_to_wait` requests a redraw on every event-loop
+                // iteration, so forcing here would run `window.refresh()` — and
+                // thereby discard every cached view — at event-loop rate.
+                let mut force_render = false;
                 if let Some(renderer) = window.0.renderer.get() {
                     let renderer_ref = renderer.borrow();
                     if let Some(pending_surfaces) = renderer_ref.get_pending_surfaces() {
-                        fast_blit_succeeded = renderer_ref.blit_surfaces_direct(&pending_surfaces);
+                        force_render = !renderer_ref.blit_surfaces_direct(&pending_surfaces);
                     }
                 }
 
@@ -1366,8 +1380,7 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                     &window.0.state.callbacks.on_request_frame,
                     |cb| {
                         cb(crate::RequestFrameOptions {
-                            // Only force compositor if fast blit failed
-                            force_render: !fast_blit_succeeded,
+                            force_render,
                             require_presentation: true,
                         });
                     },
