@@ -2040,6 +2040,7 @@ dependencies = [
  "web-time",
  "wgpu",
  "winit",
+ "x11-dl",
 ]
 
 [[package]]

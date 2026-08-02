@@ -15,11 +15,6 @@ use winit::event_loop::EventLoopProxy;
 #[cfg(target_os = "windows")]
 use winit::platform::windows::{BackdropType, WindowExtWindows};
 
-#[cfg(target_os = "linux")]
-// use winit::platform::linux::WindowExtLinux;
-#[cfg(target_os = "windows")]
-use winit::platform::windows::{BackdropType, WindowExtWindows};
-
 #[derive(Clone)]
 pub struct CrossWindow(pub(crate) Arc<CrossWindowInner>);
 
@@ -297,8 +292,68 @@ impl PlatformWindow for CrossWindow {
 
     fn set_app_id(&mut self, app_id: &str) {
         self.0.state.app_id.borrow_mut().replace(app_id.to_owned());
-        // #[cfg(target_os = "linux")]
-        // self.window().set_app_id(Some(app_id));
+
+        // winit 0.30 has no post-creation app-id setter, so the app id must be
+        // applied at window creation (see `CrossPlatform::open_window`). The two
+        // Linux backends differ at runtime:
+        // - X11: WM_CLASS can be updated on a live window via XChangeProperty.
+        // - Wayland: the app id is fixed by the compositor at first commit and
+        //   cannot be changed afterwards through winit.
+        #[cfg(target_os = "linux")]
+        {
+            use raw_window_handle::{
+                HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle,
+            };
+            use x11_dl::xlib::{PropModeReplace, Xlib};
+
+            let (Ok(display_handle), Ok(window_handle)) = (
+                self.window().display_handle(),
+                self.window().window_handle(),
+            ) else {
+                return;
+            };
+            let (RawDisplayHandle::Xlib(display), RawWindowHandle::Xlib(window)) = (
+                display_handle.as_raw(),
+                window_handle.as_raw(),
+            ) else {
+                log::warn!(
+                    "set_app_id on Wayland must be set at window creation; ignoring runtime change"
+                );
+                return;
+            };
+
+            let xlib = match Xlib::open() {
+                Ok(xlib) => xlib,
+                Err(error) => {
+                    log::warn!("failed to load libX11 for set_app_id: {error}");
+                    return;
+                }
+            };
+
+            // SAFETY: the display and window pointers come from winit's raw
+            // window/display handles and stay valid for the lifetime of the
+            // window, which `self` holds while this runs.
+            unsafe {
+                let Some(display) = display.display else {
+                    return;
+                };
+                let display = display.as_ptr().cast::<x11_dl::xlib::Display>();
+                let wm_class_atom = (xlib.XInternAtom)(display, b"WM_CLASS\0".as_ptr().cast(), 0);
+                let string_atom = (xlib.XInternAtom)(display, b"STRING\0".as_ptr().cast(), 0);
+                let class = format!("{app_id}\0{app_id}\0");
+                (xlib.XChangeProperty)(
+                    display,
+                    window.window,
+                    wm_class_atom,
+                    string_atom,
+                    8,
+                    PropModeReplace,
+                    class.as_ptr(),
+                    class.len() as i32,
+                );
+                (xlib.XFlush)(display);
+            }
+        }
     }
 
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {

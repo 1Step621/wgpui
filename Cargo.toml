@@ -151,6 +151,9 @@ objc2 = "0.5"
 objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSImage"] }
 objc2-foundation = { version = "0.2", features = ["NSData"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+x11-dl = "2.21.0"
+
 [dev-dependencies]
 backtrace = "0.3"
 helio = { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "04a38328c6d1329272072ade89d07098737df6b8" }

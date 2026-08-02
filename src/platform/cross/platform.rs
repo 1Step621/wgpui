@@ -564,6 +564,18 @@ impl Platform for CrossPlatform {
                     .with_fullsize_content_view(true);
             }
 
+            // On Linux, winit reads the app id / WM_CLASS from the window
+            // attributes at creation time; there is no post-creation setter in
+            // winit 0.30. Both the Wayland and X11 `with_name` extension traits
+            // write the same `platform_specific.name` field, so a single call
+            // covers both backends. X11 also requires WM_CLASS to be set before
+            // the window is mapped (ICCCM), which this guarantees.
+            #[cfg(target_os = "linux")]
+            if let Some(app_id) = options.app_id.as_ref() {
+                use winit::platform::wayland::WindowAttributesExtWayland;
+                attributes = attributes.with_name(app_id.clone(), app_id.clone());
+            }
+
             let winit_window = event_loop
                 .create_window(attributes)
                 .expect("Failed to create window");

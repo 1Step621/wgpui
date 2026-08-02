@@ -1205,6 +1205,10 @@ pub(crate) struct WindowParams {
     pub tabbing_identifier: Option<String>,
     pub window_decorations: Option<WindowDecorations>,
     pub app_icon: Option<WindowIcon>,
+    /// Consumed by winit on Linux at window creation to set the app id /
+    /// WM_CLASS (see `CrossPlatform::open_window`); unused on other platforms.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub app_id: Option<String>,
 }
 
 /// Represents the status of how a window should be opened.

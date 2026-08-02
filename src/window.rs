@@ -1260,6 +1260,7 @@ impl Window {
                 tabbing_identifier,
                 window_decorations,
                 app_icon,
+                app_id: app_id.clone(),
             },
         )?;
 
