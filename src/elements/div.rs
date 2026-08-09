@@ -2321,6 +2321,7 @@ impl Interactivity {
                                 value: drag_value,
                                 cursor_offset,
                                 cursor_style: drag_cursor_style,
+                                source_window: Some(window.window_handle()),
                             });
                             pending_mouse_down.take();
                             window.refresh();

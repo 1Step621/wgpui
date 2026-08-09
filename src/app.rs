@@ -2624,6 +2624,10 @@ pub struct AnyDrag {
 
     /// The cursor style to use while dragging
     pub cursor_style: Option<CursorStyle>,
+
+    /// The window that initiated this drag, so the drag preview only
+    /// renders in the originating window rather than all windows.
+    pub source_window: Option<AnyWindowHandle>,
 }
 
 /// Contains state associated with a tooltip. You'll only need this struct if you're implementing

@@ -2751,10 +2751,18 @@ impl Window {
             prompt_element = Some(element);
             self.prompt = Some(prompt);
         } else if let Some(active_drag) = cx.active_drag.take() {
-            let mut element = active_drag.view.clone().into_any();
-            let offset = self.mouse_position() - active_drag.cursor_offset;
-            element.prepaint_as_root(offset, AvailableSpace::min_size(), self, cx);
-            active_drag_element = Some(element);
+            // Only render drag preview in the window that originated the drag,
+            // so drag overlays don't leak into other windows.
+            let drag_belongs_to_this_window = active_drag
+                .source_window
+                .map(|h| h == self.window_handle())
+                .unwrap_or(true);
+            if drag_belongs_to_this_window {
+                let mut element = active_drag.view.clone().into_any();
+                let offset = self.mouse_position() - active_drag.cursor_offset;
+                element.prepaint_as_root(offset, AvailableSpace::min_size(), self, cx);
+                active_drag_element = Some(element);
+            }
             cx.active_drag = Some(active_drag);
         } else {
             tooltip_element = self.prepaint_tooltip(cx);
@@ -4683,6 +4691,7 @@ impl Window {
                             view: cx.new(|_| paths).into(),
                             cursor_offset: position,
                             cursor_style: None,
+                            source_window: Some(self.window_handle()),
                         });
                     }
                     PlatformInput::MouseMove(MouseMoveEvent {
