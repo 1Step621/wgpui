@@ -2755,7 +2755,7 @@ impl Window {
             // so drag overlays don't leak into other windows.
             let drag_belongs_to_this_window = active_drag
                 .source_window
-                .map(|h| h == self.window_handle())
+                .map(|h| h == self.handle)
                 .unwrap_or(true);
             if drag_belongs_to_this_window {
                 let mut element = active_drag.view.clone().into_any();
@@ -4691,7 +4691,7 @@ impl Window {
                             view: cx.new(|_| paths).into(),
                             cursor_offset: position,
                             cursor_style: None,
-                            source_window: Some(self.window_handle()),
+                            source_window: Some(self.handle),
                         });
                     }
                     PlatformInput::MouseMove(MouseMoveEvent {
