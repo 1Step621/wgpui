@@ -1311,7 +1311,12 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
             }
 
             winit::event::WindowEvent::Focused(active) => {
-                window.window().set_ime_allowed(active);
+                if !active {
+                    // Disable IME immediately on OS focus loss. Enabling is
+                    // synchronized after a completed frame, once we know a
+                    // focused text input handler is actually installed.
+                    window.window().set_ime_allowed(false);
+                }
                 if active {
                     self.active_window_id.set(Some(window_id));
                 } else if self.active_window_id.get() == Some(window_id) {
@@ -1743,9 +1748,6 @@ fn handle_ime_event(window: &CrossWindow, ime: &winit::event::Ime) {
 
     match ime {
         winit::event::Ime::Enabled => {
-            // Ensure any stale composing state is cleared and the candidate
-            // window is positioned at the current cursor.
-            input_handler.unmark_text();
             input_handler.update_ime_cursor();
         }
         winit::event::Ime::Preedit(text, cursor) => {

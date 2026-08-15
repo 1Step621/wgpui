@@ -484,6 +484,15 @@ impl PlatformWindow for CrossWindow {
         }
     }
 
+    fn completed_frame(&self) {
+        // Input handlers are rebuilt during painting. Synchronize IME here so
+        // temporary take_input_handler() calls during key dispatch do not
+        // spuriously toggle IME state.
+        let ime_allowed =
+            self.window().has_focus() && self.0.state.input_handler.borrow().is_some();
+        self.window().set_ime_allowed(ime_allowed);
+    }
+
     fn create_wgpu_surface(
         &self,
         width: u32,
