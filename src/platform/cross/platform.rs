@@ -868,9 +868,33 @@ impl Platform for CrossPlatform {
             return;
         };
 
-        match Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text)) {
-            Ok(()) => {}
-            Err(error) => log::warn!("failed to write to clipboard: {error}"),
+        #[cfg(target_os = "linux")]
+        {
+            // On Linux the clipboard is served by the process that owns it, so
+            // arboard's server thread must stay alive until the contents have
+            // been handed off to the clipboard manager. Dropping the
+            // `Clipboard` right after writing clears the contents (arboard
+            // warns "Clipboard was dropped very quickly after writing"), so we
+            // keep it alive on a background thread until the next write
+            // replaces it.
+            use arboard::SetExtLinux;
+            std::thread::spawn(move || {
+                if let Err(error) = (|| -> Result<(), arboard::Error> {
+                    let mut clipboard = Clipboard::new()?;
+                    clipboard.set().wait().text(text)?;
+                    Ok(())
+                })() {
+                    log::warn!("failed to write to clipboard: {error}");
+                }
+            });
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            match Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text)) {
+                Ok(()) => {}
+                Err(error) => log::warn!("failed to write to clipboard: {error}"),
+            }
         }
         }
     }
