@@ -37,6 +37,19 @@ pub(crate) struct CrossWindowState {
     pub(crate) is_hovered: Cell<bool>,
     pub(crate) resize_detector: ResizeDetector,
     pub(crate) app_id: RefCell<Option<String>>,
+    /// Monotonically increasing counter incremented for every window event,
+    /// used to decide whether an IME commit is a duplicate of a character that
+    /// was already inserted from a preceding keystroke.
+    pub(crate) input_seq: Cell<u64>,
+    /// The most recent printable character routed to the input handler from a
+    /// keystroke, along with the `input_seq` value at that time.
+    pub(crate) last_key_char: RefCell<Option<(String, u64)>>,
+    /// Number of consecutive empty IME preedits seen since the last non-empty
+    /// one. Used to tell a keystroke that is merely passed through as an IME
+    /// commit (a single empty preedit) apart from a genuine composition (which
+    /// is preceded by more preedit events), so that a genuine commit is never
+    /// mistaken for a duplicate of a keystroke.
+    pub(crate) empty_preedit_streak: Cell<u32>,
 }
 
 #[derive(Default)]
