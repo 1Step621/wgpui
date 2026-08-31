@@ -114,6 +114,7 @@ wasm-bindgen = "0.2"
 web-time = "1.0"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
+clipboard-rs = { version = "0.3.5", default-features = false, features = ["wayland"] }
 device_query = "2.1"
 winit = "0.30.12"
 wgpu = { version = "30", default-features = false, features = [

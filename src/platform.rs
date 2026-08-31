@@ -1541,6 +1541,12 @@ pub enum CursorStyle {
     None,
 }
 
+/// The system clipboard format used for GPUI string metadata.
+///
+/// Native platform backends write this alongside the plain-text representation,
+/// allowing metadata to be read by another process without exposing it as text.
+pub const GPUI_CLIPBOARD_METADATA_FORMAT: &str = "application/x-gpui-clipboard-metadata";
+
 /// A clipboard item that should be copied to the clipboard
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClipboardItem {
@@ -1566,7 +1572,8 @@ impl ClipboardItem {
         }
     }
 
-    /// Create a new ClipboardItem::String with the given text and associated metadata
+    /// Create a string with metadata stored in [`GPUI_CLIPBOARD_METADATA_FORMAT`]
+    /// alongside its plain-text system clipboard representation.
     pub fn new_string_with_metadata(text: String, metadata: String) -> Self {
         Self {
             entries: vec![ClipboardEntry::String(ClipboardString {
@@ -1576,7 +1583,8 @@ impl ClipboardItem {
         }
     }
 
-    /// Create a new ClipboardItem::String with the given text and associated metadata
+    /// Create a string with JSON metadata stored in
+    /// [`GPUI_CLIPBOARD_METADATA_FORMAT`] alongside its plain-text representation.
     pub fn new_string_with_json_metadata<T: Serialize>(text: String, metadata: T) -> Self {
         Self {
             entries: vec![ClipboardEntry::String(
@@ -1621,7 +1629,7 @@ impl ClipboardItem {
         }
     }
 
-    /// If this item is one ClipboardEntry::String, returns its metadata.
+    /// If this item is one string entry, return its custom clipboard metadata.
     pub fn metadata(&self) -> Option<&String> {
         match self.entries().first() {
             Some(ClipboardEntry::String(clipboard_string)) if self.entries.len() == 1 => {

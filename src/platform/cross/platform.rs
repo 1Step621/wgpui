@@ -30,7 +30,9 @@ fn device_button_to_gpui(button: u32) -> Option<MouseButton> {
 }
 use anyhow::Result;
 #[cfg(not(target_family = "wasm"))]
-use arboard::Clipboard;
+use arboard::Clipboard as ArboardClipboard;
+#[cfg(not(target_family = "wasm"))]
+use clipboard_rs::{Clipboard as _, ClipboardContent, ClipboardContext, ContentFormat};
 use collections::FxHashMap;
 use std::{
     cell::{Cell, RefCell},
@@ -76,7 +78,30 @@ pub(crate) struct CrossPlatform {
     menus: RefCell<Option<Vec<crate::OwnedMenu>>>,
     dock_menu: RefCell<Vec<crate::OwnedMenuItem>>,
     #[cfg(not(target_family = "wasm"))]
+    clipboard: Option<ClipboardContext>,
+    #[cfg(not(target_family = "wasm"))]
     single_instance: RefCell<Option<SingleInstanceRuntime>>,
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn system_clipboard_contents(item: &crate::ClipboardItem) -> Option<Vec<ClipboardContent>> {
+    let text = item.text()?;
+    let mut contents = vec![ClipboardContent::Text(text)];
+    if let Some(metadata) = item.metadata() {
+        contents.push(ClipboardContent::Other(
+            crate::GPUI_CLIPBOARD_METADATA_FORMAT.to_owned(),
+            metadata.as_bytes().to_vec(),
+        ));
+    }
+    Some(contents)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn clipboard_item_with_metadata(text: String, metadata: Option<String>) -> crate::ClipboardItem {
+    match metadata {
+        Some(metadata) => crate::ClipboardItem::new_string_with_metadata(text, metadata),
+        None => crate::ClipboardItem::new_string(text),
+    }
 }
 
 #[derive(Default)]
@@ -141,6 +166,14 @@ impl CrossPlatform {
         };
 
         let (main_tx, main_rx) = PriorityQueueReceiver::new();
+        #[cfg(not(target_family = "wasm"))]
+        let clipboard = match ClipboardContext::new() {
+            Ok(clipboard) => Some(clipboard),
+            Err(error) => {
+                log::warn!("failed to initialize custom-format clipboard support: {error}");
+                None
+            }
+        };
         let mut event_loop =
             winit::event_loop::EventLoop::<CrossEvent>::with_user_event().build()?;
         event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
@@ -164,6 +197,8 @@ impl CrossPlatform {
             callbacks: Rc::new(PlatformCallbacks::default()),
             menus: RefCell::new(None),
             dock_menu: RefCell::new(Vec::new()),
+            #[cfg(not(target_family = "wasm"))]
+            clipboard,
             #[cfg(not(target_family = "wasm"))]
             single_instance: RefCell::new(None),
         })
@@ -863,55 +898,92 @@ impl Platform for CrossPlatform {
     fn write_to_clipboard(&self, item: crate::ClipboardItem) {
         #[cfg(not(target_family = "wasm"))]
         {
-        let Some(text) = item.text() else {
-            log::warn!("write_to_clipboard currently supports text entries only on this platform");
-            return;
-        };
+            let Some(contents) = system_clipboard_contents(&item) else {
+                log::warn!(
+                    "write_to_clipboard currently supports text entries only on this platform"
+                );
+                return;
+            };
+            let Some(text) = item.text() else {
+                return;
+            };
+            if let Some(clipboard) = &self.clipboard {
+                match clipboard.set(contents) {
+                    Ok(()) => return,
+                    Err(error) => {
+                        log::warn!(
+                            "failed to write custom-format clipboard contents; falling back to plain text: {error}"
+                        );
+                    }
+                }
+            }
 
-        #[cfg(target_os = "linux")]
-        {
-            // On Linux the clipboard is served by the process that owns it, so
-            // arboard's server thread must stay alive until the contents have
-            // been handed off to the clipboard manager. Dropping the
-            // `Clipboard` right after writing clears the contents (arboard
-            // warns "Clipboard was dropped very quickly after writing"), so we
-            // keep it alive on a background thread until the next write
-            // replaces it.
-            use arboard::SetExtLinux;
+            #[cfg(target_os = "linux")]
             std::thread::spawn(move || {
-                if let Err(error) = (|| -> Result<(), arboard::Error> {
-                    let mut clipboard = Clipboard::new()?;
+                use arboard::SetExtLinux as _;
+                let result = (|| -> Result<(), arboard::Error> {
+                    let mut clipboard = ArboardClipboard::new()?;
                     clipboard.set().wait().text(text)?;
                     Ok(())
-                })() {
-                    log::warn!("failed to write to clipboard: {error}");
+                })();
+                if let Err(error) = result {
+                    log::warn!("failed to write plain-text clipboard fallback: {error}");
                 }
             });
-        }
 
-        #[cfg(not(target_os = "linux"))]
-        {
-            match Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text)) {
+            #[cfg(not(target_os = "linux"))]
+            match ArboardClipboard::new().and_then(|mut clipboard| clipboard.set_text(text)) {
                 Ok(()) => {}
-                Err(error) => log::warn!("failed to write to clipboard: {error}"),
+                Err(error) => log::warn!("failed to write plain-text clipboard fallback: {error}"),
             }
-        }
         }
     }
 
     fn read_from_clipboard(&self) -> Option<crate::ClipboardItem> {
         #[cfg(not(target_family = "wasm"))]
         {
-        match Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
-            Ok(text) => Some(crate::ClipboardItem::new_string(text)),
-            Err(error) => {
-                log::warn!("failed to read from clipboard: {error}");
-                None
+            if let Some(clipboard) = &self.clipboard {
+                let text = match clipboard.get_text() {
+                    Ok(text) => text,
+                    Err(error) => {
+                        log::warn!("failed to read clipboard text: {error}");
+                        return None;
+                    }
+                };
+                let metadata_format =
+                    ContentFormat::Other(crate::GPUI_CLIPBOARD_METADATA_FORMAT.to_owned());
+                let metadata = if clipboard.has(metadata_format) {
+                    match clipboard.get_buffer(crate::GPUI_CLIPBOARD_METADATA_FORMAT) {
+                        Ok(metadata) => match String::from_utf8(metadata) {
+                            Ok(metadata) => Some(metadata),
+                            Err(error) => {
+                                log::warn!("clipboard metadata is not valid UTF-8: {error}");
+                                None
+                            }
+                        },
+                        Err(error) => {
+                            log::warn!("failed to read clipboard metadata: {error}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                return Some(clipboard_item_with_metadata(text, metadata));
+            }
+
+            match ArboardClipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
+                Ok(text) => Some(crate::ClipboardItem::new_string(text)),
+                Err(error) => {
+                    log::warn!("failed to read plain-text clipboard fallback: {error}");
+                    None
+                }
             }
         }
-        }
         #[cfg(target_family = "wasm")]
-        { None }
+        {
+            None
+        }
     }
 
     fn write_credentials(
@@ -2156,8 +2228,11 @@ fn winit_key_to_keystroke(
 
 #[cfg(test)]
 mod tests {
-    use super::winit_key_to_keystroke;
-    use crate::Modifiers;
+    use super::{
+        clipboard_item_with_metadata, system_clipboard_contents, winit_key_to_keystroke,
+    };
+    use crate::{ClipboardItem, Modifiers};
+    use clipboard_rs::ClipboardContent;
     use winit::keyboard::{Key, NamedKey};
 
     #[test]
@@ -2184,6 +2259,47 @@ mod tests {
 
         assert_eq!(keystroke.key, "space");
         assert_eq!(keystroke.key_char, None);
+    }
+
+    #[test]
+    fn clipboard_metadata_uses_a_custom_system_format() {
+        let item = ClipboardItem::new_string_with_metadata(
+            "clipboard text".to_owned(),
+            "application metadata".to_owned(),
+        );
+        let contents = system_clipboard_contents(&item).expect("text item should be supported");
+
+        assert_eq!(contents.len(), 2);
+        assert!(matches!(
+            &contents[0],
+            ClipboardContent::Text(text) if text == "clipboard text"
+        ));
+        assert!(matches!(
+            &contents[1],
+            ClipboardContent::Other(format, metadata)
+                if format == crate::GPUI_CLIPBOARD_METADATA_FORMAT
+                    && metadata == b"application metadata"
+        ));
+
+        let restored = clipboard_item_with_metadata(
+            "clipboard text".to_owned(),
+            Some("application metadata".to_owned()),
+        );
+        assert_eq!(restored.text().as_deref(), Some("clipboard text"));
+        assert_eq!(restored.metadata().map(String::as_str), Some("application metadata"));
+    }
+
+    #[test]
+    fn plain_clipboard_text_does_not_offer_the_metadata_format() {
+        let item = ClipboardItem::new_string("plain".to_owned());
+        let contents = system_clipboard_contents(&item)
+            .expect("text item should be supported");
+
+        assert_eq!(contents.len(), 1);
+        assert!(matches!(
+            &contents[0],
+            ClipboardContent::Text(text) if text == "plain"
+        ));
     }
 }
 
