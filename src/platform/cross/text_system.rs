@@ -512,7 +512,7 @@ impl CosmicTextSystemState {
     fn layout_line(&mut self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
         let mut attrs_list = AttrsList::new(&Attrs::new());
         let mut offs = 0;
-        let cjk_families = crate::cjk_font_fallbacks(text, self.font_system.locale());
+        let cjk_families = crate::cjk_font_fallbacks(self.font_system.locale());
         for run in font_runs {
             let loaded_font = self.loaded_font(run.font_id);
             let font = self.font_system.db().face(loaded_font.font.id()).unwrap();
@@ -542,20 +542,7 @@ impl CosmicTextSystemState {
                         .as_ref()
                         .map_or(&[][..], |fallbacks| fallbacks.fallback_list());
                     let automatic = if grapheme.chars().any(crate::text_system::is_cjk) {
-                        let script_families =
-                            crate::cjk_font_fallbacks(grapheme, self.font_system.locale());
-                        // Han and punctuation use the language hint from the surrounding line.
-                        if grapheme.chars().any(|character| {
-                            use unicode_script::{Script, UnicodeScript};
-                            matches!(
-                                character.script(),
-                                Script::Hiragana | Script::Katakana | Script::Hangul
-                            )
-                        }) {
-                            script_families
-                        } else {
-                            cjk_families
-                        }
+                        cjk_families
                     } else {
                         &[]
                     };

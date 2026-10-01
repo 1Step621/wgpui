@@ -32,7 +32,7 @@ pub fn new_font_system() -> FontSystem {
         .common_fallback()
         .iter()
         .copied()
-        .chain(cjk_font_fallbacks("", &locale).iter().copied())
+        .chain(cjk_font_fallbacks(&locale).iter().copied())
         .collect();
     FontSystem::new_with_locale_and_db_and_fallback(locale, database, RegionalFallback { common })
 }
@@ -173,32 +173,9 @@ impl CjkRegion {
     }
 }
 
-/// Returns regional CJK families, using kana or Hangul as a language hint for otherwise ambiguous Han.
-/// Han-only text follows the locale; a Unicode Han character does not identify its language.
-pub fn cjk_font_fallbacks(text: &str, locale: &str) -> &'static [&'static str] {
-    let mut has_kana = false;
-    let mut has_hangul = false;
-    for character in text.chars() {
-        match character.script() {
-            Script::Hiragana | Script::Katakana => has_kana = true,
-            Script::Hangul => has_hangul = true,
-            Script::Common if is_cjk(character) => {
-                let extension = character.script_extension();
-                if !extension.is_common() && !extension.is_inherited() {
-                    has_kana |= extension
-                        .iter()
-                        .all(|script| matches!(script, Script::Hiragana | Script::Katakana));
-                }
-            }
-            _ => {}
-        }
-    }
-    match (has_kana, has_hangul) {
-        (true, false) => CjkRegion::Japanese,
-        (false, true) => CjkRegion::Korean,
-        _ => CjkRegion::from_locale(locale),
-    }
-    .families()
+/// Returns regional CJK families selected solely from the locale.
+pub fn cjk_font_fallbacks(locale: &str) -> &'static [&'static str] {
+    CjkRegion::from_locale(locale).families()
 }
 
 pub(crate) fn is_cjk(character: char) -> bool {
@@ -240,9 +217,11 @@ impl Fallback for RegionalFallback {
 
     fn script_fallback(&self, script: Script, locale: &str) -> &[&'static str] {
         match script {
-            Script::Han | Script::Bopomofo => CjkRegion::from_locale(locale).families(),
-            Script::Hiragana | Script::Katakana => CjkRegion::Japanese.families(),
-            Script::Hangul => CjkRegion::Korean.families(),
+            Script::Han
+            | Script::Bopomofo
+            | Script::Hiragana
+            | Script::Katakana
+            | Script::Hangul => cjk_font_fallbacks(locale),
             _ => PlatformFallback.script_fallback(script, locale),
         }
     }
