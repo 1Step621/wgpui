@@ -63,7 +63,14 @@ struct LoadedFont {
 
 impl CosmicTextSystem {
     pub(crate) fn new() -> Self {
-        let mut font_system = crate::new_font_system();
+        Self::with_locale(None)
+    }
+
+    pub(crate) fn with_locale(locale: Option<String>) -> Self {
+        let mut font_system = match locale {
+            Some(locale) => crate::new_font_system_with_locale(locale),
+            None => crate::new_font_system(),
+        };
 
         // On WASM there are no system fonts, so bundle a basic font.
         #[cfg(target_family = "wasm")]

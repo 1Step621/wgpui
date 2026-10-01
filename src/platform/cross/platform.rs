@@ -149,11 +149,11 @@ struct ClickState {
 }
 
 impl CrossPlatform {
-    pub fn new(wgpu_options: WgpuOptions) -> Result<Self> {
-        Self::new_impl(wgpu_options)
+    pub fn new(wgpu_options: WgpuOptions, locale: Option<String>) -> Result<Self> {
+        Self::new_impl(wgpu_options, locale)
     }
 
-    fn new_impl(wgpu_options: WgpuOptions) -> Result<Self> {
+    fn new_impl(wgpu_options: WgpuOptions, locale: Option<String>) -> Result<Self> {
         let wgpu_context: Arc<std::sync::OnceLock<Arc<WgpuContext>>> = match WgpuContext::new(&wgpu_options) {
             Ok(ctx) => {
                 let lock = Arc::new(std::sync::OnceLock::new());
@@ -183,7 +183,7 @@ impl CrossPlatform {
         let background_executor = BackgroundExecutor::new(dispatcher.clone());
         let foreground_executor = ForegroundExecutor::new(dispatcher.clone());
 
-        let text_system = Arc::new(CosmicTextSystem::new());
+        let text_system = Arc::new(CosmicTextSystem::with_locale(locale));
 
         Ok(Self {
             background_executor,

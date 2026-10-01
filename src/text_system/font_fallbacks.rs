@@ -25,6 +25,12 @@ impl FontFallbacks {
 /// Creates a font system with installed fonts, system generic families and regional CJK fallbacks.
 pub fn new_font_system() -> FontSystem {
     let locale = sys_locale::get_locale().unwrap_or_else(|| "en-US".into());
+    new_font_system_with_locale(locale)
+}
+
+/// Creates a font system using the given locale for regional font fallbacks.
+pub fn new_font_system_with_locale(locale: impl Into<String>) -> FontSystem {
+    let locale = locale.into();
     let mut database = fontdb::Database::new();
     database.load_system_fonts();
     configure_generic_families(&mut database);
