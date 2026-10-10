@@ -1,3 +1,4 @@
+use crate::util::ResultExt;
 use crate::{
     ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
     HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
@@ -15,7 +16,6 @@ use std::{
     rc::Rc,
     sync::Arc,
 };
-use crate::util::ResultExt;
 
 impl Element for &'static str {
     type RequestLayoutState = TextLayout;
@@ -317,6 +317,7 @@ struct TextLayoutInner {
     lines: SmallVec<[WrappedLine; 1]>,
     line_height: Pixels,
     wrap_width: Option<Pixels>,
+    truncate_width: Option<Pixels>,
     size: Option<Size<Pixels>>,
     bounds: Option<Bounds<Pixels>>,
 }
@@ -371,10 +372,11 @@ impl TextLayout {
                     };
 
                 if let Some(text_layout) = element_state.0.borrow().as_ref()
-                    && text_layout.size.is_some()
-                    && (wrap_width.is_none() || wrap_width == text_layout.wrap_width)
+                    && let Some(size) = text_layout.size
+                    && wrap_width == text_layout.wrap_width
+                    && truncate_width == text_layout.truncate_width
                 {
-                    return text_layout.size.unwrap();
+                    return size;
                 }
 
                 let mut line_wrapper = cx.text_system().line_wrapper(
@@ -410,6 +412,7 @@ impl TextLayout {
                         len: 0,
                         line_height,
                         wrap_width,
+                        truncate_width,
                         size: Some(Size::default()),
                         bounds: None,
                     });
@@ -428,6 +431,7 @@ impl TextLayout {
                     len,
                     line_height,
                     wrap_width,
+                    truncate_width,
                     size: Some(size),
                     bounds: None,
                 });
