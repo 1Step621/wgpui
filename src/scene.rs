@@ -1245,6 +1245,33 @@ impl Primitive {
     }
 }
 
+/// Where `primitive` lands in the renderer's draw stream relative to others
+/// of the same scope: by draw order, then by kind at an equal order (the
+/// batch iterator's rule — every quad of an order draws before that order's
+/// paths, text and surfaces). Equal keys draw in paint order.
+///
+/// Paint order alone is *not* draw order: inside a clip group (a text line,
+/// a scrollbar) everything shares one order, so a quad painted after text
+/// still draws beneath it. Anything that reasons about what is on top (the
+/// occlusion pass) must use this key.
+pub(crate) fn draw_key(primitive: &Primitive) -> (DrawOrder, PrimitiveKind) {
+    let kind = match primitive {
+        Primitive::Shadow(_) => PrimitiveKind::Shadow,
+        Primitive::Quad(_) => PrimitiveKind::Quad,
+        Primitive::Path(_) => PrimitiveKind::Path,
+        Primitive::Underline(_) => PrimitiveKind::Underline,
+        Primitive::MonochromeSprite(_) => PrimitiveKind::MonochromeSprite,
+        Primitive::PolychromeSprite(_) => PrimitiveKind::PolychromeSprite,
+        Primitive::Surface(_) => PrimitiveKind::Surface,
+        Primitive::BackdropFilter(_) => PrimitiveKind::BackdropFilter,
+        Primitive::FilterBoundary(boundary) if boundary.is_start => {
+            PrimitiveKind::FilterBoundaryStart
+        }
+        Primitive::FilterBoundary(_) => PrimitiveKind::FilterBoundaryEnd,
+    };
+    (primitive_order(primitive), kind)
+}
+
 fn primitive_order(primitive: &Primitive) -> DrawOrder {
     match primitive {
         Primitive::Shadow(shadow) => shadow.order,
