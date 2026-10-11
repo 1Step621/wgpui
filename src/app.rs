@@ -152,7 +152,9 @@ impl Application {
         Self::with_wgpu_options_and_locale(WgpuOptions::default(), Some(locale.into()))
     }
 
-    fn with_wgpu_options_and_locale(options: WgpuOptions, locale: Option<String>) -> Self {
+    /// Builds an app with custom WGPU options and a locale for regional font fallbacks.
+    /// If no locale is provided, the system locale is used.
+    pub fn with_wgpu_options_and_locale(options: WgpuOptions, locale: Option<String>) -> Self {
         #[cfg(any(test, feature = "test-support"))]
         log::info!("GPUI was compiled in test mode");
 
