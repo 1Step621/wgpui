@@ -7,7 +7,7 @@ mod h_list;
 mod image_cache;
 mod img;
 mod list;
-pub(crate) mod scroll_buffer;
+pub mod scroll_buffer;
 mod smooth_scroll;
 mod surface;
 mod svg;
@@ -32,3 +32,6 @@ pub use text::*;
 pub use uniform_list::*;
 pub use virtual_list::*;
 pub use wgpu_surface::*;
+pub use scroll_buffer::{
+    inflate_for_buffer, prepare_scroll_buffer, with_buffer_mask, ScrollBufferFrame,
+};
