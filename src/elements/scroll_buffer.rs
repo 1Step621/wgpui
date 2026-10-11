@@ -19,6 +19,16 @@
 //! `.overflow_scroll()` div under its own buffered keyed layer skips its
 //! whole child prepaint on shift frames.
 //!
+//! **Custom elements.** Anything that draws scrolled content can use the same
+//! protocol as the built-in lists: put the element inside a div with
+//! `.layer_keyed(<what the content depends on, excluding scroll>)` followed by
+//! `.layer_with_policy(LayerPolicy { overdraw_margin, .. })`, fill that div,
+//! and from `prepaint` call [`prepare_scroll_buffer`] with the element's
+//! bounds and current scroll. On [`ScrollBufferFrame::Skip`] do nothing (the
+//! layer composites its texture shifted); on [`ScrollBufferFrame::Buffer`]
+//! draw `bounds` inflated by the margin under [`with_buffer_mask`]; on
+//! [`ScrollBufferFrame::Viewport`] draw the visible part only.
+//!
 //! **This only bounds the cost of a *shift* frame, not a *refill* frame, and
 //! the difference matters a great deal for plain (non-virtualized) divs.**
 //! `ScrollBufferFrame::Buffer`/`Viewport` say "lay out the buffer range," but
@@ -39,9 +49,9 @@
 
 use crate::{LayerKey, Pixels, Point, Size, point, px};
 
-/// What a list's `prepaint` should do this frame.
+/// What a buffered element's `prepaint` should do this frame.
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum ScrollBufferFrame {
+pub enum ScrollBufferFrame {
     /// The enclosing layer composites from its texture, shifted by the
     /// content offset already recorded on the layer: skip per-item layout
     /// entirely. Hitboxes and the scroll listener stay alive through the
@@ -50,7 +60,10 @@ pub(crate) enum ScrollBufferFrame {
     /// Lay out items across the full buffer range (`viewport + 2 × margin`)
     /// and paint them under the buffer's content mask. The layer's texture
     /// is being (re)rendered this frame.
-    Buffer { margin: Size<Pixels> },
+    Buffer {
+        /// How far past the viewport, on each side, to draw.
+        margin: Size<Pixels>,
+    },
     /// No usable buffer this frame; lay out the viewport range as before.
     Viewport,
 }
@@ -61,7 +74,7 @@ pub(crate) enum ScrollBufferFrame {
 /// Must be called from `prepaint`, inside the layer's hitbox scope, after the
 /// scroll offset is final: the prediction it makes about the layer's paint
 /// reads the same frame state the paint-time decision will.
-pub(crate) fn prepare_scroll_buffer(
+pub fn prepare_scroll_buffer(
     window: &mut crate::Window,
     viewport: crate::Bounds<Pixels>,
     scroll: Point<Pixels>,
@@ -131,9 +144,9 @@ pub(crate) fn prepare_scroll_buffer(
     }
 }
 
-/// The item range covering content-space `from..to`, via the same
-/// partition-point lookup the list uses for its viewport range.
-pub(crate) fn inflate_for_buffer(
+/// The bounds a [`ScrollBufferFrame::Buffer`] frame draws into: `bounds`
+/// grown by `margin` on every side.
+pub fn inflate_for_buffer(
     bounds: crate::Bounds<Pixels>,
     margin: Size<Pixels>,
 ) -> crate::Bounds<Pixels> {
@@ -142,7 +155,7 @@ pub(crate) fn inflate_for_buffer(
 
 /// Record the full buffer in both prepaint and paint. The texture composite
 /// clips it back to the viewport; the non-rasterized path must keep its mask.
-pub(crate) fn with_buffer_mask<R>(
+pub fn with_buffer_mask<R>(
     window: &mut crate::Window,
     mask: Option<crate::ContentMask<Pixels>>,
     f: impl FnOnce(&mut crate::Window) -> R,
