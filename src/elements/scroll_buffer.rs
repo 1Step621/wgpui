@@ -26,7 +26,8 @@
 //! and from `prepaint` call [`prepare_scroll_buffer`] with the element's
 //! bounds and current scroll. On [`ScrollBufferFrame::Skip`] do nothing (the
 //! layer composites its texture shifted); on [`ScrollBufferFrame::Buffer`]
-//! draw `bounds` inflated by the margin under [`with_buffer_mask`]; on
+//! draw `bounds` inflated by the margin under [`with_buffer_mask`] (called
+//! with the element's own bounds as the current content mask; see its docs); on
 //! [`ScrollBufferFrame::Viewport`] draw the visible part only.
 //!
 //! **This only bounds the cost of a *shift* frame, not a *refill* frame, and
@@ -155,6 +156,14 @@ pub fn inflate_for_buffer(
 
 /// Record the full buffer in both prepaint and paint. The texture composite
 /// clips it back to the viewport; the non-rasterized path must keep its mask.
+///
+/// `mask` (the buffer: the viewport grown by the margin) *replaces* the
+/// current content mask for recording, while what is shown on screen this
+/// frame stays clipped to the content mask in force when this is called.
+/// So call it with the element's own viewport as the current mask — inside
+/// its overflow clip, or after `window.with_content_mask(Some(bounds))` — and
+/// do **not** widen the mask first: a widened current mask becomes the
+/// on-screen clip and the margin rows draw outside the element.
 pub fn with_buffer_mask<R>(
     window: &mut crate::Window,
     mask: Option<crate::ContentMask<Pixels>>,

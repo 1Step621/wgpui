@@ -384,7 +384,25 @@ fn in_overdraw_band(
     intersects_buffer && !inside_viewport
 }
 
-/// One backward sweep over the layer's own primitives, from topmost paint
+/// The layer's primitive items in the order the renderer draws them, bottom
+/// first (see [`crate::scene::draw_key`]). The occlusion pass walks this, not
+/// paint order: a quad painted after text in the same clip group draws
+/// beneath it, and treating it as on top culled content that was visible.
+fn draw_sequence(items: &[LayerItem]) -> Vec<usize> {
+    let mut sequence: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| matches!(item, LayerItem::Primitive(_)).then_some(index))
+        .collect();
+    // Stable: equal keys keep paint order, as the renderer's sorts do.
+    sequence.sort_by_key(|&index| match &items[index] {
+        LayerItem::Primitive(primitive) => crate::scene::draw_key(primitive),
+        _ => unreachable!("filtered to primitives"),
+    });
+    sequence
+}
+
+/// One backward sweep over the layer's own primitives, from topmost draw
 /// order down: every opaque quad met joins the running occluder set before
 /// anything beneath it is tested against it.
 fn compute_keep_mask(
@@ -400,7 +418,8 @@ fn compute_keep_mask(
     // Greater than zero while the backward walk is inside a filter group.
     let mut group_depth: usize = 0;
 
-    for (index, item) in items.iter().enumerate().rev() {
+    for &index in draw_sequence(items).iter().rev() {
+        let item = &items[index];
         let LayerItem::Primitive(primitive) = item else {
             continue;
         };
@@ -456,13 +475,21 @@ fn compute_keep_mask_independently(
     items: &[LayerItem],
     overdraw: Option<(Bounds<ScaledPixels>, Bounds<ScaledPixels>)>,
 ) -> Vec<bool> {
-    /// Filter-group nesting depth at `through`, counting boundaries up to and
-    /// including that position. A non-boundary primitive sits inside a group
-    /// exactly when this is greater than zero.
-    fn group_depth_at(items: &[LayerItem], through: usize) -> usize {
+    // Everything below reasons in draw order: `sequence[position]` is the
+    // item drawn at that position, bottom first.
+    let sequence = draw_sequence(items);
+    let primitive_at = |position: usize| match &items[sequence[position]] {
+        LayerItem::Primitive(primitive) => primitive,
+        _ => unreachable!("draw_sequence holds primitives only"),
+    };
+
+    /// Filter-group nesting depth at draw position `through`, counting
+    /// boundaries up to and including it. A non-boundary primitive sits
+    /// inside a group exactly when this is greater than zero.
+    fn group_depth_at<'a>(primitives: impl Iterator<Item = &'a Primitive>) -> usize {
         let mut depth = 0usize;
-        for item in &items[..=through] {
-            if let LayerItem::Primitive(Primitive::FilterBoundary(boundary)) = item {
+        for primitive in primitives {
+            if let Primitive::FilterBoundary(boundary) = primitive {
                 if boundary.is_start {
                     depth += 1;
                 } else {
@@ -473,47 +500,39 @@ fn compute_keep_mask_independently(
         depth
     }
 
-    /// Whether the primitive at `at` sits inside a filter group or intersects
-    /// a backdrop/filter-group poison zone declared above it.
-    fn protected_from_above(
-        items: &[LayerItem],
-        at: usize,
-        visible: &Bounds<ScaledPixels>,
-    ) -> bool {
-        if group_depth_at(items, at) > 0 {
+    // Whether the primitive at draw position `at` sits inside a filter group
+    // or intersects a backdrop/filter-group poison zone drawn above it.
+    let protected_from_above = |at: usize, visible: &Bounds<ScaledPixels>| -> bool {
+        if group_depth_at((0..=at).map(primitive_at)) > 0 {
             return true;
         }
-        items[at + 1..].iter().any(|item| match item {
-            LayerItem::Primitive(Primitive::BackdropFilter(filter)) => {
+        (at + 1..sequence.len()).map(primitive_at).any(|primitive| match primitive {
+            Primitive::BackdropFilter(filter) => {
                 intersects_any(visible, &[filter.bounds.dilate(filter.blur_radius)])
             }
-            LayerItem::Primitive(Primitive::FilterBoundary(boundary)) => {
+            Primitive::FilterBoundary(boundary) => {
                 boundary.is_start
                     && intersects_any(visible, &[boundary.bounds.dilate(boundary.blur_radius)])
             }
             _ => false,
         })
-    }
+    };
 
     let mut keep = vec![true; items.len()];
-    for (index, item) in items.iter().enumerate() {
-        let LayerItem::Primitive(primitive) = item else {
-            continue;
-        };
+    for position in 0..sequence.len() {
+        let primitive = primitive_at(position);
         let Some(visible) = cullee_visible_bounds(primitive) else {
             continue;
         };
-        if protected_from_above(items, index, &visible)
-            || in_overdraw_band(&visible, &overdraw)
-        {
+        if protected_from_above(position, &visible) || in_overdraw_band(&visible, &overdraw) {
             // Poisoned and overdraw content always emits; no occluder set can
             // change that.
             continue;
         }
 
         let mut occluders: Vec<Bounds<ScaledPixels>> = Vec::new();
-        for probe_index in index + 1..items.len() {
-            let LayerItem::Primitive(Primitive::Quad(quad)) = &items[probe_index] else {
+        for probe in position + 1..sequence.len() {
+            let Primitive::Quad(quad) = primitive_at(probe) else {
                 continue;
             };
             let Some(region) = quad_opaque_region(quad) else {
@@ -525,15 +544,14 @@ fn compute_keep_mask_independently(
             let Some(probe_bounds) = cullee_visible_bounds(&Primitive::Quad(*quad)) else {
                 continue;
             };
-            if protected_from_above(items, probe_index, &probe_bounds)
-                || in_overdraw_band(&probe_bounds, &overdraw)
+            if protected_from_above(probe, &probe_bounds) || in_overdraw_band(&probe_bounds, &overdraw)
             {
                 continue;
             }
             occluders.push(region);
         }
 
-        keep[index] = !fully_covered(visible, &occluders);
+        keep[sequence[position]] = !fully_covered(visible, &occluders);
     }
     keep
 }
@@ -906,7 +924,7 @@ mod tests {
             background.solid.a = 1.0;
         }
         crate::scene::Quad {
-            order: 0,
+            order: next_order(),
             border_style: BorderStyle::Solid,
             bounds,
             content_mask: unbounded_mask(),
@@ -923,6 +941,44 @@ mod tests {
         }
     }
 
+    /// Increasing draw orders in construction order: what a real scene gives
+    /// primitives painted one above another. (Placeholder zeros would let the
+    /// draw-order sort move filter boundaries away from their content.)
+    fn next_order() -> u32 {
+        thread_local!(static NEXT: std::cell::Cell<u32> = const { std::cell::Cell::new(1) });
+        NEXT.with(|next| {
+            let order = next.get();
+            next.set(order + 1);
+            order
+        })
+    }
+
+    #[test]
+    fn a_quad_sharing_an_order_with_later_kinds_draws_beneath_them() {
+        // Inside a clip group (a text line, a scrollbar) everything shares one
+        // order and draws by kind: quads before paths and text. An opaque quad
+        // painted *after* a path at that order still draws underneath it, so
+        // it must not cull the path. Paint-order culling did, and the content
+        // vanished on record frames only.
+        let mut path = crate::Path::new(point(px(10.), px(10.)));
+        path.line_to(point(px(50.), px(10.)));
+        path.line_to(point(px(30.), px(50.)));
+        let mut path = path.scale(1.0);
+        path.order = 7;
+        path.content_mask = unbounded_mask();
+        let mut quad = scene_quad(scaled_bounds(0., 0., 100., 100.), true);
+        quad.order = 7;
+        let items = vec![
+            LayerItem::Primitive(Primitive::Path(path)),
+            LayerItem::Primitive(Primitive::Quad(quad)),
+        ];
+        assert_eq!(
+            cull_covered_instances(items).len(),
+            2,
+            "the path draws above the quad and must be kept"
+        );
+    }
+
     fn cullee(bounds: Bounds<ScaledPixels>) -> LayerItem {
         // A translucent quad is a pure cullee: it can be covered but never
         // covers.
@@ -931,7 +987,7 @@ mod tests {
 
     fn filter_boundary(bounds: Bounds<ScaledPixels>, blur: f32, is_start: bool) -> LayerItem {
         LayerItem::Primitive(Primitive::FilterBoundary(crate::scene::FilterBoundary {
-            order: 0,
+            order: next_order(),
             bounds,
             content_mask: unbounded_mask(),
             corner_radii: Default::default(),
@@ -943,7 +999,7 @@ mod tests {
 
     fn backdrop_filter(bounds: Bounds<ScaledPixels>, blur: f32) -> LayerItem {
         LayerItem::Primitive(Primitive::BackdropFilter(crate::scene::BackdropFilter {
-            order: 0,
+            order: next_order(),
             blur_radius: ScaledPixels(blur),
             bounds,
             content_mask: unbounded_mask(),
@@ -1069,9 +1125,11 @@ mod tests {
 
     #[test]
     fn instance_sweep_nested_references_are_transparent_to_coverage() {
+        // Built in paint order: each constructor takes the next draw order.
+        let beneath = cullee(scaled_bounds(10., 10., 40., 40.));
         let occluder = opaque_quad(scaled_bounds(0., 0., 100., 100.));
         let items = vec![
-            cullee(scaled_bounds(10., 10., 40., 40.)),
+            beneath,
             LayerItem::Nested(crate::layer::LayerKey(7)),
             occluder.clone(),
         ];
