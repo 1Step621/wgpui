@@ -1368,16 +1368,25 @@ impl HitboxId {
 pub struct Hitbox {
     /// A unique identifier for the hitbox.
     pub id: HitboxId,
-    /// The bounds of the hitbox.
+    /// The bounds of the hitbox, in window coordinates: where the element
+    /// that inserted it paints and receives mouse events.
     #[deref]
     pub bounds: Bounds<Pixels>,
-    /// The content mask when the hitbox was inserted.
+    /// The content mask when the hitbox was inserted, in window coordinates.
     pub content_mask: ContentMask<Pixels>,
     /// Flags that specify hitbox behavior.
     pub behavior: HitboxBehavior,
-    /// The retained layer whose local coordinate space contains these bounds.
-    /// `None` identifies legacy window-relative hitboxes.
+    /// The retained layer whose local coordinate space `local_bounds` and
+    /// `local_content_mask` are in. `None` identifies legacy window-relative
+    /// hitboxes, whose local geometry is their window geometry.
     pub(crate) layer: Option<LayerKey>,
+    /// `bounds` in `layer`'s local coordinate space, which hit testing uses:
+    /// a transform-only composite moves the layer's pixels without
+    /// re-running prepaint, so the query point is mapped into this space
+    /// rather than the hitbox out of it.
+    pub(crate) local_bounds: Bounds<Pixels>,
+    /// `content_mask` in the same space as `local_bounds`.
+    pub(crate) local_content_mask: ContentMask<Pixels>,
 }
 
 impl Hitbox {
@@ -1683,7 +1692,9 @@ impl Frame {
                 .layer
                 .and_then(|key| layers.get(&key))
                 .map_or(position, |layer| layer.transform.invert(position));
-            let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
+            let bounds = hitbox
+                .local_bounds
+                .intersect(&hitbox.local_content_mask.bounds);
             if bounds.contains(&position) {
                 hit_test.ids.push(hitbox.id);
                 if !set_hover_hitbox_count
@@ -6907,21 +6918,28 @@ impl Window {
     pub fn insert_hitbox(&mut self, bounds: Bounds<Pixels>, behavior: HitboxBehavior) -> Hitbox {
         self.invalidator.debug_assert_prepaint();
 
-        let mut bounds = bounds;
-        let mut content_mask = self.content_mask();
+        let content_mask = self.content_mask();
+        let mut local_bounds = bounds;
+        let mut local_content_mask = content_mask.clone();
         let layer = self.hitbox_layer_stack.last().copied();
         if let Some((_, origin, _)) = layer {
-            bounds.origin -= origin;
-            content_mask.bounds.origin -= origin;
+            local_bounds.origin -= origin;
+            local_content_mask.bounds.origin -= origin;
         }
         let mut id = self.next_hitbox_id;
         self.next_hitbox_id = self.next_hitbox_id.next();
+        // The caller gets window coordinates, which is where it paints and
+        // what mouse events carry (Pulsar-Native#1001: a scrollbar painted
+        // from its hitbox inside a scrolling form was drawn displaced by
+        // the form's origin). Only hit testing works in layer space.
         let hitbox = Hitbox {
             id,
             bounds,
             content_mask,
             behavior,
             layer: layer.map(|(key, _, _)| key),
+            local_bounds,
+            local_content_mask,
         };
         self.next_frame.hitboxes.push(hitbox.clone());
         hitbox
@@ -7050,8 +7068,8 @@ impl Window {
                 // A nested viewport moves only part of its enclosing texture.
                 // Shifting that whole texture would also move its siblings.
                 if !layer.policy.buffers_scroll()
-                    || hitbox.bounds.origin != Point::default()
-                    || hitbox.bounds.size != layer.cache_key.bounds.size
+                    || hitbox.local_bounds.origin != Point::default()
+                    || hitbox.local_bounds.size != layer.cache_key.bounds.size
                 {
                     self.request_layer_buffer_refill(key);
                 }
@@ -14711,6 +14729,90 @@ mod test {
         out
     }
 
+    /// An element inside a layered scroll container that is not at the
+    /// window's origin gets its hitbox in window coordinates, so painting
+    /// from it lands in place, and hit testing (which works in the layer's
+    /// space) still finds it (Pulsar-Native#1001: a scrollbar painted from
+    /// its hitbox inside a scrolling form was drawn displaced by the form's
+    /// origin).
+    #[gpui::test]
+    fn hitboxes_inside_an_offset_layer_are_in_window_coordinates(cx: &mut TestAppContext) {
+        if layers_off() || !crate::layer::auto_layers_enabled() {
+            return;
+        }
+        struct Form {
+            handle: crate::ScrollHandle,
+            hovered: std::rc::Rc<std::cell::Cell<bool>>,
+        }
+        impl crate::Render for Form {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let hovered = self.hovered.clone();
+                crate::div().size_full().child(
+                    crate::div()
+                        .absolute()
+                        .left(px(300.))
+                        .top(px(100.))
+                        .w(px(200.))
+                        .h(px(200.))
+                        .child(
+                            crate::div()
+                                .id("form")
+                                .size_full()
+                                .overflow_y_scroll()
+                                .track_scroll(&self.handle)
+                                .child(crate::div().h(px(30.)))
+                                .child(
+                                    crate::canvas(
+                                        |bounds, window, _| {
+                                            window.insert_hitbox(bounds, crate::HitboxBehavior::Normal)
+                                        },
+                                        move |_, hitbox, window, _| {
+                                            hovered.set(hitbox.is_hovered(window));
+                                            window.paint_quad(crate::fill(hitbox.bounds, crate::red()));
+                                        },
+                                    )
+                                    .size(px(20.)),
+                                )
+                                .child(crate::div().h(px(600.))),
+                        ),
+                )
+            }
+        }
+        let hovered = std::rc::Rc::new(std::cell::Cell::new(false));
+        let window = cx.open_window(size(px(800.), px(600.)), {
+            let hovered = hovered.clone();
+            move |_, _| Form {
+                handle: crate::ScrollHandle::new(),
+                hovered,
+            }
+        });
+        cx.run_until_parked();
+        let any: crate::AnyWindowHandle = window.into();
+        let frame = |cx: &mut TestAppContext| {
+            any.update(cx, |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+                window.present();
+                assert!(!window.layers.is_empty(), "the scroll container is a layer");
+                (drawn_quads(&window.rendered_frame.scene), window.scale_factor())
+            })
+            .unwrap()
+        };
+        frame(cx);
+        let (quads, scale) = frame(cx);
+        assert_eq!(quads.len(), 1, "{quads:#?}");
+        let expected = format!("{:.1},{:.1} {:.1}x{:.1}", 300. * scale, 130. * scale, 20. * scale, 20. * scale);
+        assert!(quads[0].starts_with(&expected), "expected {expected}: {quads:#?}");
+
+        let mut vcx = crate::VisualTestContext::from_window(any, cx);
+        vcx.simulate_mouse_move(crate::point(px(310.), px(140.)), None, crate::Modifiers::none());
+        frame(cx);
+        assert!(hovered.get(), "the mouse over the probe hovers its hitbox");
+        vcx.simulate_mouse_move(crate::point(px(10.), px(40.)), None, crate::Modifiers::none());
+        frame(cx);
+        assert!(!hovered.get(), "where the layer-local hitbox would wrongly have been");
+    }
+
     /// A panel re-records (it was notified) while one of its children is
     /// unchanged and reused as an instance. That child contains a layer of its
     /// own. The re-record frame must still draw the nested layer's content,
@@ -16903,3 +17005,4 @@ mod headless_layer_flicker {
         }
     }
 }
+
