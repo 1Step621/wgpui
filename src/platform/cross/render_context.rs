@@ -3,17 +3,36 @@ use std::sync::Arc;
 
 use super::surface_registry::SurfaceRegistry;
 
+/// Creates a device and queue for the adapter selected by WGPUI.
+pub type WgpuDeviceFactory = Arc<
+    dyn Fn(
+            &wgpu::Adapter,
+            &wgpu::DeviceDescriptor<'_>,
+        ) -> anyhow::Result<(wgpu::Device, wgpu::Queue)>
+        + Send
+        + Sync,
+>;
+
 /// Options for configuring the WGPU backend.
+#[derive(Clone)]
 pub struct WgpuOptions {
     /// Additional WGPU features to request when creating the device.
     /// These are OR'd with the features WGPUI itself requires.
     pub additional_features: wgpu::Features,
+    /// Prefer these backends when multiple adapters meet the required features.
+    /// Adapters using other backends remain eligible.
+    pub preferred_backends: wgpu::Backends,
+    /// Customize native device creation, for example to enable video queues.
+    /// The factory must satisfy the supplied feature and limit requirements.
+    pub device_factory: Option<WgpuDeviceFactory>,
 }
 
 impl Default for WgpuOptions {
     fn default() -> Self {
         Self {
             additional_features: wgpu::Features::empty(),
+            preferred_backends: wgpu::Backends::empty(),
+            device_factory: None,
         }
     }
 }
@@ -93,7 +112,13 @@ impl WgpuContext {
 
             let required_features = wgpui_features | options.additional_features;
 
-            let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+            let mut adapters =
+                pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+            adapters.sort_by_key(|adapter| {
+                !options
+                    .preferred_backends
+                    .contains(wgpu::Backends::from(adapter.get_info().backend))
+            });
 
             // On macOS, some features are optional — prefer adapters that expose them
             // but do not require them, since Metal may not advertise them on all hardware.
@@ -155,16 +180,19 @@ impl WgpuContext {
                 }
             };
 
-            let (device, queue) =
-                pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                    label: None,
-                    required_features: device_features,
-                    required_limits: wgpu::Limits {
-                        max_binding_array_elements_per_shader_stage: 512,
-                        ..adapter.limits()
-                    },
-                    ..Default::default()
-                }))?;
+            let descriptor = wgpu::DeviceDescriptor {
+                label: None,
+                required_features: device_features,
+                required_limits: wgpu::Limits {
+                    max_binding_array_elements_per_shader_stage: 512,
+                    ..adapter.limits()
+                },
+                ..Default::default()
+            };
+            let (device, queue) = match &options.device_factory {
+                Some(factory) => factory(&adapter, &descriptor)?,
+                None => pollster::block_on(adapter.request_device(&descriptor))?,
+            };
 
             let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Globals Buffer"),

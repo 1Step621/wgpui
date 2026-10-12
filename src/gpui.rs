@@ -101,7 +101,7 @@ use key_dispatch::*;
 pub use keymap::*;
 pub use path_builder::*;
 pub use platform::*;
-pub use platform::cross::render_context::WgpuOptions;
+pub use platform::cross::render_context::{WgpuDeviceFactory, WgpuOptions};
 #[cfg(feature = "flamegraph")]
 pub use flamegraph::*;
 #[cfg(feature = "flamegraph")]

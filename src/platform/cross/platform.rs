@@ -386,9 +386,7 @@ impl Platform for CrossPlatform {
             hovered_window_id: Cell::new(None),
             hovered_external_paths: Vec::new(),
             wgpu_context: self.wgpu_context.clone(),
-            wgpu_options: WgpuOptions {
-                additional_features: self.wgpu_options.additional_features,
-            },
+            wgpu_options: self.wgpu_options.clone(),
             proxy: self.event_loop_proxy.clone(),
         };
 
@@ -1248,17 +1246,13 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                 // The wgpu_context Arc is shared with CrossPlatform, so once
                 // set here, open_window() on the platform side finds it.
                 let wgpu_ctx = self.wgpu_context.clone();
-                let wgpu_opts = WgpuOptions {
-                    additional_features: self.wgpu_options.additional_features,
-                };
+                let wgpu_opts = self.wgpu_options.clone();
                 let proxy = self.proxy.clone();
                 // Use setTimeout(0) instead of spawn_local because winit's
                 // throw-based control flow would abort microtask processing.
                 let closure = wasm_bindgen::prelude::Closure::once({
                     let wgpu_ctx = wgpu_ctx.clone();
-                    let wgpu_opts_clone = WgpuOptions {
-                        additional_features: wgpu_opts.additional_features,
-                    };
+                    let wgpu_opts_clone = wgpu_opts.clone();
                     move || {
                         web_sys::console::log_1(&"WGPUI: async WGPU init starting via setTimeout".into());
                         wasm_bindgen_futures::spawn_local(async move {
