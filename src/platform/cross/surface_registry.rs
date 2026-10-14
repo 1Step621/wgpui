@@ -65,14 +65,18 @@ impl TripleBuffer {
 /// Maps `SurfaceId` to triple-buffered texture sets.
 pub struct SurfaceRegistry {
     surfaces: Mutex<HashMap<SurfaceId, TripleBuffer>>,
-    next_id: AtomicU64,
 }
+
+/// Surface ids are unique across registries, not just within one: after a
+/// device loss the platform makes a new registry, and a view still holding a
+/// surface from the old one must find nothing there rather than someone
+/// else's surface under a reused id.
+static NEXT_SURFACE_ID: AtomicU64 = AtomicU64::new(1);
 
 impl SurfaceRegistry {
     pub fn new() -> Self {
         Self {
             surfaces: Mutex::new(HashMap::new()),
-            next_id: AtomicU64::new(1),
         }
     }
 
@@ -110,7 +114,7 @@ impl SurfaceRegistry {
         format: wgpu::TextureFormat,
         color_conversion: crate::SurfaceColorConversion,
     ) -> SurfaceId {
-        let id = SurfaceId(self.next_id.fetch_add(1, Ordering::Relaxed));
+        let id = SurfaceId(NEXT_SURFACE_ID.fetch_add(1, Ordering::Relaxed));
         let mut tb = Self::create_triple_buffer(device, width, height, format);
         tb.color_conversion = color_conversion;
         self.lock_surfaces().insert(id, tb);
@@ -667,6 +671,29 @@ mod flamegraph_tests {
 #[cfg(test)]
 mod tests {
     use super::{SurfaceRegistry, TripleBuffer};
+
+    /// After a device loss the platform makes a new registry; a view still
+    /// holding a surface from the old one must not find someone else's.
+    #[test]
+    fn surface_ids_are_not_reused_by_a_new_registry() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+            eprintln!("no wgpu adapter; skipping");
+            return;
+        };
+        let Ok((device, _queue)) = pollster::block_on(adapter.request_device(&Default::default()))
+        else {
+            eprintln!("no wgpu device; skipping");
+            return;
+        };
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let old = SurfaceRegistry::new();
+        let stale = old.create(&device, 4, 4, format);
+        let new = SurfaceRegistry::new();
+        let fresh = new.create(&device, 4, 4, format);
+        assert_ne!(stale, fresh);
+        assert!(new.front_view(stale).is_none());
+    }
 
     // Minimal, GPU-free model of the three-buffer roles. We track which "frame"
     // (a monotonically increasing id) currently lives in each physical buffer,

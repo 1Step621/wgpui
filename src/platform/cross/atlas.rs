@@ -26,6 +26,34 @@ impl WgpuAtlas {
         }))
     }
 
+    /// Start over on `context`'s device after the old one was lost: every
+    /// page is gone, so every tile is forgotten and rasterized again on first
+    /// use. The pages are reported destroyed (see
+    /// [`Self::drain_destroyed_pages`]) so retained sprites on them are drawn
+    /// again rather than sampled from a new page that reuses their id. The
+    /// atlas keeps its identity: views and the text system hold it.
+    pub(crate) fn reset(&self, context: Arc<WgpuContext>) {
+        let mut state = self.0.lock();
+        let storage = std::mem::take(&mut state.storage);
+        for list in [storage.monochrome_textures, storage.polychrome_textures] {
+            let pages = list.textures.into_iter().flatten();
+            state
+                .destroyed_pages
+                .extend(pages.map(|texture| texture.id));
+        }
+        state.tiles_by_key.clear();
+        state.uploads.clear();
+        state.atlas_target = None;
+        state.atlas_target_view = None;
+        state.context = context;
+    }
+
+    /// The context the atlas makes its pages on.
+    #[cfg(test)]
+    pub(crate) fn context(&self) -> Arc<WgpuContext> {
+        self.0.lock().context.clone()
+    }
+
     pub fn before_frame(&self, encoder: &mut wgpu::CommandEncoder) {
         self.0.lock().flush(encoder);
     }

@@ -16467,6 +16467,7 @@ mod headless_layer_flicker {
     struct Editor {
         handle: AnyWindowHandle,
         root: crate::WindowHandle<Root>,
+        atlas: Arc<WgpuAtlas>,
         renderer: Rc<RefCell<WgpuRenderer>>,
         presented: Rc<RefCell<Vec<u8>>>,
     }
@@ -16531,6 +16532,7 @@ mod headless_layer_flicker {
             let editor = Editor {
                 handle,
                 root,
+                atlas,
                 renderer,
                 presented,
             };
@@ -16650,6 +16652,20 @@ mod headless_layer_flicker {
         fn size(&self) -> (u32, u32) {
             self.renderer.borrow().frame_size()
         }
+
+        /// What `CrossWindow::rebuild_on` does after a device loss: the atlas
+        /// starts over on the new device, a new renderer replaces the old
+        /// one, and the resize callback runs `bounds_changed`.
+        fn move_onto(&self, cx: &mut TestAppContext, context: &Arc<WgpuContext>) {
+            let (width, height) = self.size();
+            self.atlas.reset(context.clone());
+            *self.renderer.borrow_mut() =
+                WgpuRenderer::new_headless(context.clone(), self.atlas.clone(), width, height);
+            self.handle
+                .update(cx, |_, window, cx| window.bounds_changed(cx))
+                .expect("window update");
+            cx.run_until_parked();
+        }
     }
 
     /// Walk the scene's draw stream exactly as the renderer does and require
@@ -16757,7 +16773,7 @@ mod headless_layer_flicker {
         LongInteraction(usize),
     }
 
-    fn apply(cx: &mut TestAppContext, editors: [&Editor; 2], step: &Step) {
+    fn apply<const N: usize>(cx: &mut TestAppContext, editors: [&Editor; N], step: &Step) {
         for editor in editors {
             match step {
                 Step::Pointer(in_panel) => {
@@ -16882,6 +16898,73 @@ mod headless_layer_flicker {
             }
         }
         cx.run_until_parked();
+    }
+
+    /// A lost GPU device: the window moves onto a new one as
+    /// `CrossWindow::rebuild_on` moves it, and its first frame there draws
+    /// what a full render on the new device draws. Retained layers, cached
+    /// views and atlas tiles made on the lost device must not show through.
+    #[crate::test]
+    fn a_window_moved_onto_a_new_device_draws_what_a_full_render_draws(cx: &mut TestAppContext) {
+        if !crate::layer::layers_enabled() {
+            return;
+        }
+        let (Ok(lost), Ok(fresh)) = (
+            WgpuContext::new(&WgpuOptions::default()),
+            WgpuContext::new(&WgpuOptions::default()),
+        ) else {
+            return;
+        };
+        let (lost, fresh) = (Arc::new(lost), Arc::new(fresh));
+        let live = Editor::open(cx, &lost, 14);
+        let (width, height) = live.size();
+        for step in [
+            Step::ShowSiblingImage,
+            Step::IdleDraw,
+            Step::SiblingUpdate,
+            Step::Scroll(-40.),
+            Step::IdleDraw,
+        ] {
+            apply(cx, [&live], &step);
+        }
+
+        lost.device.destroy();
+        let _ = lost.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        assert!(lost.is_lost(), "destroying the device reports it lost");
+
+        live.move_onto(cx, &fresh);
+        // A destroyed device's textures stay readable on some drivers
+        // (lavapipe among them), so pages left on the lost device would still
+        // draw the right pixels here; they must not be used at all.
+        assert!(
+            Arc::ptr_eq(&live.atlas.context(), &fresh),
+            "the atlas makes its pages on the new device"
+        );
+        live.draw(cx, false);
+        cx.run_until_parked();
+        live.settle(cx, "first frame on the new device");
+        let moved = live.presented.borrow().clone();
+        let distinct_colors = moved
+            .chunks(4)
+            .map(|pixel| [pixel[0], pixel[1], pixel[2]])
+            .collect::<collections::FxHashSet<_>>()
+            .len();
+        assert!(
+            distinct_colors >= 6,
+            "the frame on the new device has only {distinct_colors} colors; nothing was drawn"
+        );
+        live.draw(cx, true);
+        cx.run_until_parked();
+        compare(
+            &moved,
+            &live.presented.borrow(),
+            width,
+            height,
+            "first frame on the new device",
+        );
     }
 
     /// A body light enough to stay primitive-retained, spliced as slab spans

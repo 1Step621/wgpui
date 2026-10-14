@@ -32,6 +32,8 @@ struct WgpuSurfaceHandleInner {
     /// Device-level guard shared with the renderer. See
     /// `WgpuContext::gpu_submit_lock`'s doc comment for the full mechanism.
     gpu_submit_lock: Arc<parking_lot::RwLock<()>>,
+    /// Set when `device` is lost. See [`WgpuSurfaceHandle::is_device_lost`].
+    device_lost: Arc<AtomicBool>,
     size: Mutex<(u32, u32)>,
     pending_resize: Mutex<Option<(u32, u32)>>,
     deferred_resize: Mutex<Option<(u32, u32)>>,
@@ -87,6 +89,7 @@ impl WgpuSurfaceHandle {
         registry: Arc<SurfaceRegistry>,
         present_trigger: Arc<dyn Fn() + Send + Sync>,
         gpu_submit_lock: Arc<parking_lot::RwLock<()>>,
+        device_lost: Arc<AtomicBool>,
         width: u32,
         height: u32,
         format: wgpu::TextureFormat,
@@ -100,6 +103,7 @@ impl WgpuSurfaceHandle {
                 queue,
                 present_trigger,
                 gpu_submit_lock,
+                device_lost,
                 size: Mutex::new((width, height)),
                 pending_resize: Mutex::new(None),
                 deferred_resize: Mutex::new(None),
@@ -118,6 +122,24 @@ impl WgpuSurfaceHandle {
     /// The wgpu `Queue` for submitting command buffers.
     pub fn queue(&self) -> &wgpu::Queue {
         &self.inner.queue
+    }
+
+    /// Whether this surface's device was lost (a driver reset, a removed
+    /// GPU). A handle stays on the device it was made on: once it is lost,
+    /// drop the handle and everything made on its device, and ask the window
+    /// for a new surface. The window rebuilds itself on a new device and
+    /// re-renders every view when one is ready; a surface asked for before
+    /// that is on the lost device too, so check again.
+    pub fn is_device_lost(&self) -> bool {
+        self.inner.device_lost.load(Ordering::Acquire)
+    }
+
+    /// The flag behind [`Self::is_device_lost`], for code that watches the
+    /// device itself. The window owns the device's lost and error callbacks
+    /// (a device has one slot for each), so read the loss from here instead
+    /// of installing them.
+    pub fn device_lost_flag(&self) -> Arc<AtomicBool> {
+        self.inner.device_lost.clone()
     }
 
     /// Acquire permission to submit GPU work on this surface's device.

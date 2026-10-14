@@ -7,7 +7,7 @@ use crate::{
     platform::cross::{
         dispatcher::{CrossEvent, Dispatcher},
         keyboard::CrossKeyboardLayout,
-        render_context::WgpuContext,
+        render_context::{ContextSlot, WgpuContext},
         renderer::WgpuRenderer,
         text_system::CosmicTextSystem,
         window::CrossWindow,
@@ -73,7 +73,7 @@ pub(crate) struct CrossPlatform {
     background_executor: BackgroundExecutor,
     foreground_executor: ForegroundExecutor,
     text_system: Arc<CosmicTextSystem>,
-    wgpu_context: Arc<std::sync::OnceLock<Arc<WgpuContext>>>,
+    wgpu_context: ContextSlot,
     wgpu_options: WgpuOptions,
     main_rx: PriorityQueueReceiver<RunnableVariant>,
     event_loop: Cell<Option<winit::event_loop::EventLoop<CrossEvent>>>,
@@ -135,10 +135,11 @@ struct AppState {
     /// for its next event (from the end of `about_to_wait` to `new_events`).
     idle_scope: Option<Box<dyn Send>>,
     pending_releases: FxHashMap<winit::window::WindowId, HashSet<MouseButton>>,
-    #[cfg(target_family = "wasm")]
-    wgpu_context: Arc<std::sync::OnceLock<Arc<WgpuContext>>>,
-    #[cfg(target_family = "wasm")]
+    wgpu_context: ContextSlot,
     wgpu_options: WgpuOptions,
+    /// When a replacement for a lost device was last tried and failed.
+    #[cfg(not(target_family = "wasm"))]
+    last_device_attempt: Option<Instant>,
     #[cfg(target_family = "wasm")]
     proxy: winit::event_loop::EventLoopProxy<CrossEvent>,
 }
@@ -167,20 +168,14 @@ impl CrossPlatform {
     }
 
     fn new_impl(headless: bool, wgpu_options: WgpuOptions) -> Result<Self> {
-        let wgpu_context: Arc<std::sync::OnceLock<Arc<WgpuContext>>> = if headless {
-            Arc::new(std::sync::OnceLock::new())
-        } else {
-            match WgpuContext::new(&wgpu_options) {
-                Ok(ctx) => {
-                    let lock = Arc::new(std::sync::OnceLock::new());
-                    lock.set(Arc::new(ctx)).ok();
-                    lock
-                }
-                // On WASM, WgpuContext::new returns an error (needs async init).
-                // The OnceLock stays empty; run() will fill it via spawn_local.
-                Err(_) => Arc::new(std::sync::OnceLock::new()),
+        let wgpu_context = ContextSlot::default();
+        if !headless {
+            // On WASM, WgpuContext::new returns an error (needs async init).
+            // The slot stays empty; run() will fill it via spawn_local.
+            if let Ok(ctx) = WgpuContext::new(&wgpu_options) {
+                wgpu_context.set(Arc::new(ctx));
             }
-        };
+        }
 
         let (main_tx, main_rx) = PriorityQueueReceiver::new();
         let mut event_loop =
@@ -412,6 +407,9 @@ impl Platform for CrossPlatform {
             pending_releases: FxHashMap::default(),
             active_context: self.active_context.clone(),
             idle_scope: None,
+            wgpu_context: self.wgpu_context.clone(),
+            wgpu_options: self.wgpu_options,
+            last_device_attempt: None,
         };
 
         #[cfg(target_family = "wasm")]
@@ -536,10 +534,8 @@ impl Platform for CrossPlatform {
     ) -> anyhow::Result<Box<dyn crate::PlatformWindow>> {
         let window = CrossWindow::new(
             self.wgpu_context
-                .as_ref()
                 .get()
-                .expect("WgpuContext not initialized")
-                .clone(),
+                .expect("WgpuContext not initialized"),
             self.event_loop_proxy.clone(),
         );
 
@@ -992,6 +988,41 @@ impl Platform for CrossPlatform {
 }
 
 impl AppState {
+    /// After a device loss (a driver reset, a removed GPU), make a new
+    /// context and move every window onto it. Until a device can be had --
+    /// the GPU may still be resetting -- this retries once a second and the
+    /// windows draw nothing.
+    #[cfg(not(target_family = "wasm"))]
+    fn recover_lost_device(&mut self) {
+        let Some(context) = self.wgpu_context.get() else {
+            return;
+        };
+        if !context.is_lost()
+            || self
+                .last_device_attempt
+                .is_some_and(|attempt| attempt.elapsed() < DEVICE_RETRY_INTERVAL)
+        {
+            return;
+        }
+        let context = match WgpuContext::new(&self.wgpu_options) {
+            Ok(context) => Arc::new(context),
+            Err(error) => {
+                log::warn!("No GPU device to replace the lost one yet: {error:#}");
+                self.last_device_attempt = Some(Instant::now());
+                return;
+            }
+        };
+        log::info!(
+            "GPU device replaced; rebuilding {} window(s) on it",
+            self.windows.len()
+        );
+        self.last_device_attempt = None;
+        self.wgpu_context.set(context.clone());
+        for window in self.windows.values() {
+            window.rebuild_on(context.clone());
+        }
+    }
+
     fn set_active_context(&mut self, event_loop: &ActiveEventLoop) {
         let app_state = self as *mut AppState;
         self.active_context
@@ -1073,7 +1104,7 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                 // After async WGPU init completes, run the deferred callback
                 // within a valid ActiveEventLoop context.
                 #[cfg(target_family = "wasm")]
-                if self.wgpu_context.as_ref().get().is_some() {
+                if self.wgpu_context.get().is_some() {
                     web_sys::console::log_1(
                         &"WGPUI: WGPU ready, calling on_finish_launching".into(),
                     );
@@ -1226,6 +1257,8 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
         self.set_active_context(event_loop);
 
         self.drain_main_queue();
+        #[cfg(not(target_family = "wasm"))]
+        self.recover_lost_device();
 
         // Cap the idle poll rate (measured: this loop, unthrottled, drove
         // `request_redraw()` — and therefore `RedrawRequested` and the whole
@@ -1303,10 +1336,10 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
         #[cfg(target_family = "wasm")]
         {
             use wasm_bindgen::JsCast;
-            if self.wgpu_context.as_ref().get().is_none() {
+            if self.wgpu_context.get().is_none() {
                 web_sys::console::log_1(&"WGPUI: WGPU not ready, starting async init".into());
                 // WGPU context not yet initialized — do it asynchronously.
-                // The wgpu_context Arc is shared with CrossPlatform, so once
+                // The wgpu_context slot is shared with CrossPlatform, so once
                 // set here, open_window() on the platform side finds it.
                 let wgpu_ctx = self.wgpu_context.clone();
                 let wgpu_opts = self.wgpu_options;
@@ -1324,7 +1357,7 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                             match WgpuContext::new_async(&wgpu_opts_clone).await {
                                 Ok(ctx) => {
                                     web_sys::console::log_1(&"WGPUI: async WGPU init OK".into());
-                                    wgpu_ctx.set(Arc::new(ctx)).ok();
+                                    wgpu_ctx.set(Arc::new(ctx));
                                 }
                                 Err(e) => {
                                     let msg = format!("WGPUI: WASM WGPU init failed: {e}");
@@ -1457,8 +1490,9 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                 window.window().request_redraw();
                 let scale_factor = window.scale_factor();
 
-                if let Some(renderer) = window.0.renderer.get() {
-                    renderer.borrow_mut().update_drawable_size(Size {
+                let mut renderer_slot = window.0.renderer.borrow_mut();
+                if let Some(renderer) = renderer_slot.as_mut() {
+                    renderer.update_drawable_size(Size {
                         width: DevicePixels(physical_size.width as i32),
                         height: DevicePixels(physical_size.height as i32),
                     });
@@ -1466,7 +1500,7 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                     // Renderer may not exist yet if initialization was skipped
                     // (e.g. canvas reported 0x0 on WASM). Create it now.
                     let mut renderer = WgpuRenderer::new(
-                        window.0.wgpu_context.clone(),
+                        window.0.wgpu_context.borrow().clone(),
                         window.window(),
                         window.0.sprite_atlas.clone(),
                         physical_size.width,
@@ -1478,8 +1512,9 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                         width: DevicePixels(physical_size.width as i32),
                         height: DevicePixels(physical_size.height as i32),
                     });
-                    let _ = window.0.renderer.set(RefCell::new(renderer));
+                    *renderer_slot = Some(renderer);
                 }
+                drop(renderer_slot);
                 let size = crate::Size {
                     width: crate::Pixels(physical_size.width as f32 / scale_factor),
                     height: crate::Pixels(physical_size.height as f32 / scale_factor),
@@ -1596,9 +1631,10 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                     std::sync::LazyLock::new(|| {
                         std::env::var("WGPUI_FAST_SURFACE_BLIT").is_ok_and(|value| value == "1")
                     });
-                if *FAST_SURFACE_BLIT && let Some(renderer) = window.0.renderer.get() {
+                if *FAST_SURFACE_BLIT
+                    && let Some(renderer_ref) = window.0.renderer.borrow().as_ref()
+                {
                     wgpui_scope!("Main: fast-blit pending surfaces");
-                    let renderer_ref = renderer.borrow();
                     if let Some(pending_surfaces) = renderer_ref.get_pending_surfaces() {
                         force_render = !renderer_ref.blit_surfaces_direct(&pending_surfaces);
                     }
@@ -1888,6 +1924,9 @@ const DOUBLE_CLICK_DISTANCE: f32 = 5.0;
 /// could show — this only removes the tens-of-thousands-of-Hz spin that
 /// `ControlFlow::Poll` produced with nothing to show.
 const IDLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(4);
+/// How often a replacement for a lost GPU device is tried.
+#[cfg(not(target_family = "wasm"))]
+const DEVICE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl ClickState {
     fn update(
