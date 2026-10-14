@@ -610,3 +610,82 @@ impl Styled for WgpuSurface {
         &mut self.style
     }
 }
+
+#[cfg(test)]
+mod device_loss_tests {
+    use crate::{
+        Context, IntoElement, ParentElement, Render, Styled, TestAppContext, WgpuSurfaceHandle,
+        Window, div,
+    };
+
+    /// Holds a surface the way an editor viewport does: one on a lost device
+    /// is dropped, and one asked for before the window has a new device
+    /// (also on the lost one) is not kept.
+    #[derive(Default)]
+    struct Viewport {
+        surface: Option<WgpuSurfaceHandle>,
+        renders: usize,
+    }
+
+    impl Render for Viewport {
+        fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders += 1;
+            if self
+                .surface
+                .as_ref()
+                .is_some_and(WgpuSurfaceHandle::is_device_lost)
+            {
+                self.surface = None;
+            }
+            if self.surface.is_none() {
+                self.surface = window
+                    .create_wgpu_surface(64, 64, wgpu::TextureFormat::Rgba8UnormSrgb)
+                    .filter(|surface| !surface.is_device_lost());
+            }
+            div()
+                .size_full()
+                .children(self.surface.clone().map(super::wgpu_surface))
+        }
+    }
+
+    #[crate::test]
+    fn a_view_rebuilds_its_surface_on_the_new_device_after_a_loss(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, _| Viewport::default());
+        if !cx.update(|window, _| window.use_test_gpu_device()) {
+            return; // No GPU adapter here.
+        }
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let first = view.read_with(cx, |view, _| view.surface.clone());
+        let first = first.expect("a surface on the test device");
+        assert!(!first.is_device_lost());
+
+        assert!(cx.update(|window, _| window.lose_test_gpu_device()));
+        assert!(first.is_device_lost(), "a surface reports its device lost");
+        let renders = view.read_with(cx, |view, _| view.renders);
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.renders > renders,
+                "the view rendered while the device was lost"
+            );
+            assert!(
+                view.surface.is_none(),
+                "no surface is kept until the window has a new device"
+            );
+        });
+
+        assert!(cx.update(|window, cx| window.replace_test_gpu_device(cx)));
+        cx.run_until_parked();
+        let second = view.read_with(cx, |view, _| view.surface.clone());
+        let second = second.expect("a surface on the new device after the window moves");
+        assert!(!second.is_device_lost());
+        // Devices from separate wgpu instances can compare equal by id, so
+        // tell them apart by their loss flags, one per device.
+        assert!(
+            !std::sync::Arc::ptr_eq(&second.device_lost_flag(), &first.device_lost_flag()),
+            "the new surface is on the new device"
+        );
+    }
+}

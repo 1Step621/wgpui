@@ -6707,6 +6707,57 @@ impl Window {
             .create_wgpu_surface(width, height, format)
     }
 
+    /// Test windows only: make the surfaces [`Self::create_wgpu_surface`]
+    /// hands out on a real GPU device, as a platform window does. Returns
+    /// `false`, leaving the window without surfaces, when no GPU adapter is
+    /// available.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn use_test_gpu_device(&mut self) -> bool {
+        let Ok(context) = crate::platform::cross::render_context::WgpuContext::new(
+            &crate::WgpuOptions::default(),
+        ) else {
+            return false;
+        };
+        let Some(window) = self.platform_window.as_test() else {
+            return false;
+        };
+        window.0.lock().gpu = Some(Arc::new(context));
+        true
+    }
+
+    /// Test windows only: lose the GPU device behind this window's surfaces,
+    /// as a driver reset or a removed GPU does. Surfaces made on it report
+    /// [`crate::WgpuSurfaceHandle::is_device_lost`], and so do new ones until
+    /// [`Self::replace_test_gpu_device`]. Returns whether the device is lost.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn lose_test_gpu_device(&mut self) -> bool {
+        let Some(window) = self.platform_window.as_test() else {
+            return false;
+        };
+        let Some(context) = window.0.lock().gpu.clone() else {
+            return false;
+        };
+        context.device.destroy();
+        let _ = context.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        context.is_lost()
+    }
+
+    /// Test windows only: move onto a new GPU device after
+    /// [`Self::lose_test_gpu_device`], as the platform does once it can make
+    /// one, and render every view again. Returns `false` when no new device
+    /// can be made.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn replace_test_gpu_device(&mut self, cx: &mut App) -> bool {
+        if !self.use_test_gpu_device() {
+            return false;
+        }
+        self.bounds_changed(cx);
+        true
+    }
+
     /// Create an external WGPU surface with an explicit compositor color
     /// conversion. Existing callers should continue using
     /// [`Self::create_wgpu_surface`] unless their renderer needs conversion at

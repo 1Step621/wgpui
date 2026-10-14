@@ -12,6 +12,8 @@ use std::{
     sync::{self, Arc},
 };
 
+use crate::platform::cross::render_context::WgpuContext;
+
 pub(crate) struct TestWindowState {
     pub(crate) bounds: Bounds<Pixels>,
     pub(crate) handle: AnyWindowHandle,
@@ -30,6 +32,9 @@ pub(crate) struct TestWindowState {
     moved_callback: Option<Box<dyn FnMut()>>,
     input_handler: Option<PlatformInputHandler>,
     is_fullscreen: bool,
+    /// The GPU device `create_wgpu_surface` makes surfaces on, once a test
+    /// gives the window one (`Window::use_test_gpu_device`).
+    pub(crate) gpu: Option<Arc<WgpuContext>>,
 }
 
 #[derive(Clone)]
@@ -76,6 +81,7 @@ impl TestWindow {
             moved_callback: None,
             input_handler: None,
             is_fullscreen: false,
+            gpu: None,
         })))
     }
 
@@ -282,6 +288,53 @@ impl PlatformWindow for TestWindow {
 
     fn as_test(&mut self) -> Option<&mut TestWindow> {
         Some(self)
+    }
+
+    fn create_wgpu_surface(
+        &self,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> Option<crate::WgpuSurfaceHandle> {
+        self.create_wgpu_surface_with_color_conversion(
+            width,
+            height,
+            format,
+            crate::SurfaceColorConversion::None,
+        )
+    }
+
+    /// A surface on the test GPU device, if the test gave the window one. No
+    /// frame presents it, so presenting is a no-op.
+    fn create_wgpu_surface_with_color_conversion(
+        &self,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+        color_conversion: crate::SurfaceColorConversion,
+    ) -> Option<crate::WgpuSurfaceHandle> {
+        let ctx = self.0.lock().gpu.clone()?;
+        let registry = ctx.surface_registry.clone();
+        let surface_id = registry.create_with_color_conversion(
+            &ctx.device,
+            width,
+            height,
+            format,
+            color_conversion,
+        );
+        Some(crate::WgpuSurfaceHandle::new(
+            ctx.device.clone(),
+            ctx.queue.clone(),
+            surface_id,
+            registry,
+            Arc::new(|| {}),
+            ctx.gpu_submit_lock.clone(),
+            ctx.device_lost.clone(),
+            width,
+            height,
+            format,
+            color_conversion,
+        ))
     }
 
     fn show_window_menu(&self, _position: Point<Pixels>) {
