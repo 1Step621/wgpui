@@ -20,8 +20,12 @@ pub struct CrossWindow(pub(crate) Arc<CrossWindowInner>);
 
 pub(crate) struct CrossWindowInner {
     pub(crate) winit_window: OnceCell<Arc<winit::window::Window>>,
-    pub(crate) renderer: OnceCell<RefCell<WgpuRenderer>>,
-    pub(crate) wgpu_context: Arc<WgpuContext>,
+    /// `None` until the window has a size, and while a lost device's
+    /// replacement could not be made yet.
+    pub(crate) renderer: RefCell<Option<WgpuRenderer>>,
+    /// Replaced, with the renderer and the atlas's pages, when the device is
+    /// lost ([`CrossWindow::rebuild_on`]).
+    pub(crate) wgpu_context: RefCell<Arc<WgpuContext>>,
     pub(crate) sprite_atlas: Arc<WgpuAtlas>,
     pub(crate) event_loop_proxy: EventLoopProxy<CrossEvent>,
     pub(crate) state: CrossWindowState,
@@ -82,8 +86,8 @@ impl CrossWindow {
     ) -> Self {
         Self(Arc::new(CrossWindowInner {
             winit_window: OnceCell::new(),
-            wgpu_context: wgpu_context.clone(),
-            renderer: OnceCell::new(),
+            wgpu_context: RefCell::new(wgpu_context.clone()),
+            renderer: RefCell::new(None),
             sprite_atlas: Arc::new(WgpuAtlas::new(wgpu_context.clone())),
             event_loop_proxy,
             state: CrossWindowState::default(),
@@ -122,7 +126,7 @@ impl CrossWindow {
 
         if initial_size.width > 0 && initial_size.height > 0 {
             let mut renderer = WgpuRenderer::new(
-                self.0.wgpu_context.clone(),
+                self.0.wgpu_context.borrow().clone(),
                 self.window(),
                 self.0.sprite_atlas.clone(),
                 initial_size.width,
@@ -141,9 +145,55 @@ impl CrossWindow {
                 height: crate::DevicePixels(initial_size.height as i32),
             });
 
-            let _ = self.0.renderer.set(RefCell::new(renderer));
+            *self.0.renderer.borrow_mut() = Some(renderer);
             self.window().request_redraw();
         }
+    }
+
+    /// Move this window onto `context`'s device after the old one was lost:
+    /// a new swapchain and renderer, an empty atlas, and a full redraw, since
+    /// retained layers and cached views name atlas pages of the lost device.
+    /// If no renderer can be made yet, the next resize makes one.
+    pub(crate) fn rebuild_on(&self, context: Arc<WgpuContext>) {
+        // The old swapchain goes first: a window holds one at a time.
+        drop(self.0.renderer.borrow_mut().take());
+        *self.0.wgpu_context.borrow_mut() = context.clone();
+        self.0.sprite_atlas.reset(context.clone());
+
+        let size = self.window().inner_size();
+        if size.width > 0 && size.height > 0 {
+            match WgpuRenderer::new(
+                context,
+                self.window(),
+                self.0.sprite_atlas.clone(),
+                size.width,
+                size.height,
+                4,
+            ) {
+                Ok(mut renderer) => {
+                    renderer.update_drawable_size(crate::geometry::Size {
+                        width: crate::DevicePixels(size.width as i32),
+                        height: crate::DevicePixels(size.height as i32),
+                    });
+                    *self.0.renderer.borrow_mut() = Some(renderer);
+                }
+                Err(error) => log::error!("No renderer on the new GPU device yet: {error:#}"),
+            }
+        }
+
+        // Through the resize callback, which refreshes every view.
+        let scale_factor = self.window().scale_factor() as f32;
+        let logical = crate::Size {
+            width: crate::Pixels(size.width as f32 / scale_factor),
+            height: crate::Pixels(size.height as f32 / scale_factor),
+        };
+        self.0
+            .state
+            .callbacks
+            .invoke_mut(&self.0.state.callbacks.on_resize, |callback| {
+                callback(logical, scale_factor)
+            });
+        self.window().request_redraw();
     }
 
     pub(crate) fn window(&self) -> &winit::window::Window {
@@ -480,9 +530,8 @@ impl PlatformWindow for CrossWindow {
     }
 
     fn draw(&self, scene: &crate::Scene) {
-        if let Some(renderer) = self.0.renderer.get() {
+        if let Some(renderer) = self.0.renderer.borrow_mut().as_mut() {
             let requests_pending = {
-                let mut renderer = renderer.borrow_mut();
                 renderer.draw(scene);
                 renderer.has_pending_requests()
             };
@@ -497,7 +546,8 @@ impl PlatformWindow for CrossWindow {
     }
 
     fn snapshot_frame(&self, scene: &crate::Scene) -> Option<crate::platform::FrameSnapshot> {
-        let renderer = self.0.renderer.get()?.borrow();
+        let renderer = self.0.renderer.borrow();
+        let renderer = renderer.as_ref()?;
         let (width, height) = renderer.frame_size();
         Some(crate::platform::FrameSnapshot {
             width,
@@ -509,22 +559,22 @@ impl PlatformWindow for CrossWindow {
     }
 
     fn take_dead_atlas_page_requests(&mut self) -> Vec<crate::AtlasTextureId> {
-        match self.0.renderer.get() {
-            Some(renderer) => renderer.borrow_mut().take_dead_page_requests(),
+        match self.0.renderer.borrow_mut().as_mut() {
+            Some(renderer) => renderer.take_dead_page_requests(),
             None => Vec::new(),
         }
     }
 
     fn take_slab_rerecord_requests(&mut self) -> Vec<crate::LayerKey> {
-        match self.0.renderer.get() {
-            Some(renderer) => renderer.borrow_mut().take_rerecord_requests(),
+        match self.0.renderer.borrow_mut().as_mut() {
+            Some(renderer) => renderer.take_rerecord_requests(),
             None => Vec::new(),
         }
     }
 
     fn present_framebuffer_only(&self) {
-        if let Some(renderer) = self.0.renderer.get() {
-            renderer.borrow().present_framebuffer_only();
+        if let Some(renderer) = self.0.renderer.borrow().as_ref() {
+            renderer.present_framebuffer_only();
         }
     }
 
@@ -558,7 +608,7 @@ impl PlatformWindow for CrossWindow {
         format: wgpu::TextureFormat,
         color_conversion: crate::SurfaceColorConversion,
     ) -> Option<WgpuSurfaceHandle> {
-        let ctx = &self.0.wgpu_context;
+        let ctx = self.0.wgpu_context.borrow().clone();
         let registry = ctx.surface_registry.clone();
         let surface_id = registry.create_with_color_conversion(
             &ctx.device,
@@ -585,6 +635,7 @@ impl PlatformWindow for CrossWindow {
             registry,
             present_trigger,
             ctx.gpu_submit_lock.clone(),
+            ctx.device_lost.clone(),
             width,
             height,
             format,
@@ -600,20 +651,22 @@ impl PlatformWindow for CrossWindow {
     fn gpu_memory_snapshot(&self) -> Option<crate::GpuMemorySnapshot> {
         self.0
             .renderer
-            .get()
-            .map(|renderer| renderer.borrow().gpu_memory_snapshot())
+            .borrow()
+            .as_ref()
+            .map(|renderer| renderer.gpu_memory_snapshot())
     }
 
     #[cfg(feature = "flamegraph")]
     fn gpu_device_and_queue(&self) -> Option<(wgpu::Device, wgpu::Queue)> {
         self.0
             .renderer
-            .get()
-            .map(|renderer| renderer.borrow().gpu_device_and_queue())
+            .borrow()
+            .as_ref()
+            .map(|renderer| renderer.gpu_device_and_queue())
     }
 
     fn gpu_specs(&self) -> Option<crate::GpuSpecs> {
-        self.0.renderer.get().map(|renderer| renderer.borrow().gpu_specs())
+        self.0.renderer.borrow().as_ref().map(|renderer| renderer.gpu_specs())
     }
 
     fn update_ime_position(&self, bounds: crate::Bounds<crate::Pixels>) {

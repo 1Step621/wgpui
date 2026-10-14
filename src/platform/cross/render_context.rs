@@ -1,5 +1,6 @@
 use parking_lot::Mutex;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::surface_registry::SurfaceRegistry;
 
@@ -34,6 +35,22 @@ impl Default for WgpuOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             hardware_ray_queries: false,
         }
+    }
+}
+
+/// The platform's current GPU context, shared by everything that opens
+/// windows. Empty until one is made (headless, or WASM before its async
+/// init); replaced when the device is lost.
+#[derive(Clone, Default)]
+pub(crate) struct ContextSlot(Arc<parking_lot::RwLock<Option<Arc<WgpuContext>>>>);
+
+impl ContextSlot {
+    pub(crate) fn get(&self) -> Option<Arc<WgpuContext>> {
+        self.0.read().clone()
+    }
+
+    pub(crate) fn set(&self, context: Arc<WgpuContext>) {
+        *self.0.write() = Some(context);
     }
 }
 
@@ -89,6 +106,9 @@ pub struct WgpuContext {
     /// The renderer's own submits deliberately do NOT take a read guard: they run
     /// on the same thread as `configure`, so guarding them would self-deadlock.
     pub(crate) gpu_submit_lock: Arc<parking_lot::RwLock<()>>,
+
+    /// Set once the device is lost; see [`watch_device_loss`].
+    pub(crate) device_lost: Arc<AtomicBool>,
 }
 
 impl WgpuContext {
@@ -254,108 +274,13 @@ impl WgpuContext {
                     ..Default::default()
                 }))?;
 
-            // Phase 4 of the profiling epic (issue #60/#71) reads these seven
-            // fixed buffers back via `copy_buffer_to_buffer` during a triggered
-            // GPU deep capture (see `DeepCaptureBufferKind`), which requires
-            // `COPY_SRC` on the source buffer or wgpu's validator rejects the
-            // encoder outright -- not a soft failure, a hard panic on the first
-            // frame a capture is armed. Add it only when the capture code that
-            // actually needs it is compiled in, so a non-`flamegraph` build's
-            // buffers are byte-for-byte the same as before this fix.
-            #[cfg(feature = "flamegraph")]
-            let deep_capture_readback = wgpu::BufferUsages::COPY_SRC;
-            #[cfg(not(feature = "flamegraph"))]
-            let deep_capture_readback = wgpu::BufferUsages::empty();
-
-            let quads_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Quads Buffer"),
-                // Resized dynamically by ensure_buffer_size() when the initial allocation is exceeded.
-                size: 8 * 1024 * 1024,
-                usage: wgpu::BufferUsages::VERTEX
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::STORAGE
-                    | deep_capture_readback,
-                mapped_at_creation: false,
-            });
-
-            let mono_sprites_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Monosprites Buffer"),
-                // Resized dynamically by ensure_buffer_size() when the initial allocation is exceeded.
-                size: 8 * 1024 * 1024,
-                usage: wgpu::BufferUsages::VERTEX
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::STORAGE
-                    | deep_capture_readback,
-                mapped_at_creation: false,
-            });
-
-            let shadows_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Shadows Buffer"),
-                size: 8 * 1024 * 1024,
-                usage: wgpu::BufferUsages::VERTEX
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::STORAGE
-                    | deep_capture_readback,
-                mapped_at_creation: false,
-            });
-
-            let backdrop_filters_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Backdrop Filters Buffer"),
-                size: 8 * 1024 * 1024,
-                usage: wgpu::BufferUsages::VERTEX
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::STORAGE
-                    | deep_capture_readback,
-                mapped_at_creation: false,
-            });
-
-            let underlines_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Underlines Buffer"),
-                size: 8 * 1024 * 1024,
-                usage: wgpu::BufferUsages::VERTEX
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::STORAGE
-                    | deep_capture_readback,
-                mapped_at_creation: false,
-            });
-
-            let poly_sprites_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Poly Sprites Buffer"),
-                size: 8 * 1024 * 1024,
-                usage: wgpu::BufferUsages::VERTEX
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::STORAGE
-                    | deep_capture_readback,
-                mapped_at_creation: false,
-            });
-
-            let paths_vertices_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Path Vertices Buffer"),
-                size: 8 * 1024 * 1024, // 8 MB – ~174 k vertices @ 48 bytes each
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_DST
-                    | deep_capture_readback,
-                mapped_at_creation: false,
-            });
-
-            Ok(Self {
+            Self::create_buffers(
+                instance,
                 adapter,
                 device,
                 queue,
-                instance,
-
-                quads_buffer: Mutex::new(quads_buffer),
-                shadows_buffer: Mutex::new(shadows_buffer),
-                backdrop_filters_buffer: Mutex::new(backdrop_filters_buffer),
-                underlines_buffer: Mutex::new(underlines_buffer),
-                mono_sprites_buffer: Mutex::new(mono_sprites_buffer),
-                poly_sprites_buffer: Mutex::new(poly_sprites_buffer),
-
-                paths_vertices_buffer: Mutex::new(paths_vertices_buffer),
-                surface_registry: Arc::new(SurfaceRegistry::new()),
-                desired_maximum_frame_latency: options.desired_maximum_frame_latency,
-                gpu_submit_lock: Arc::new(parking_lot::RwLock::new(())),
-            })
+                options.desired_maximum_frame_latency,
+            )
         } // end #[cfg(not(target_family = "wasm"))]
     }
 
@@ -423,7 +348,8 @@ impl WgpuContext {
         )
     }
 
-    /// Shared buffer-creation helper, used by both sync (native) and async (WASM) paths.
+    /// The context around a new device: its shared buffers and loss watcher.
+    /// Used by both the sync (native) and async (WASM) constructors.
     fn create_buffers(
         instance: wgpu::Instance,
         adapter: wgpu::Adapter,
@@ -431,6 +357,14 @@ impl WgpuContext {
         queue: wgpu::Queue,
         desired_maximum_frame_latency: u32,
     ) -> anyhow::Result<Self> {
+        let device_lost = watch_device_loss(&device);
+
+        // Phase 4 of the profiling epic (issue #60/#71) reads these seven
+        // fixed buffers back via `copy_buffer_to_buffer` during a triggered
+        // GPU deep capture (see `DeepCaptureBufferKind`), which requires
+        // `COPY_SRC` on the source buffer or wgpu's validator rejects the
+        // encoder outright. Add it only when the capture code that actually
+        // needs it is compiled in.
         #[cfg(feature = "flamegraph")]
         let deep_capture_readback = wgpu::BufferUsages::COPY_SRC;
         #[cfg(not(feature = "flamegraph"))]
@@ -520,8 +454,41 @@ impl WgpuContext {
             surface_registry: Arc::new(SurfaceRegistry::new()),
             desired_maximum_frame_latency,
             gpu_submit_lock: Arc::new(parking_lot::RwLock::new(())),
+            device_lost,
         })
     }
+
+    /// Whether the device was lost (a driver reset, a removed GPU). Nothing
+    /// made on it works again; the platform replaces the whole context.
+    pub(crate) fn is_lost(&self) -> bool {
+        self.device_lost.load(Ordering::Acquire)
+    }
+}
+
+/// Watch `device` for loss, returning the flag its lost callback sets.
+///
+/// Errors no error scope caught panic, as wgpu's default handler does, until
+/// the device is lost; after that every call on it fails and the errors are
+/// the loss's echo, so they are only logged while the platform rebuilds on a
+/// new device. A device has one slot for each callback: code sharing this
+/// device reads the loss from [`crate::WgpuSurfaceHandle::device_lost_flag`]
+/// rather than installing its own.
+fn watch_device_loss(device: &wgpu::Device) -> Arc<AtomicBool> {
+    let lost = Arc::new(AtomicBool::new(false));
+    let flag = lost.clone();
+    device.set_device_lost_callback(move |reason, message| {
+        flag.store(true, Ordering::Release);
+        log::error!("GPU device lost ({reason:?}): {message}");
+    });
+    let flag = lost.clone();
+    device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+        if flag.load(Ordering::Acquire) {
+            log::debug!("GPU error after the device was lost: {error}");
+        } else {
+            panic!("wgpu error: {error}");
+        }
+    }));
+    lost
 }
 
 impl WgpuContext {
@@ -598,6 +565,48 @@ pub(super) fn ensure_buffer_size(
             usage,
             mapped_at_creation: false,
         });
+    }
+}
+
+#[cfg(test)]
+mod device_loss_tests {
+    use super::{WgpuContext, WgpuOptions};
+
+    /// A buffer wgpu rejects (mappable for reading and a storage buffer).
+    fn invalid_buffer(device: &wgpu::Device) {
+        let _ = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("invalid"),
+            size: 4,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+    }
+
+    #[test]
+    fn a_lost_device_is_noticed_and_its_errors_do_not_panic() {
+        let Ok(context) = WgpuContext::new(&WgpuOptions::default()) else {
+            eprintln!("no wgpu adapter; skipping");
+            return;
+        };
+        assert!(!context.is_lost());
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            invalid_buffer(&context.device)
+        }));
+        assert!(
+            caught.is_err(),
+            "a GPU error panics while the device is alive"
+        );
+
+        // `destroy` reports the loss through the same callback a driver
+        // reset does.
+        context.device.destroy();
+        let _ = context.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        assert!(context.is_lost());
+        // Now errors are the loss's echo: logged, not a panic.
+        invalid_buffer(&context.device);
     }
 }
 
