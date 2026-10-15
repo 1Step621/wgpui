@@ -960,7 +960,12 @@ impl Platform for CrossPlatform {
                 let text = match clipboard.get_text() {
                     Ok(text) => text,
                     Err(error) => {
-                        log::warn!("failed to read clipboard text: {error}");
+                        // Empty and non-text selections are normal during paste
+                        // availability checks. Probe after reading so formats
+                        // accepted by get_text but not has(Text) still work.
+                        if clipboard.has(ContentFormat::Text) {
+                            log::warn!("failed to read clipboard text: {error}");
+                        }
                         return None;
                     }
                 };
@@ -988,6 +993,7 @@ impl Platform for CrossPlatform {
 
             match ArboardClipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
                 Ok(text) => Some(crate::ClipboardItem::new_string(text)),
+                Err(arboard::Error::ContentNotAvailable) => None,
                 Err(error) => {
                     log::warn!("failed to read plain-text clipboard fallback: {error}");
                     None
