@@ -2135,6 +2135,7 @@ impl Window {
                 if invalidator.is_dirty() || request_frame_options.force_render {
                     #[cfg(feature = "flamegraph")]
                     crate::record_frame_pacing(true);
+                    crate::ui_frame_signal::mark_ui_frame_begin();
                     crate::render_stats::count("window: full draw");
                     if request_frame_options.force_render {
                         crate::render_stats::count("window: forced (cache bypassed)");

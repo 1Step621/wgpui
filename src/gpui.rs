@@ -69,6 +69,7 @@ mod platform;
 pub mod prelude;
 mod queue;
 pub mod render_stats;
+pub mod ui_frame_signal;
 mod scene;
 mod scene_pack;
 mod scroll_momentum;
