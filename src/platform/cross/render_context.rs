@@ -16,6 +16,8 @@ pub type WgpuDeviceFactory = Arc<
 /// Options for configuring the WGPU backend.
 #[derive(Clone)]
 pub struct WgpuOptions {
+    /// Backends to initialize. Excluded backends are never loaded or enumerated.
+    pub backends: wgpu::Backends,
     /// Additional WGPU features to request when creating the device.
     /// These are OR'd with the features WGPUI itself requires.
     pub additional_features: wgpu::Features,
@@ -30,6 +32,7 @@ pub struct WgpuOptions {
 impl Default for WgpuOptions {
     fn default() -> Self {
         Self {
+            backends: wgpu::Backends::all(),
             additional_features: wgpu::Features::empty(),
             preferred_backends: wgpu::Backends::empty(),
             device_factory: None,
@@ -84,7 +87,7 @@ pub struct WgpuContext {
 impl WgpuContext {
     pub fn new(options: &WgpuOptions) -> anyhow::Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
+            backends: options.backends,
             flags: wgpu::InstanceFlags::default(),
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
@@ -113,7 +116,7 @@ impl WgpuContext {
             let required_features = wgpui_features | options.additional_features;
 
             let mut adapters =
-                pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+                pollster::block_on(instance.enumerate_adapters(options.backends));
             adapters.sort_by_key(|adapter| {
                 !options
                     .preferred_backends
@@ -193,6 +196,9 @@ impl WgpuContext {
                 Some(factory) => factory(&adapter, &descriptor)?,
                 None => pollster::block_on(adapter.request_device(&descriptor))?,
             };
+            device.set_device_lost_callback(|reason, message| {
+                log::error!("WGPUI GPU device lost ({reason:?}): {message}");
+            });
 
             let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Globals Buffer"),
@@ -322,7 +328,7 @@ impl WgpuContext {
     #[cfg(target_family = "wasm")]
     pub async fn new_async(options: &WgpuOptions) -> anyhow::Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
+            backends: options.backends,
             flags: wgpu::InstanceFlags::default(),
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
@@ -333,7 +339,7 @@ impl WgpuContext {
 
         let required_features = wgpui_features | options.additional_features;
 
-        let adapters = instance.enumerate_adapters(wgpu::Backends::all()).await;
+        let adapters = instance.enumerate_adapters(options.backends).await;
 
         let adapter = adapters
             .into_iter()

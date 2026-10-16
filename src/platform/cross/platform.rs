@@ -1414,19 +1414,15 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                 } else {
                     // Renderer may not exist yet if initialization was skipped
                     // (e.g. canvas reported 0x0 on WASM). Create it now.
-                    let mut renderer = WgpuRenderer::new(
+                    let renderer = WgpuRenderer::new(
                         window.0.wgpu_context.clone(),
-                        window.window(),
+                        window.window().clone(),
                         window.0.sprite_atlas.clone(),
                         physical_size.width,
                         physical_size.height,
                         4,
                     )
                     .expect("Failed to create renderer from resize");
-                    renderer.update_drawable_size(Size {
-                        width: DevicePixels(physical_size.width as i32),
-                        height: DevicePixels(physical_size.height as i32),
-                    });
                     let _ = window.0.renderer.set(RefCell::new(renderer));
                 }
                 let size = crate::Size {
@@ -1531,9 +1527,10 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                 // thereby discard every cached view — at event-loop rate.
                 let mut force_render = false;
                 if let Some(renderer) = window.0.renderer.get() {
-                    let renderer_ref = renderer.borrow();
+                    let mut renderer_ref = renderer.borrow_mut();
+                    force_render = renderer_ref.needs_full_redraw();
                     if let Some(pending_surfaces) = renderer_ref.get_pending_surfaces() {
-                        force_render = !renderer_ref.blit_surfaces_direct(&pending_surfaces);
+                        force_render |= !renderer_ref.blit_surfaces_direct(&pending_surfaces);
                     }
                 }
 
