@@ -87,23 +87,41 @@ pub(crate) struct CrossPlatform {
 
 #[cfg(not(target_family = "wasm"))]
 fn system_clipboard_contents(item: &crate::ClipboardItem) -> Option<Vec<ClipboardContent>> {
-    let text = item.text()?;
-    let mut contents = vec![ClipboardContent::Text(text)];
-    if let Some(metadata) = item.metadata() {
-        contents.push(ClipboardContent::Other(
-            crate::GPUI_CLIPBOARD_METADATA_FORMAT.to_owned(),
-            metadata.as_bytes().to_vec(),
-        ));
+    let mut contents = Vec::new();
+    if let Some(text) = item.text() {
+        contents.push(ClipboardContent::Text(text));
     }
-    Some(contents)
+    for entry in item.entries() {
+        if let crate::ClipboardEntry::Custom { format, data } = entry {
+            contents.push(ClipboardContent::Other(
+                format.native_name().to_owned(),
+                data.clone(),
+            ));
+        }
+    }
+    (!contents.is_empty()).then_some(contents)
 }
 
 #[cfg(not(target_family = "wasm"))]
-fn clipboard_item_with_metadata(text: String, metadata: Option<String>) -> crate::ClipboardItem {
-    match metadata {
-        Some(metadata) => crate::ClipboardItem::new_string_with_metadata(text, metadata),
-        None => crate::ClipboardItem::new_string(text),
-    }
+fn clipboard_item_from_contents(
+    contents: Vec<ClipboardContent>,
+    formats: &[crate::ClipboardFormat],
+) -> Option<crate::ClipboardItem> {
+    let entries = contents
+        .into_iter()
+        .filter_map(|content| match content {
+            ClipboardContent::Text(text) => Some(crate::ClipboardEntry::String(text.into())),
+            ClipboardContent::Other(name, data) => formats
+                .iter()
+                .find(|format| format.native_name() == name)
+                .map(|format| crate::ClipboardEntry::Custom {
+                    format: *format,
+                    data,
+                }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    (!entries.is_empty()).then_some(crate::ClipboardItem { entries })
 }
 
 #[derive(Default)]
@@ -914,37 +932,46 @@ impl Platform for CrossPlatform {
         {
             let Some(contents) = system_clipboard_contents(&item) else {
                 log::warn!(
-                    "write_to_clipboard currently supports text entries only on this platform"
+                    "write_to_clipboard currently supports text and custom data only on this platform"
                 );
-                return;
-            };
-            let Some(text) = item.text() else {
                 return;
             };
             if let Some(clipboard) = &self.clipboard {
                 match clipboard.set(contents) {
                     Ok(()) => {
                         // clipboard-rs does not check NSPasteboardItem::setData's
-                        // return value, so a successful write may still lose metadata.
+                        // return value, so verify that custom representations survived.
                         #[cfg(target_os = "macos")]
-                        if let Some(metadata) = item.metadata() {
-                            match clipboard.get_buffer(crate::GPUI_CLIPBOARD_METADATA_FORMAT) {
-                                Ok(stored) if stored == metadata.as_bytes() => {}
-                                Ok(_) => log::warn!("clipboard metadata changed during write"),
-                                Err(error) => log::warn!(
-                                    "clipboard metadata was not preserved during write: {error}"
-                                ),
+                        for entry in item.entries() {
+                            if let crate::ClipboardEntry::Custom { format, data } = entry {
+                                match clipboard.get_buffer(format.native_name()) {
+                                    Ok(stored) if stored.as_slice() == data.as_slice() => {}
+                                    Ok(_) => log::warn!(
+                                        "clipboard data changed during write for {}",
+                                        format.native_name()
+                                    ),
+                                    Err(error) => log::warn!(
+                                        "clipboard data was not preserved during write for {}: {error}",
+                                        format.native_name(),
+                                    ),
+                                }
                             }
                         }
                         return;
                     }
                     Err(error) => {
                         log::warn!(
-                            "failed to write custom-format clipboard contents; falling back to plain text: {error}"
+                            "failed to write clipboard contents; falling back to plain text: {error}"
                         );
                     }
                 }
             }
+            let Some(text) = item.text() else {
+                log::warn!(
+                    "cannot write custom clipboard data without custom-format clipboard support"
+                );
+                return;
+            };
 
             #[cfg(target_os = "linux")]
             std::thread::spawn(move || {
@@ -967,42 +994,39 @@ impl Platform for CrossPlatform {
         }
     }
 
-    fn read_from_clipboard(&self) -> Option<crate::ClipboardItem> {
+    fn read_from_clipboard(
+        &self,
+        _formats: &[crate::ClipboardFormat],
+    ) -> Option<crate::ClipboardItem> {
         #[cfg(not(target_family = "wasm"))]
         {
+            let formats = _formats;
             if let Some(clipboard) = &self.clipboard {
-                let text = match clipboard.get_text() {
-                    Ok(text) => text,
+                let mut contents = Vec::new();
+                match clipboard.get_text() {
+                    Ok(text) => contents.push(ClipboardContent::Text(text)),
                     Err(error) => {
                         // Empty and non-text selections are normal during paste
-                        // availability checks. Probe after reading so formats
-                        // accepted by get_text but not has(Text) still work.
+                        // availability checks. Custom data may exist without text.
                         if clipboard.has(ContentFormat::Text) {
                             log::warn!("failed to read clipboard text: {error}");
                         }
-                        return None;
                     }
-                };
-                let metadata_format =
-                    ContentFormat::Other(crate::GPUI_CLIPBOARD_METADATA_FORMAT.to_owned());
-                let metadata = if clipboard.has(metadata_format) {
-                    match clipboard.get_buffer(crate::GPUI_CLIPBOARD_METADATA_FORMAT) {
-                        Ok(metadata) => match String::from_utf8(metadata) {
-                            Ok(metadata) => Some(metadata),
-                            Err(error) => {
-                                log::warn!("clipboard metadata is not valid UTF-8: {error}");
-                                None
+                }
+                for format in formats {
+                    let name = format.native_name();
+                    if clipboard.has(ContentFormat::Other(name.to_owned())) {
+                        match clipboard.get_buffer(name) {
+                            Ok(data) => {
+                                contents.push(ClipboardContent::Other(name.to_owned(), data))
                             }
-                        },
-                        Err(error) => {
-                            log::warn!("failed to read clipboard metadata: {error}");
-                            None
+                            Err(error) => {
+                                log::warn!("failed to read clipboard format {name}: {error}")
+                            }
                         }
                     }
-                } else {
-                    None
-                };
-                return Some(clipboard_item_with_metadata(text, metadata));
+                }
+                return clipboard_item_from_contents(contents, formats);
             }
 
             match ArboardClipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
@@ -2280,10 +2304,8 @@ fn winit_key_to_keystroke(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        clipboard_item_with_metadata, system_clipboard_contents, winit_key_to_keystroke,
-    };
-    use crate::{ClipboardItem, Modifiers};
+    use super::{clipboard_item_from_contents, system_clipboard_contents, winit_key_to_keystroke};
+    use crate::{ClipboardEntry, ClipboardFormat, ClipboardItem, Modifiers};
     use clipboard_rs::ClipboardContent;
     use winit::keyboard::{Key, NamedKey};
 
@@ -2313,37 +2335,110 @@ mod tests {
         assert_eq!(keystroke.key_char, None);
     }
 
+    const TEST_FORMAT: ClipboardFormat = ClipboardFormat {
+        mime_type: "application/x-gpui-test-data",
+        macos_uti: "dev.gpui.test-data",
+    };
+    const OTHER_FORMAT: ClipboardFormat = ClipboardFormat {
+        mime_type: "application/x-gpui-test-other",
+        macos_uti: "dev.gpui.test-other",
+    };
+
     #[test]
-    fn clipboard_metadata_uses_a_custom_system_format() {
-        let item = ClipboardItem::new_string_with_metadata(
-            "clipboard text".to_owned(),
-            "application metadata".to_owned(),
-        );
-        let contents = system_clipboard_contents(&item).expect("text item should be supported");
+    fn custom_formats_roundtrip_with_text_and_binary_data() {
+        let original = ClipboardItem::new_string("clipboard text".to_owned())
+            .with_custom(TEST_FORMAT, vec![0, 255, 128, 0])
+            .with_custom(OTHER_FORMAT, Vec::new());
+        let contents = system_clipboard_contents(&original).expect("item should be supported");
+        assert!(contents.iter().any(|content| matches!(content,
+            ClipboardContent::Other(name, data)
+                if name == TEST_FORMAT.native_name() && data == &[0, 255, 128, 0]
+        )));
+        let restored = clipboard_item_from_contents(contents, &[TEST_FORMAT, OTHER_FORMAT])
+            .expect("item should be readable");
+        assert_eq!(restored, original);
+    }
 
-        assert_eq!(contents.len(), 2);
-        assert!(matches!(
-            &contents[0],
-            ClipboardContent::Text(text) if text == "clipboard text"
-        ));
-        assert!(matches!(
-            &contents[1],
-            ClipboardContent::Other(format, metadata)
-                if format == crate::GPUI_CLIPBOARD_METADATA_FORMAT
-                    && metadata == b"application metadata"
-        ));
+    #[test]
+    fn custom_data_roundtrips_without_text() {
+        let original = ClipboardItem::from(ClipboardEntry::Custom {
+            format: TEST_FORMAT,
+            data: vec![0, 255],
+        });
+        let contents =
+            system_clipboard_contents(&original).expect("custom data should be supported");
+        let restored = clipboard_item_from_contents(contents, &[TEST_FORMAT])
+            .expect("custom data should be readable without text");
+        assert_eq!(restored, original);
+        assert!(restored.text().is_none());
+    }
 
-        let restored = clipboard_item_with_metadata(
-            "clipboard text".to_owned(),
-            Some("application metadata".to_owned()),
-        );
+    #[test]
+    fn only_requested_custom_formats_are_read() {
+        let original = ClipboardItem::new_string("clipboard text".to_owned())
+            .with_custom(TEST_FORMAT, vec![1])
+            .with_custom(OTHER_FORMAT, vec![2]);
+        let contents = system_clipboard_contents(&original).expect("item should be supported");
+        let restored = clipboard_item_from_contents(contents, &[OTHER_FORMAT])
+            .expect("text and requested format should be readable");
         assert_eq!(restored.text().as_deref(), Some("clipboard text"));
-        assert_eq!(restored.metadata().map(String::as_str), Some("application metadata"));
+        assert!(restored.custom(TEST_FORMAT).is_none());
+        assert_eq!(restored.custom(OTHER_FORMAT), Some([2].as_slice()));
+        assert!(
+            clipboard_item_from_contents(
+                vec![ClipboardContent::Other(
+                    "application/x-unknown".to_owned(),
+                    vec![1]
+                )],
+                &[TEST_FORMAT],
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn replacing_custom_data_preserves_other_representations() {
+        let item = ClipboardItem::new_string("clipboard text".to_owned())
+            .with_custom(TEST_FORMAT, vec![1])
+            .with_custom(OTHER_FORMAT, vec![2])
+            .with_custom(TEST_FORMAT, vec![3]);
+        assert_eq!(item.entries().len(), 3);
+        assert_eq!(item.custom(TEST_FORMAT), Some([3].as_slice()));
+        assert_eq!(item.custom(OTHER_FORMAT), Some([2].as_slice()));
+        assert_eq!(item.text().as_deref(), Some("clipboard text"));
+    }
+
+    #[test]
+    fn plain_clipboard_text_does_not_offer_custom_formats() {
+        let item = ClipboardItem::new_string("plain".to_owned());
+        let contents = system_clipboard_contents(&item).expect("text item should be supported");
+        let restored = clipboard_item_from_contents(contents, &[TEST_FORMAT])
+            .expect("text should still be readable when a custom format is unavailable");
+        assert_eq!(restored, item);
+        assert!(restored.custom(TEST_FORMAT).is_none());
+    }
+
+    #[gpui::test]
+    fn custom_formats_are_requested_through_app_context(cx: &mut crate::TestAppContext) {
+        let item = ClipboardItem::new_string("clipboard text".to_owned())
+            .with_custom(TEST_FORMAT, vec![0, 255])
+            .with_custom(OTHER_FORMAT, vec![1]);
+        cx.update(|cx| {
+            cx.write_to_clipboard(item.clone());
+            let plain = cx.read_from_clipboard().expect("text should be readable");
+            assert_eq!(plain.text().as_deref(), Some("clipboard text"));
+            assert!(plain.custom(TEST_FORMAT).is_none());
+            let custom = cx
+                .read_from_clipboard_with_formats(&[TEST_FORMAT])
+                .expect("custom data should be readable");
+            assert_eq!(custom.custom(TEST_FORMAT), Some([0, 255].as_slice()));
+            assert!(custom.custom(OTHER_FORMAT).is_none());
+        });
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn clipboard_metadata_roundtrips_through_macos_pasteboard() {
+    fn custom_data_roundtrips_through_macos_pasteboard() {
         use objc2::{rc::autoreleasepool, runtime::ProtocolObject};
         use objc2_app_kit::{NSPasteboard, NSPasteboardItem, NSPasteboardTypeString};
         use objc2_foundation::{NSArray, NSData, NSString};
@@ -2352,22 +2447,15 @@ mod tests {
             // A private pasteboard leaves the user's general clipboard untouched.
             let pasteboard = NSPasteboard::pasteboardWithUniqueName();
             let pasteboard_item = NSPasteboardItem::new();
-            let original = ClipboardItem::new_string_with_metadata(
-                "clipboard text".to_owned(),
-                "application metadata".to_owned(),
-            );
-            let contents =
-                system_clipboard_contents(&original).expect("text item should be supported");
+            let original = ClipboardItem::new_string("clipboard text".to_owned())
+                .with_custom(TEST_FORMAT, vec![0, 255, 128, 0]);
+            let contents = system_clipboard_contents(&original).expect("item should be supported");
             for content in contents {
                 let written = match content {
-                    ClipboardContent::Text(text) => pasteboard_item.setString_forType(
-                        &NSString::from_str(&text),
-                        NSPasteboardTypeString,
-                    ),
-                    ClipboardContent::Other(format, metadata) => pasteboard_item.setData_forType(
-                        &NSData::with_bytes(&metadata),
-                        &NSString::from_str(&format),
-                    ),
+                    ClipboardContent::Text(text) => pasteboard_item
+                        .setString_forType(&NSString::from_str(&text), NSPasteboardTypeString),
+                    ClipboardContent::Other(format, data) => pasteboard_item
+                        .setData_forType(&NSData::with_bytes(&data), &NSString::from_str(&format)),
                     _ => panic!("unexpected clipboard representation"),
                 };
                 assert!(written, "pasteboard representation should be accepted");
@@ -2378,30 +2466,22 @@ mod tests {
             let text = pasteboard
                 .stringForType(NSPasteboardTypeString)
                 .expect("pasteboard text should be readable");
-            let metadata = pasteboard
-                .dataForType(&NSString::from_str(crate::GPUI_CLIPBOARD_METADATA_FORMAT))
-                .expect("pasteboard metadata should be readable");
-            let restored = clipboard_item_with_metadata(
-                text.to_string(),
-                Some(
-                    String::from_utf8(metadata.bytes().to_vec()).expect("metadata should be UTF-8"),
-                ),
-            );
+            let data = pasteboard
+                .dataForType(&NSString::from_str(TEST_FORMAT.macos_uti))
+                .expect("pasteboard custom data should be readable");
+            let restored = clipboard_item_from_contents(
+                vec![
+                    ClipboardContent::Text(text.to_string()),
+                    ClipboardContent::Other(
+                        TEST_FORMAT.macos_uti.to_owned(),
+                        data.bytes().to_vec(),
+                    ),
+                ],
+                &[TEST_FORMAT],
+            )
+            .expect("item should be readable");
             assert_eq!(restored, original);
         });
-    }
-
-    #[test]
-    fn plain_clipboard_text_does_not_offer_the_metadata_format() {
-        let item = ClipboardItem::new_string("plain".to_owned());
-        let contents = system_clipboard_contents(&item)
-            .expect("text item should be supported");
-
-        assert_eq!(contents.len(), 1);
-        assert!(matches!(
-            &contents[0],
-            ClipboardContent::Text(text) if text == "plain"
-        ));
     }
 }
 
