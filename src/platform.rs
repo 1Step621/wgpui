@@ -1549,7 +1549,12 @@ pub enum CursorStyle {
 ///
 /// Native platform backends write this alongside the plain-text representation,
 /// allowing metadata to be read by another process without exposing it as text.
-pub const GPUI_CLIPBOARD_METADATA_FORMAT: &str = "application/x-gpui-clipboard-metadata";
+pub const GPUI_CLIPBOARD_METADATA_FORMAT: &str = if cfg!(target_os = "macos") {
+    // NSPasteboardItem requires a UTI, which cannot contain the slash in a MIME type.
+    "dev.gpui.clipboard-metadata"
+} else {
+    "application/x-gpui-clipboard-metadata"
+};
 
 /// A clipboard item that should be copied to the clipboard
 #[derive(Clone, Debug, Eq, PartialEq)]

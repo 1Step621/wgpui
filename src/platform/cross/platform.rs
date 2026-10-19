@@ -923,7 +923,21 @@ impl Platform for CrossPlatform {
             };
             if let Some(clipboard) = &self.clipboard {
                 match clipboard.set(contents) {
-                    Ok(()) => return,
+                    Ok(()) => {
+                        // clipboard-rs does not check NSPasteboardItem::setData's
+                        // return value, so a successful write may still lose metadata.
+                        #[cfg(target_os = "macos")]
+                        if let Some(metadata) = item.metadata() {
+                            match clipboard.get_buffer(crate::GPUI_CLIPBOARD_METADATA_FORMAT) {
+                                Ok(stored) if stored == metadata.as_bytes() => {}
+                                Ok(_) => log::warn!("clipboard metadata changed during write"),
+                                Err(error) => log::warn!(
+                                    "clipboard metadata was not preserved during write: {error}"
+                                ),
+                            }
+                        }
+                        return;
+                    }
                     Err(error) => {
                         log::warn!(
                             "failed to write custom-format clipboard contents; falling back to plain text: {error}"
@@ -2325,6 +2339,56 @@ mod tests {
         );
         assert_eq!(restored.text().as_deref(), Some("clipboard text"));
         assert_eq!(restored.metadata().map(String::as_str), Some("application metadata"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn clipboard_metadata_roundtrips_through_macos_pasteboard() {
+        use objc2::{rc::autoreleasepool, runtime::ProtocolObject};
+        use objc2_app_kit::{NSPasteboard, NSPasteboardItem, NSPasteboardTypeString};
+        use objc2_foundation::{NSArray, NSData, NSString};
+
+        autoreleasepool(|_| unsafe {
+            // A private pasteboard leaves the user's general clipboard untouched.
+            let pasteboard = NSPasteboard::pasteboardWithUniqueName();
+            let pasteboard_item = NSPasteboardItem::new();
+            let original = ClipboardItem::new_string_with_metadata(
+                "clipboard text".to_owned(),
+                "application metadata".to_owned(),
+            );
+            let contents =
+                system_clipboard_contents(&original).expect("text item should be supported");
+            for content in contents {
+                let written = match content {
+                    ClipboardContent::Text(text) => pasteboard_item.setString_forType(
+                        &NSString::from_str(&text),
+                        NSPasteboardTypeString,
+                    ),
+                    ClipboardContent::Other(format, metadata) => pasteboard_item.setData_forType(
+                        &NSData::with_bytes(&metadata),
+                        &NSString::from_str(&format),
+                    ),
+                    _ => panic!("unexpected clipboard representation"),
+                };
+                assert!(written, "pasteboard representation should be accepted");
+            }
+            let objects = NSArray::from_vec(vec![ProtocolObject::from_retained(pasteboard_item)]);
+            assert!(pasteboard.writeObjects(&objects));
+
+            let text = pasteboard
+                .stringForType(NSPasteboardTypeString)
+                .expect("pasteboard text should be readable");
+            let metadata = pasteboard
+                .dataForType(&NSString::from_str(crate::GPUI_CLIPBOARD_METADATA_FORMAT))
+                .expect("pasteboard metadata should be readable");
+            let restored = clipboard_item_with_metadata(
+                text.to_string(),
+                Some(
+                    String::from_utf8(metadata.bytes().to_vec()).expect("metadata should be UTF-8"),
+                ),
+            );
+            assert_eq!(restored, original);
+        });
     }
 
     #[test]

@@ -176,6 +176,9 @@ pretty_assertions = { version = "1.3.0", features = ["unstable"] }
 rand = "0.10"
 util = { package = "gpui_util", version = "0.2.2", features = ["test-support"] }
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2-app-kit = { version = "0.2", features = ["NSPasteboard", "NSPasteboardItem"] }
+
 [[example]]
 name = "karaoke_text"
 path = "examples/karaoke_text.rs"
