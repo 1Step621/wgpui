@@ -1263,6 +1263,24 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
 
         self.drain_main_queue();
 
+        #[cfg(target_os = "windows")]
+        if !self.hovered_external_paths.is_empty()
+            && let Some(window_id) = self.hovered_window_id.get()
+            && let Some(window) = self.windows.get(&window_id)
+        {
+            let previous_position = window.0.state.mouse_position.get();
+            let position = window.external_drag_position();
+            if position != previous_position {
+                let event = PlatformInput::FileDrop(FileDropEvent::Pending { position });
+                window.0.state.callbacks.invoke_mut(
+                    &window.0.state.callbacks.on_input,
+                    |callback| {
+                        callback(event.clone());
+                    },
+                );
+            }
+        }
+
         for window in self.windows.values() {
             window.window().request_redraw();
         }
@@ -1364,11 +1382,12 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
 
         match event {
             winit::event::WindowEvent::HoveredFile(path) => {
+                self.hovered_window_id.set(Some(window_id));
                 if !self.hovered_external_paths.iter().any(|p| p == &path) {
                     self.hovered_external_paths.push(path);
                 }
 
-                let position = window.0.state.mouse_position.get();
+                let position = window.external_drag_position();
 
                 // Start external drag once with all currently known hovered paths.
                 if self.hovered_external_paths.len() == 1 {
@@ -1402,11 +1421,11 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
             }
 
             winit::event::WindowEvent::DroppedFile(path) => {
+                let position = window.external_drag_position();
                 // Some backends may emit drop without prior hover events.
                 if self.hovered_external_paths.is_empty() {
                     self.hovered_external_paths.push(path);
 
-                    let position = window.0.state.mouse_position.get();
                     let entered = PlatformInput::FileDrop(FileDropEvent::Entered {
                         position,
                         paths: ExternalPaths(self.hovered_external_paths.clone().into()),
@@ -1421,7 +1440,6 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                         });
                 }
 
-                let position = window.0.state.mouse_position.get();
                 let submit = PlatformInput::FileDrop(FileDropEvent::Submit { position });
 
                 window
