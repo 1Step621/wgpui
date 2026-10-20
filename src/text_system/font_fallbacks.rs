@@ -129,6 +129,8 @@ impl CjkRegion {
     fn families(self) -> &'static [&'static str] {
         match self {
             Self::Japanese => &[
+                #[cfg(target_os = "macos")]
+                "Hiragino Sans",
                 "Yu Gothic UI",
                 "Yu Gothic",
                 "Meiryo",
@@ -141,6 +143,8 @@ impl CjkRegion {
                 "MS Gothic",
             ],
             Self::Korean => &[
+                #[cfg(target_os = "macos")]
+                "Apple SD Gothic Neo",
                 "Malgun Gothic",
                 "Noto Sans CJK KR",
                 "Noto Sans KR",
@@ -149,6 +153,8 @@ impl CjkRegion {
                 "NanumGothic",
             ],
             Self::SimplifiedChinese => &[
+                #[cfg(target_os = "macos")]
+                "PingFang SC",
                 "Microsoft YaHei UI",
                 "Microsoft YaHei",
                 "Noto Sans CJK SC",
@@ -159,6 +165,8 @@ impl CjkRegion {
                 "SimSun",
             ],
             Self::TraditionalChinese => &[
+                #[cfg(target_os = "macos")]
+                "PingFang TC",
                 "Microsoft JhengHei UI",
                 "Microsoft JhengHei",
                 "Noto Sans CJK TC",
@@ -168,6 +176,8 @@ impl CjkRegion {
                 "MingLiU",
             ],
             Self::HongKong => &[
+                #[cfg(target_os = "macos")]
+                "PingFang HK",
                 "Noto Sans CJK HK",
                 "Noto Sans HK",
                 "Source Han Sans HC",
@@ -179,7 +189,7 @@ impl CjkRegion {
     }
 }
 
-/// Returns regional CJK families selected solely from the locale.
+/// Returns regional CJK families for the current platform and locale.
 pub fn cjk_font_fallbacks(locale: &str) -> &'static [&'static str] {
     CjkRegion::from_locale(locale).families()
 }
