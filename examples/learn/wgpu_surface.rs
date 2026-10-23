@@ -11,7 +11,7 @@ use helio::{
     MaterialId, MeshId, MeshUpload, ObjectDescriptor, ObjectId, PackedVertex, Renderer,
     RendererConfig, Scene, SceneActor,
 };
-use helio_default_graphs::build_default_graph_external;
+use helio_default_passes::build_default_graph_external;
 
 // ── Mesh helpers ────────────────────────────────────────────────────────────
 
