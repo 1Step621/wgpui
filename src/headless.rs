@@ -55,7 +55,7 @@ impl HeadlessWindow {
                 window.test_frame_sink = Some(Box::new(move |scene| {
                     let mut renderer = renderer.borrow_mut();
                     assert_draw_order(scene);
-                    renderer.draw(scene);
+                    renderer.draw(scene, Vec::new());
                     *presented.borrow_mut() = renderer.read_back_frame();
                     (renderer.take_rerecord_requests(), renderer.take_dead_page_requests())
                 }));
@@ -118,7 +118,7 @@ impl HeadlessWindow {
                     return true;
                 }
                 let mut renderer = self.renderer.borrow_mut();
-                renderer.draw(&window.rendered_frame.scene);
+                renderer.draw(&window.rendered_frame.scene, Vec::new());
                 window.test_pending_rerecords.extend(renderer.take_rerecord_requests());
                 window.test_pending_dead_pages.extend(renderer.take_dead_page_requests());
                 *self.presented.borrow_mut() = renderer.read_back_frame();

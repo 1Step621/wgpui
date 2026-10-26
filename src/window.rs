@@ -16,7 +16,8 @@ use crate::{
     AsyncWindowContext, AvailableSpace, BackdropFilter, Background, BorderStyle, Bounds, BoxShadow,
     Capslock, Context, Corners, CursorStyle, Decorations, DevicePixels, DispatchActionListener,
     DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, ElementGeometry, Entity, EntityId,
-    EventEmitter, FileDropEvent, Filter, FilterBoundary, FontId, Global, GlobalElementId, GlyphId,
+    EventEmitter, FileDropEvent, Filter, FilterBoundary, FontId,
+    FrameCaptureRequest, Global, GlobalElementId, GlyphId,
     GpuSpecs, Hsla, InputHandler, InstanceKey, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
     KeyUpEvent, Keystroke, KeystrokeEvent, LayerId, LayerKey, LayerPolicy, LayerTransform,
     LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton,
@@ -1790,6 +1791,8 @@ pub struct Window {
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
+    pub(crate) last_element_bounds: FxHashMap<ElementId, Bounds<Pixels>>,
+    frame_capture_requests: RefCell<Vec<FrameCaptureRequest>>,
     /// Test-only stand-in for presenting: receives every scene `draw`
     /// produces (including the draws `flush_effects` runs by itself in tests)
     /// and returns the renderer's slab re-record requests, which the next
@@ -2376,6 +2379,8 @@ impl Window {
             element_opacity: 1.0,
             requested_autoscroll: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
+            last_element_bounds: FxHashMap::default(),
+            frame_capture_requests: RefCell::new(Vec::new()),
             #[cfg(any(test, feature = "test-support"))]
             test_frame_sink: None,
             #[cfg(any(test, feature = "test-support"))]
@@ -3076,6 +3081,32 @@ impl Window {
         RefCell::borrow_mut(&self.next_frame_callbacks).push(Box::new(callback));
     }
 
+    /// Asynchronously capture the last presented bounds of an element.
+    ///
+    /// Call this before changing the element's visibility or active tab. The
+    /// GPU copies the requested region from the existing framebuffer on the
+    /// next present and maps it without waiting; `max_size` limits the returned
+    /// pixel dimensions while preserving aspect ratio.
+    pub fn capture_element_from_last_frame(
+        &mut self,
+        element_id: ElementId,
+        max_size: Size<u32>,
+    ) -> Option<oneshot::Receiver<crate::platform::ElementCapture>> {
+        let mut requests = self.frame_capture_requests.borrow_mut();
+        if requests.len() >= 4 {
+            return None;
+        }
+        let bounds = *self.last_element_bounds.get(&element_id)?;
+        let (completion, result) = oneshot::channel();
+        requests.push(FrameCaptureRequest {
+            bounds,
+            scale_factor: self.scale_factor(),
+            size: max_size,
+            completion,
+        });
+        Some(result)
+    }
+
     /// Schedule a frame to be drawn on the next animation frame.
     ///
     /// This is useful for elements that need to animate continuously, such as a video player or an animated GIF.
@@ -3479,6 +3510,7 @@ impl Window {
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.invalidator.set_dirty(false);
         self.requested_autoscroll = None;
+        self.last_element_bounds.clear();
 
         // Restore the previously-used input handler.
         // Place it back into a None slot (left by a previous .take()) so that
@@ -3834,7 +3866,10 @@ impl Window {
             None,
         );
 
-        self.platform_window.draw(&self.rendered_frame.scene);
+        self.platform_window.draw(
+            &self.rendered_frame.scene,
+            mem::take(&mut *self.frame_capture_requests.borrow_mut()),
+        );
         self.needs_present.set(false);
         profiling::finish_frame!();
 
@@ -16573,7 +16608,7 @@ mod headless_layer_flicker {
                     window.test_frame_sink = Some(Box::new(move |scene| {
                         let mut renderer = renderer.borrow_mut();
                         assert_draw_order(scene);
-                        renderer.draw(scene);
+                        renderer.draw(scene, Vec::new());
                         *presented.borrow_mut() = renderer.read_back_frame();
                         (renderer.take_rerecord_requests(), renderer.take_dead_page_requests())
                     }));
@@ -16624,7 +16659,7 @@ mod headless_layer_flicker {
                         return true;
                     }
                     let mut renderer = self.renderer.borrow_mut();
-                    renderer.draw(&window.rendered_frame.scene);
+                    renderer.draw(&window.rendered_frame.scene, Vec::new());
                     window.test_pending_rerecords.extend(renderer.take_rerecord_requests());
                     window.test_pending_dead_pages.extend(renderer.take_dead_page_requests());
                     *self.presented.borrow_mut() = renderer.read_back_frame();

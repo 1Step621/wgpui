@@ -598,6 +598,9 @@ impl<E: Element> Drawable<E> {
                 }
 
                 let bounds = window.layout_bounds(layout_id);
+                if let Some(element_id) = self.element.id() {
+                    window.last_element_bounds.insert(element_id, bounds);
+                }
                 let node_id = window.next_frame.dispatch_tree.push_node();
 
                 #[cfg(feature = "flamegraph")]

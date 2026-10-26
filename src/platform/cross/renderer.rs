@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use collections::{FxHashMap, FxHashSet};
 use wgpu::util::DeviceExt;
@@ -75,6 +75,45 @@ const FRAGMENT_TRANSLATE_EDITS: &[(&str, &str, &str)] = &[
         "quad_sdf(layer_world_position(input.position.xy), sprite.bounds, sprite.corner_radii)",
     ),
 ];
+
+fn resize_capture_rgba(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    max_width: u32,
+    max_height: u32,
+) -> crate::platform::ElementCapture {
+    let scale = if max_width == 0 || max_height == 0 {
+        1.0
+    } else {
+        (max_width as f32 / width as f32)
+            .min(max_height as f32 / height as f32)
+            .min(1.0)
+    };
+    let output_width = ((width as f32 * scale).round() as u32).max(1);
+    let output_height = ((height as f32 * scale).round() as u32).max(1);
+    if output_width == width && output_height == height {
+        return crate::platform::ElementCapture {
+            width,
+            height,
+            rgba: pixels.to_vec(),
+        };
+    }
+    let mut rgba = Vec::with_capacity(output_width as usize * output_height as usize * 4);
+    for output_y in 0..output_height {
+        let source_y = (u64::from(output_y) * u64::from(height) / u64::from(output_height)) as usize;
+        for output_x in 0..output_width {
+            let source_x = (u64::from(output_x) * u64::from(width) / u64::from(output_width)) as usize;
+            let source_offset = (source_y * width as usize + source_x) * 4;
+            rgba.extend_from_slice(&pixels[source_offset..source_offset + 4]);
+        }
+    }
+    crate::platform::ElementCapture {
+        width: output_width,
+        height: output_height,
+        rgba,
+    }
+}
 
 /// Shaders whose vertex stage builds NDC positions through the shared
 /// `to_device_position_impl` helper; `paths.wgsl` builds them inline instead.
@@ -2293,6 +2332,7 @@ pub struct WgpuRenderer {
     // Persistent framebuffer for browser-canvas-style blitting
     persistent_framebuffer: Option<wgpu::Texture>,
     persistent_framebuffer_view: Option<wgpu::TextureView>,
+    pending_frame_captures: Vec<PendingFrameCapture>,
 
     // Backdrop blur texture for capturing framebuffer content
     backdrop_blur_texture: Option<wgpu::Texture>,
@@ -2360,6 +2400,17 @@ pub struct WgpuRenderer {
     // `gpu_query_manager` above rather than sharing its machinery.
     #[cfg(feature = "flamegraph")]
     deep_capture: parking_lot::Mutex<Option<crate::flamegraph_gpu::DeepCapturePendingReadback>>,
+}
+
+struct PendingFrameCapture {
+    buffer: wgpu::Buffer,
+    width: u32,
+    height: u32,
+    padded_bytes_per_row: u32,
+    output_size: crate::Size<u32>,
+    bgra: bool,
+    ready: Arc<AtomicU8>,
+    completion: futures::channel::oneshot::Sender<crate::platform::ElementCapture>,
 }
 
 impl WgpuRenderer {
@@ -2525,7 +2576,7 @@ impl WgpuRenderer {
     pub(crate) fn render_scene_fresh(&self, scene: &Scene) -> Vec<u8> {
         let (width, height) = self.frame_size();
         let mut fresh = Self::new_headless(self.context.clone(), self.atlas.clone(), width, height);
-        fresh.draw(scene);
+        fresh.draw(scene, Vec::new());
         fresh.read_back_frame()
     }
 
@@ -2793,6 +2844,7 @@ impl WgpuRenderer {
             surface_bind_groups: Mutex::new(HashMap::new()),
             persistent_framebuffer: Some(persistent_framebuffer),
             persistent_framebuffer_view: Some(persistent_framebuffer_view),
+            pending_frame_captures: Vec::new(),
             backdrop_blur_texture: Some(backdrop_blur_texture),
             backdrop_blur_texture_view: Some(backdrop_blur_texture_view),
             group_textures,
@@ -3267,8 +3319,131 @@ impl WgpuRenderer {
         self.slab_registry.take_rerecord_requests()
     }
 
-    pub fn draw(&mut self, scene: &Scene) {
+    fn record_frame_capture_copies(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        captures: Vec<crate::platform::FrameCaptureRequest>,
+    ) -> Vec<PendingFrameCapture> {
+        let Some(source) = self
+            .persistent_framebuffer
+            .as_ref()
+            .or(self.headless_target.as_ref())
+        else {
+            return Vec::new();
+        };
+        let source_width = source.width();
+        let source_height = source.height();
+        let bgra = matches!(
+            source.format(),
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+        );
+        let mut pending_captures = Vec::with_capacity(captures.len());
+        for capture in captures {
+            let scale = capture.scale_factor.max(0.01);
+            let x = (capture.bounds.origin.x.0 * scale).floor().max(0.0) as u32;
+            let y = (capture.bounds.origin.y.0 * scale).floor().max(0.0) as u32;
+            if x >= source_width || y >= source_height {
+                continue;
+            }
+            let width = (capture.bounds.size.width.0 * scale).ceil().max(1.0) as u32;
+            let height = (capture.bounds.size.height.0 * scale).ceil().max(1.0) as u32;
+            let width = width.min(source_width - x);
+            let height = height.min(source_height - y);
+            let bytes_per_row = width.saturating_mul(4);
+            let padded_bytes_per_row = bytes_per_row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+                * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+            let buffer = self.context.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("frame_capture_readback"),
+                size: u64::from(padded_bytes_per_row) * u64::from(height),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: source,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded_bytes_per_row),
+                        rows_per_image: Some(height),
+                    },
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            pending_captures.push(PendingFrameCapture {
+                buffer,
+                width,
+                height,
+                padded_bytes_per_row,
+                output_size: capture.size,
+                bgra,
+                ready: Arc::new(AtomicU8::new(0)),
+                completion: capture.completion,
+            });
+        }
+        pending_captures
+    }
+
+    fn harvest_frame_captures(&mut self) {
+        let mut index = 0;
+        while index < self.pending_frame_captures.len() {
+            let map_state = self.pending_frame_captures[index].ready.load(Ordering::Acquire);
+            if map_state == 0 {
+                index += 1;
+                continue;
+            }
+            let capture = self.pending_frame_captures.swap_remove(index);
+            if map_state != 1 {
+                continue;
+            }
+            let byte_count = capture.padded_bytes_per_row as usize * capture.height as usize;
+            let rgba = {
+                let mapped = capture.buffer.slice(0..byte_count as u64).get_mapped_range();
+                let Ok(mapped) = mapped else {
+                    capture.buffer.unmap();
+                    continue;
+                };
+                let mut pixels = Vec::with_capacity(capture.width as usize * capture.height as usize * 4);
+                for row in 0..capture.height as usize {
+                    let start = row * capture.padded_bytes_per_row as usize;
+                    for pixel in mapped[start..start + capture.width as usize * 4].chunks_exact(4) {
+                        if capture.bgra {
+                            pixels.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+                        } else {
+                            pixels.extend_from_slice(pixel);
+                        }
+                    }
+                }
+                pixels
+            };
+            capture.buffer.unmap();
+            let output = resize_capture_rgba(
+                &rgba,
+                capture.width,
+                capture.height,
+                capture.output_size.width,
+                capture.output_size.height,
+            );
+            let _ = capture.completion.send(output);
+        }
+    }
+
+    pub fn draw(
+        &mut self,
+        scene: &Scene,
+        captures: Vec<crate::platform::FrameCaptureRequest>,
+    ) {
         wgpui_scope!("wgpui: renderer draw");
+        self.harvest_frame_captures();
         self.sync_present_mode();
         log::trace!("Renderer::draw: starting frame");
 
@@ -3278,6 +3453,8 @@ impl WgpuRenderer {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("main"),
                 });
+
+        let new_frame_captures = self.record_frame_capture_copies(&mut command_encoder, captures);
 
         // Flamegraph GPU capture (issue #57): lazily create/tear down the
         // query manager to match whether a GPU-capturing session is active,
@@ -4956,6 +5133,13 @@ impl WgpuRenderer {
             wgpui_scope!("wgpui: queue.submit (draw)");
             self.context.queue.submit(Some(command_encoder.finish()));
         }
+        for pending in &new_frame_captures {
+            let ready = pending.ready.clone();
+            pending.buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+                ready.store(if result.is_ok() { 1 } else { 2 }, Ordering::Release);
+            });
+        }
+        self.pending_frame_captures.extend(new_frame_captures);
         log::trace!("Renderer::draw: presenting surface");
         {
             wgpui_scope!("wgpui: queue.present (draw)");

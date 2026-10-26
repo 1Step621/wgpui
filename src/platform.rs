@@ -356,6 +356,22 @@ pub(crate) struct FrameSnapshot {
     pub renderer_report: String,
 }
 
+/// Pixels captured from a region of the last presented frame.
+#[derive(Debug, Clone)]
+pub struct ElementCapture {
+    pub width: u32,
+    pub height: u32,
+    /// Tightly packed RGBA8 pixels, top row first.
+    pub rgba: Vec<u8>,
+}
+
+pub(crate) struct FrameCaptureRequest {
+    pub bounds: Bounds<Pixels>,
+    pub scale_factor: f32,
+    pub size: Size<u32>,
+    pub completion: oneshot::Sender<ElementCapture>,
+}
+
 pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn bounds(&self) -> Bounds<Pixels>;
     fn is_maximized(&self) -> bool;
@@ -399,7 +415,7 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_hit_test_window_control(&self, callback: Box<dyn FnMut() -> Option<WindowControlArea>>);
     fn on_close(&self, callback: Box<dyn FnOnce()>);
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
-    fn draw(&self, scene: &Scene);
+    fn draw(&self, scene: &Scene, captures: Vec<FrameCaptureRequest>);
     fn present_framebuffer_only(&self);
     fn completed_frame(&self) {}
 

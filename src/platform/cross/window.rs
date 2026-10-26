@@ -529,10 +529,10 @@ impl PlatformWindow for CrossWindow {
             .set(Some(callback));
     }
 
-    fn draw(&self, scene: &crate::Scene) {
+    fn draw(&self, scene: &crate::Scene, captures: Vec<crate::platform::FrameCaptureRequest>) {
         if let Some(renderer) = self.0.renderer.borrow_mut().as_mut() {
             let requests_pending = {
-                renderer.draw(scene);
+                renderer.draw(scene, captures);
                 renderer.has_pending_requests()
             };
             // Whatever the renderer skipped this frame is only restored by a

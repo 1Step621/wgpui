@@ -276,7 +276,9 @@ impl PlatformWindow for TestWindow {
 
     fn on_appearance_changed(&self, _callback: Box<dyn FnMut()>) {}
 
-    fn draw(&self, _scene: &crate::Scene) {}
+    fn draw(&self, _scene: &crate::Scene, captures: Vec<crate::platform::FrameCaptureRequest>) {
+        drop(captures);
+    }
 
     fn present_framebuffer_only(&self) {
         // Test harness doesn't have a real GPU framebuffer; noop is acceptable.
